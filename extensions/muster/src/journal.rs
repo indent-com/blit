@@ -9,6 +9,7 @@
 //! read and counts the keys they produced: enough to diagnose "it did not pick
 //! up my `.env`", not enough to leak one.
 
+use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::fmt;
 
@@ -154,65 +155,44 @@ impl Record {
     }
 
     /// One JSON object, the same shape the channel and `--json` emit.
-    pub fn to_json(&self) -> String {
-        let mut out = format!(
-            r#"{{"seq":{},"ts":{},"unit":{},"event":"{}","phase":"{}""#,
-            self.seq,
-            self.ts,
-            quote(&self.unit),
-            self.event,
-            self.phase
-        );
+    ///
+    /// Optional fields are omitted rather than emitted as null: a reader
+    /// distinguishes "this record has no pty" from "the pty is unknown", and
+    /// the journal is read by people as often as by programs.
+    pub fn to_json(&self) -> Value {
+        let mut object = json!({
+            "seq": self.seq,
+            "ts": self.ts,
+            "unit": self.unit,
+            "event": self.event.as_str(),
+            "phase": self.phase,
+        });
+        let map = object.as_object_mut().expect("built as an object");
         if let Some(instance) = &self.instance {
-            out.push_str(&format!(r#","instance":{}"#, quote(instance)));
+            map.insert("instance".into(), json!(instance));
         }
         if let Some(cause) = &self.cause {
-            out.push_str(&format!(r#","cause":"{cause}""#));
+            map.insert("cause".into(), json!(cause.to_string()));
         }
         if let Some(pty) = self.pty {
-            out.push_str(&format!(r#","pty":{pty}"#));
+            map.insert("pty".into(), json!(pty));
         }
         if let Some(code) = self.exit_code {
-            out.push_str(&format!(r#","exitCode":{code}"#));
+            map.insert("exitCode".into(), json!(code));
         }
         if !self.detail.is_empty() {
-            out.push_str(&format!(r#","detail":{}"#, quote(&self.detail)));
+            map.insert("detail".into(), json!(self.detail));
         }
         if let Some(keys) = self.env_keys {
-            let files: Vec<String> = self.env_files.iter().map(|f| quote(f)).collect();
-            out.push_str(&format!(
-                r#","envFiles":[{}],"envKeys":{keys}"#,
-                files.join(",")
-            ));
+            map.insert("envFiles".into(), json!(self.env_files));
+            map.insert("envKeys".into(), json!(keys));
         }
-        out.push('}');
-        out
+        object
     }
-}
-
-/// Minimal JSON string escaping — enough for paths, unit names and details.
-pub fn quote(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() + 2);
-    out.push('"');
-    for c in text.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }
 
 /// How many records the live tail holds.
 pub const RING: usize = 1024;
-/// How many are mirrored into KV, so the answer survives a server restart.
-pub const DURABLE: usize = 256;
 
 #[derive(Debug, Default)]
 pub struct Journal {
@@ -232,27 +212,32 @@ impl Journal {
         self.next_seq
     }
 
-    /// Stamp and store. Returns the stored record so a caller can publish the
-    /// same bytes it persisted.
-    pub fn push(&mut self, mut record: Record, now_ms: u64) -> Record {
+    /// Stamp and store, returning the stored record so a caller can publish
+    /// exactly what it kept.
+    pub fn push(&mut self, mut record: Record, now_ms: u64) -> &Record {
         record.seq = self.next_seq;
         record.ts = now_ms;
         self.next_seq += 1;
         if self.records.len() == RING {
             self.records.pop_front();
         }
-        self.records.push_back(record.clone());
-        record
+        self.records.push_back(record);
+        self.records.back().expect("just pushed")
     }
 
-    /// Newest last, oldest first — the order a tail wants.
-    pub fn tail(&self, count: usize) -> impl Iterator<Item = &Record> {
+    /// Oldest first, which is the order a tail is read in. Double-ended so a
+    /// caller wanting the newest N takes from the back rather than collecting
+    /// the whole ring to reverse it.
+    pub fn tail(&self, count: usize) -> impl DoubleEndedIterator<Item = &Record> {
         let skip = self.records.len().saturating_sub(count);
         self.records.iter().skip(skip)
     }
 
-    pub fn since(&self, seq: u64) -> impl Iterator<Item = &Record> {
-        self.records.iter().filter(move |r| r.seq >= seq)
+    /// Records are pushed in sequence order, so a cursor is a partition point
+    /// rather than a filter over the whole ring.
+    pub fn since(&self, seq: u64) -> impl DoubleEndedIterator<Item = &Record> {
+        let at = self.records.partition_point(|record| record.seq < seq);
+        self.records.iter().skip(at)
     }
 
     pub fn len(&self) -> usize {
@@ -271,9 +256,13 @@ mod tests {
     #[test]
     fn sequence_numbers_are_monotonic_and_resume() {
         let mut journal = Journal::new(41);
-        let a = journal.push(Record::new("api", Event::Start, "waiting"), 1000);
-        let b = journal.push(Record::new("api", Event::Spawn, "activating"), 1001);
-        assert_eq!((a.seq, b.seq), (41, 42));
+        let a = journal
+            .push(Record::new("api", Event::Start, "waiting"), 1000)
+            .seq;
+        let b = journal
+            .push(Record::new("api", Event::Spawn, "activating"), 1001)
+            .seq;
+        assert_eq!((a, b), (41, 42));
         assert_eq!(journal.next_seq(), 43);
     }
 
@@ -296,35 +285,39 @@ mod tests {
             .detail("./target/profiling/blit gateway")
             .env(vec!["/src/blit/.env.local".into()], 9);
         let json = record.to_json();
-        assert!(json.contains(r#""envKeys":9"#), "{json}");
-        assert!(json.contains(r#""instance":"epic""#), "{json}");
-        assert!(json.contains(r#""pty":7"#), "{json}");
+        assert_eq!(json["envKeys"], json!(9));
+        assert_eq!(json["envFiles"], json!(["/src/blit/.env.local"]));
+        assert_eq!(json["instance"], json!("epic"));
+        assert_eq!(json["pty"], json!(7));
         // The record names the file and counts the keys. It holds no value.
-        assert!(!json.contains("BLIT_PASSPHRASE"), "{json}");
+        assert!(!json.to_string().contains("BLIT_PASSPHRASE"));
+    }
+
+    #[test]
+    fn absent_fields_are_omitted_rather_than_null() {
+        let json = Record::new("api", Event::Loaded, "stopped").to_json();
+        assert!(json.get("pty").is_none(), "{json}");
+        assert!(json.get("cause").is_none(), "{json}");
+        assert!(json.get("exitCode").is_none(), "{json}");
+        assert!(json.get("detail").is_none(), "{json}");
     }
 
     #[test]
     fn causes_render_the_unit_that_asked() {
         let record = Record::new("gateway@epic", Event::Start, "waiting")
             .cause(Cause::Dependency("server@epic".into()));
-        assert!(
-            record
-                .to_json()
-                .contains(r#""cause":"dependency:server@epic""#)
-        );
+        assert_eq!(record.to_json()["cause"], json!("dependency:server@epic"));
     }
 
     #[test]
-    fn quoting_survives_a_detail_with_quotes_and_newlines() {
-        let json = Record::new("api", Event::Failed, "failed")
-            .detail("cannot enter \"dir\"\nline two")
-            .to_json();
-        assert!(json.contains(r#"cannot enter \"dir\"\nline two"#), "{json}");
-        assert!(serde_json_roundtrips(&json), "{json}");
-    }
-
-    fn serde_json_roundtrips(text: &str) -> bool {
-        serde_json::from_str::<serde_json::Value>(text).is_ok()
+    fn a_detail_with_quotes_and_newlines_survives_a_round_trip() {
+        let detail = "cannot enter \"dir\"\nline two";
+        let text = Record::new("api", Event::Failed, "failed")
+            .detail(detail)
+            .to_json()
+            .to_string();
+        let parsed: Value = serde_json::from_str(&text).expect("valid JSON");
+        assert_eq!(parsed["detail"], json!(detail));
     }
 
     #[test]
