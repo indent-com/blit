@@ -1,15 +1,21 @@
 import { test, expect } from "@playwright/test";
 
 /**
- * Everything a remote has to say lives under that remote.
+ * Everything a remote has to say lives under that remote — as a pane.
  *
  * systemd units and extensions used to be status-bar glyphs opening overlays
  * of their own, which put them next to the font size and the audio mute —
  * workspace chrome for things that are properties of one server. They are now
- * tabs of one remote's Manage panel, alongside its applications and clients.
- * This asserts both halves: the glyphs are gone, and the tabs are there.
+ * tabs of one remote's Manage tile, alongside its applications and clients.
+ *
+ * And a tile rather than a dialog because a dialog could not survive being
+ * used: enabling an application in the Session tab starts it, a fresh window
+ * asks to be raised, and an activation closes whatever overlay is up. So this
+ * asserts three things: the glyphs are gone, Manage opens pane content (the
+ * remotes dialog closing behind it), and the panels are still there after the
+ * click that used to dismiss them.
  */
-test("a remote's panels open from its Manage button, not from status-bar glyphs", async ({
+test("a remote's panels open as a pane from its Manage button, not from status-bar glyphs", async ({
   page,
 }) => {
   await page.goto("/");
@@ -38,14 +44,17 @@ test("a remote's panels open from its Manage button, not from status-bar glyphs"
     timeout: 5_000,
   });
 
-  // One connected remote opens its own management overlay.
-  const control = page.getByRole("button", { name: /Manage/ }).first();
+  // Exactly "Manage", not merely containing it: a parked manage tile's dock
+  // card is a button too, and its accessible name starts with the remote's
+  // name and ends with the word — which a /Manage/ locator matches, under a
+  // modal backdrop, unclickably.
+  const control = page.getByRole("button", { name: /^Manage$/ }).first();
   await expect(control).toBeVisible({ timeout: 5_000 });
   await control.click();
-  // Its own dialog, on top of the remotes list rather than inside a row.
-  await expect(
-    page.locator('[role="dialog"][aria-label^="Manage"]'),
-  ).toHaveCount(1);
+
+  // Pane content, and the dialog that asked for it is gone rather than
+  // stacked under a second one.
+  await expect(page.locator('[role="dialog"]')).toHaveCount(0);
 
   // Clients is the tab every connected server can offer; the extension-backed
   // ones appear only where their channel answers, so this asserts the strip
@@ -73,13 +82,13 @@ test("a remote's panels open from its Manage button, not from status-bar glyphs"
     ),
   );
 
-  // Escape closes the management panel and leaves the remotes list standing:
-  // one key, one layer.
-  await page.keyboard.press("Escape");
-  await expect(
-    page.locator('[role="dialog"][aria-label^="Manage"]'),
-  ).toHaveCount(0);
-  await expect(
-    page.getByRole("button", { name: /Manage/ }).first(),
-  ).toBeVisible();
+  // A tile is addressed by the URL like every other one, so a reload brings
+  // the panels back rather than the workspace it replaced.
+  await expect
+    .poll(() => page.evaluate(() => location.hash), { timeout: 5_000 })
+    .toMatch(/tile=/);
+  await page.reload();
+  await expect(page.locator("[data-connection-tab]").first()).toBeVisible({
+    timeout: 10_000,
+  });
 });

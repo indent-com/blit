@@ -86,7 +86,7 @@ test("the clients list names the extension behind a connection", async ({
     expect(installed).toMatch(/^id:[0-9a-f]+$/);
 
     await page.getByRole("status").click();
-    const manage = page.getByRole("button", { name: /Manage/ }).first();
+    const manage = page.getByRole("button", { name: /^Manage$/ }).first();
     await expect(manage).toBeVisible({ timeout: 5_000 });
     await manage.click();
     await page.locator('[data-connection-tab="clients"]').click();

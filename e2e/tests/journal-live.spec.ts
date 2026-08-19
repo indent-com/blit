@@ -27,7 +27,7 @@ test("the journal tails live and pages history in as it scrolls", async ({
   ).toBeVisible({ timeout: 10_000 });
 
   await page.getByRole("status").click();
-  const manage = page.getByRole("button", { name: /Manage/ }).first();
+  const manage = page.getByRole("button", { name: /^Manage$/ }).first();
   await expect(manage).toBeVisible({ timeout: 5_000 });
   await manage.click();
 

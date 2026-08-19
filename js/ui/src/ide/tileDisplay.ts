@@ -14,7 +14,7 @@ function baseName(p: string): string {
 /** Human-readable title/subtitle/kind for an IDE tile assignment. Shared by the
  *  Cmd+K/expose switcher and the right-dock background-editor cards. */
 export function tileDisplay(assignment: string): {
-  kind: "editor" | "diff" | "commit" | "web";
+  kind: "editor" | "diff" | "commit" | "web" | "manage";
   title: string;
   subtitle: string;
 } {
@@ -41,6 +41,15 @@ export function tileDisplay(assignment: string): {
       kind: "diff",
       title: baseName(path),
       subtitle: staged ? "Diff · staged" : "Diff",
+    };
+  }
+  // A manage tile's whole address is its connection, and the panels inside it
+  // are named by their own tabs — so the card says which server, not which tab.
+  if (parsed.kind === "manage") {
+    return {
+      kind: "manage",
+      title: parsed.connectionId,
+      subtitle: "Manage",
     };
   }
   if (parsed.kind === "commit") {

@@ -220,11 +220,10 @@ const en: Messages = {
   "remotes.status.closed": "Closed",
   "remotes.clients": "Clients",
   "remotes.control": "Manage",
-  "remotes.controlTitle": "Manage {name}",
-  "remotes.openControl": "Open this remote's management panel",
+  "remotes.openControl": "Open this remote's panels in a pane",
   "remotes.controlDisconnected": "Connect to this remote to manage it",
   "remotes.controlSubtitle":
-    "Manage opens a remote's panels — its applications, connected clients, units, and extensions.",
+    "Manage opens a remote's panels as a pane — its applications, connected clients, units, and extensions.",
 
   "switcher.sectionRemotes": "Remotes",
   "switcher.sectionNewTerminal": "New terminal on\u2026",
