@@ -207,7 +207,17 @@ impl Client {
     /// packets for subsequent [`recv`](Self::recv) calls.
     pub fn recv_matching(
         &mut self,
+        predicate: impl FnMut(&[u8]) -> bool,
+    ) -> Result<Option<Vec<u8>>, Error> {
+        self.recv_matching_deadline(predicate, MonotonicInstant::MAX)
+    }
+
+    /// Like [`recv_matching`](Self::recv_matching), but returns `Ok(None)` if the
+    /// deadline expires before a matching packet arrives.
+    pub fn recv_matching_deadline(
+        &mut self,
         mut predicate: impl FnMut(&[u8]) -> bool,
+        deadline: MonotonicInstant,
     ) -> Result<Option<Vec<u8>>, Error> {
         let mut skipped = VecDeque::new();
         let mut skipped_bytes = 0usize;
@@ -215,13 +225,31 @@ impl Client {
             let next = if let Some(packet) = self.pending.pop_front() {
                 self.pending_bytes -= packet.len();
                 Some(packet)
-            } else {
+            } else if deadline == MonotonicInstant::MAX {
                 match self.receiver.recv_logical() {
                     Ok(packet) => packet,
                     Err(error) => {
                         self.restore_skipped(skipped, skipped_bytes);
                         return Err(error);
                     }
+                }
+            } else {
+                match self.wait_until(deadline)? {
+                    WaitOutcome::Closed => {
+                        self.restore_skipped(skipped, skipped_bytes);
+                        return Err(Error::EndpointClosed);
+                    }
+                    WaitOutcome::Deadline => {
+                        self.restore_skipped(skipped, skipped_bytes);
+                        return Ok(None);
+                    }
+                    WaitOutcome::Packet => match self.receiver.recv_logical() {
+                        Ok(packet) => packet,
+                        Err(error) => {
+                            self.restore_skipped(skipped, skipped_bytes);
+                            return Err(error);
+                        }
+                    },
                 }
             };
             let Some(packet) = next else {
@@ -566,6 +594,24 @@ mod tests {
         assert_eq!(client.recv().unwrap(), Some(vec![1]));
         assert_eq!(client.recv().unwrap(), Some(vec![2]));
         assert_eq!(client.recv().unwrap(), Some(vec![4]));
+    }
+
+    #[test]
+    fn recv_matching_deadline_restores_packets_when_time_expires() {
+        let state = boot_state([]);
+        let (_guard, mut client) = boot(&state);
+        state.borrow_mut().monotonic = 100;
+        state.borrow_mut().incoming.extend([vec![1], vec![2]]);
+
+        assert_eq!(
+            client
+                .recv_matching_deadline(|packet| packet == [3], MonotonicInstant(125))
+                .unwrap(),
+            None
+        );
+        assert_eq!(state.borrow().wait_deadlines, [125, 125, 125]);
+        assert_eq!(client.recv().unwrap(), Some(vec![1]));
+        assert_eq!(client.recv().unwrap(), Some(vec![2]));
     }
 
     #[test]

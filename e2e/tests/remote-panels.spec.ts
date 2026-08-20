@@ -94,7 +94,7 @@ test("a remote's panels open as a pane from its Manage button, not from status-b
 
   // Extensions is a server capability rather than an installed extension, so
   // it is present here, and its registry defaults to the dev stack's own —
-  // three ports up from the page, which is what bin/dev allocates.
+  // three ports up from the page, as allocated by the development stack.
   const extensions = page.locator('[data-connection-tab="extensions"]');
   await expect(extensions).toHaveCount(1);
   await extensions.click();

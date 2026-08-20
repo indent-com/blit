@@ -112,6 +112,7 @@ anything non-ASCII.
 blit --on ssh:dev-server terminal list     # SSH (auto-installs blit)
 blit --on share:mypassphrase terminal list # WebRTC shared terminal
 blit --on prod terminal list               # named remote
+blit --on local:work terminal list         # named local server (auto-starts)
 
 blit remote add prod ssh:alice@prod.co
 blit remote set-default prod

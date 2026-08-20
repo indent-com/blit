@@ -1,0 +1,7 @@
+{
+  "description": "Install JS dependencies (${INSTANCE})",
+  "type": "oneshot",
+  "requires": ["browser-wasm"],
+  "command": ["direnv", "exec", "${STACK_DIR}", "dev-js-deps"],
+  "timeoutStart": "10m"
+}

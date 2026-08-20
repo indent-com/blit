@@ -279,6 +279,13 @@ fn uri_to_connector(
         let path = blit_webserver::config::default_local_socket();
         return Some(GatewayConnector::Ipc(path));
     }
+    if let Some(name) = uri.strip_prefix("local:")
+        && blit_webserver::config::valid_server_name(name)
+    {
+        return Some(GatewayConnector::Ipc(
+            blit_webserver::config::local_socket_for_name(name),
+        ));
+    }
     None
 }
 
@@ -2921,6 +2928,31 @@ mod tests {
     fn remotes_ephemeral_get() {
         let r = blit_webserver::config::RemotesState::ephemeral("rabbit = ssh:rabbit\n".into());
         assert_eq!(r.get(), "rabbit = ssh:rabbit\n");
+    }
+
+    #[test]
+    fn named_local_remote_resolves_to_its_instance_socket() {
+        let connector = uri_to_connector(
+            "local:work",
+            &blit_ssh::SshPool::new(),
+            "wss://hub.blit.sh",
+            false,
+        );
+        match connector {
+            Some(GatewayConnector::Ipc(path)) => {
+                assert_eq!(path, blit_webserver::config::local_socket_for_name("work"));
+            }
+            _ => panic!("expected named local IPC connector"),
+        }
+        assert!(
+            uri_to_connector(
+                "local:../../elsewhere",
+                &blit_ssh::SshPool::new(),
+                "wss://hub.blit.sh",
+                false,
+            )
+            .is_none()
+        );
     }
 
     #[test]

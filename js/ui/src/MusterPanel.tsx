@@ -33,12 +33,14 @@ import type {
   TerminalPalette,
 } from "@blit-sh/core";
 import {
+  followMuster,
   groupUnits,
-  openMuster,
   type MusterEvent,
   type MusterHandle,
   type MusterPhase,
   type MusterUnit,
+  unitCanStop,
+  unitStartVerb,
 } from "./muster";
 import {
   PanelEmpty,
@@ -112,44 +114,33 @@ export function MusterPanel(props: {
   const [tab, setTab] = createSignal<"units" | "journal">("units");
   const [expanded, setExpanded] = createSignal<ReadonlySet<string>>(new Set());
 
-  // One channel per open. The supervisor sends a whole table on connect, so a
-  // re-open is a resync and needs no other recovery path.
+  // A supervisor update closes its channels before publishing them again. A
+  // fresh handle brings a fresh full table and journal backfill, so reconnect
+  // instead of stranding this mounted panel on the old channel.
   createEffect(() => {
     const connectionId = props.connectionId;
-    let live = true;
-    let opened: MusterHandle | null = null;
     let unsubscribe: (() => void) | undefined;
     setHandle(null);
     setError(null);
-    const connection = props.workspace.getConnection(connectionId);
-    if (!connection) {
-      setError("This server is not connected.");
-      return;
-    }
-    void openMuster(connection, {
-      onClosed: () => {
-        if (live) setError("The supervisor went away.");
+    const stop = followMuster(
+      () => props.workspace.getConnection(connectionId),
+      {
+        onHandle: (next) => {
+          unsubscribe?.();
+          unsubscribe = undefined;
+          setHandle(next);
+          if (!next) return;
+          setError(null);
+          unsubscribe = next.subscribe(() => setRevision((n) => n + 1));
+        },
+        onRetry: () => {
+          setError("Reconnecting to supervisor…");
+        },
       },
-    })
-      .then((next) => {
-        if (!live) {
-          next.close();
-          return;
-        }
-        opened = next;
-        setHandle(next);
-        // Not `onCleanup` here: a `then` runs with no reactive owner, so one
-        // registered inside it is never called — the same trap SystemdPanel
-        // documents, and the same fix.
-        unsubscribe = next.subscribe(() => setRevision((n) => n + 1));
-      })
-      .catch(() => {
-        if (live) setError("This server runs no muster supervisor.");
-      });
+    );
     onCleanup(() => {
-      live = false;
       unsubscribe?.();
-      opened?.close();
+      stop();
     });
   });
 
@@ -500,20 +491,20 @@ export function MusterPanel(props: {
                             }
                           />
                           {control(
-                            unit.phase === "running" ||
-                              unit.phase === "activating"
+                            unitStartVerb(unit) === "restart"
                               ? "Restart"
                               : "Start",
                             undefined,
                             () =>
-                              unit.phase === "running" ||
-                              unit.phase === "activating"
+                              unitStartVerb(unit) === "restart"
                                 ? handle()?.restart(unit.name)
                                 : handle()?.start(unit.name),
                           )}
-                          {control("Stop", "warn", () =>
-                            handle()?.stop(unit.name),
-                          )}
+                          <Show when={unitCanStop(unit)}>
+                            {control("Stop", "warn", () =>
+                              handle()?.stop(unit.name),
+                            )}
+                          </Show>
                         </div>
 
                         <Show when={expanded().has(unit.name)}>

@@ -1,12 +1,17 @@
 # Server Internals
 
-`blit server` is a single async Rust binary (tokio runtime). It owns PTYs, terminal state, and per-client frame scheduling. It has no CLI subcommands and no RPC API beyond the binary protocol described in [protocol.md](protocol.md). Configuration is entirely via environment variables.
+`blit server` is a single async Rust binary (tokio runtime). It owns PTYs,
+terminal state, and per-client frame scheduling. It has no CLI subcommands and
+no RPC API beyond the binary protocol described in
+[protocol.md](protocol.md). Configuration is available through the flags in
+`blit server --help` and their documented environment equivalents.
 
 ## Configuration
 
 | Variable                              | Default                                            | Purpose                                                                                |
 | ------------------------------------- | -------------------------------------------------- | -------------------------------------------------------------------------------------- |
 | `BLIT_SOCK`                           | see path cascade in [transports.md](transports.md) | Unix socket listen path                                                                |
+| `BLIT_SERVER_NAME`                    | `default`                                          | Instance name (also `--name`); isolates socket, state, cache, and extension settings   |
 | `SHELL`                               | `$SHELL` or `/bin/sh`                              | Shell spawned for new PTYs                                                             |
 | `BLIT_SHELL_FLAGS`                    | `li` (Unix) / `` (Windows)                         | Shell invocation flags                                                                 |
 | `BLIT_SCROLLBACK`                     | `10000`                                            | Scrollback buffer rows per PTY                                                         |
@@ -49,6 +54,19 @@
 | `BLIT_NOTIFICATION_TIMEOUT_MS`        | `10000`                                            | Default low/normal notification timeout when the application requests `-1`             |
 | `BLIT_NOTIFICATION_TIMEOUT_MIN_MS`    | `1000`                                             | Lower clamp for positive application notification timeouts                             |
 | `BLIT_NOTIFICATION_TIMEOUT_MAX_MS`    | `86400000`                                         | Upper clamp for positive application notification timeouts                             |
+
+### Named instances
+
+Every server has a name. `blit server` uses `default`; `blit server --name NAME`
+or `BLIT_SERVER_NAME=NAME` selects another. State always lives under
+`blit/instances/NAME/`, including `kv.redb`, `extensions.redb`, the Wasm object
+cache, and the default `@muster` directory; `@session` state is isolated because
+it lives in KV. The socket is suffixed with `-NAME`. Clients address it as
+`local:NAME`, for example
+`blit --on local:work terminal list`. Explicit path environment variables
+remain authoritative and may intentionally make instances share a resource.
+There is no migration or fallback to the former unnamespaced socket and storage
+paths.
 
 The global process-watcher default scales with the product of the per-endpoint
 and server-wide process limits. The process-outbox defaults scale with the

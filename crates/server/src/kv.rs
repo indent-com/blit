@@ -77,10 +77,9 @@ fn now_ns() -> u64 {
 }
 
 /// `$BLIT_KV_PATH`, else the platform state path (docs/design/kv.md
-/// § Storage): `$XDG_STATE_HOME/blit/kv.redb` (`~/.local/state` fallback)
-/// on Unix, `~/Library/Application Support/blit/kv.redb` on macOS,
-/// `%APPDATA%\blit\kv.redb` on Windows. `None` = no resolvable home.
-fn db_path() -> Option<std::path::PathBuf> {
+/// § Storage) followed by `blit/instances/NAME/kv.redb`. `None` means no
+/// resolvable home.
+fn resolve_db_path(name: &crate::ServerName) -> Option<std::path::PathBuf> {
     if let Some(p) = std::env::var_os("BLIT_KV_PATH") {
         return Some(std::path::PathBuf::from(p));
     }
@@ -95,7 +94,22 @@ fn db_path() -> Option<std::path::PathBuf> {
         });
     #[cfg(windows)]
     let base = std::env::var_os("APPDATA").map(std::path::PathBuf::from);
-    base.map(|b| b.join("blit").join("kv.redb"))
+    base.map(|base| crate::server_name::server_path(&base, name, "kv.redb"))
+}
+
+static DB_PATH: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+
+/// Freeze the database path before the process-global store is first opened.
+/// A blit process owns one server and one KV store; separate named instances
+/// run in separate processes.
+pub(crate) fn configure_server_name(name: &crate::ServerName) {
+    let _ = DB_PATH.set(resolve_db_path(name));
+}
+
+fn db_path() -> Option<std::path::PathBuf> {
+    DB_PATH
+        .get_or_init(|| resolve_db_path(&crate::ServerName::default()))
+        .clone()
 }
 
 struct Entry {

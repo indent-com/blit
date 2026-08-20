@@ -9,9 +9,9 @@ use crate::config::UnitFile;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-/// Matched to the server's own extension supervisor and to `@session`, so three
-/// layers of restart logic in one server do not each invent their own numbers.
-pub const BACKOFF_BASE: Duration = Duration::from_millis(250);
+/// A longer base than the server and `@session` use: every retry creates a new
+/// retained terminal, so a tight crash loop is materially more expensive here.
+pub const BACKOFF_BASE: Duration = Duration::from_secs(1);
 pub const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// How long a run must last before its failures are forgiven.
 pub const HEALTHY_AFTER: Duration = Duration::from_secs(60);
@@ -30,6 +30,18 @@ pub enum Phase {
     Failed,
     /// Stopped by hand: ignores `autostart` until started again.
     Held,
+}
+
+/// What an exit means for units that require this one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DependentAction {
+    /// Dependency readiness did not change.
+    None,
+    /// The dependency became unavailable, so its dependents must stop.
+    Stop,
+    /// A staged oneshot replacement succeeded, so dependents must restart
+    /// against the new result.
+    Restart,
 }
 
 impl Phase {
@@ -76,8 +88,8 @@ pub struct Unit {
     pub phase: Phase,
     /// The live terminal, if there is one.
     pub pty: Option<u16>,
-    /// Monotonic per unit, and part of the tag, so a corpse is never mistaken
-    /// for the live run.
+    /// The next sequence number to assign. Monotonic per unit, and part of the
+    /// tag, so a corpse is never mistaken for the live run.
     pub seq: u64,
     pub started_ms: u64,
     pub failures: u32,
@@ -87,10 +99,13 @@ pub struct Unit {
     pub last_exit: Option<i32>,
     /// Newest first.
     pub runs: Vec<Run>,
-    /// The unit file changed under a running unit.
+    /// The unit file changed since the last attempt.
     pub stale: bool,
-    /// An explicit restart is waiting for the current terminal to die.
+    /// Dependency recovery is waiting for the current terminal to die.
     pub restart_pending: bool,
+    /// A previously successful oneshot is being run again. Its dependents keep
+    /// using the old result until a replacement attempt succeeds.
+    pub refresh_pending: bool,
     /// A stop is in flight; SIGKILL when this comes due.
     pub kill_at_ms: u64,
 }
@@ -112,6 +127,7 @@ impl Unit {
             runs: Vec::new(),
             stale: false,
             restart_pending: false,
+            refresh_pending: false,
             kill_at_ms: 0,
         }
     }
@@ -122,6 +138,11 @@ impl Unit {
         tag_for(&self.name, seq)
     }
 
+    /// The sequence carried by the live or most recently created terminal.
+    pub fn current_seq(&self) -> u64 {
+        self.seq.saturating_sub(1)
+    }
+
     /// Whether an exit should be retried, under this unit's declared policy.
     ///
     /// The policy is obeyed literally. `@session` refuses to retry exit 0 even
@@ -130,6 +151,12 @@ impl Unit {
     /// depends on the opposite — it exits 0 on purpose when replaced, and
     /// retrying that is an infinite loop.
     pub fn wants_restart(&self, exit_code: i32) -> bool {
+        // A oneshot is a task, not a service. If it failed, retrying it just
+        // burns terminals: the failure is a bug to fix, not a transient state.
+        // Users who genuinely want a retry loop can use a `simple` unit.
+        if self.file.unit_type == crate::config::UnitType::Oneshot && exit_code != 0 {
+            return false;
+        }
         // Blit's exit status negates the terminating signal, so a negative one
         // is a process that was killed rather than one that returned. That is
         // not a decision the program made, which is why `restartOnAbnormal`
@@ -149,6 +176,7 @@ impl Unit {
     ///
     /// Returns the retained runs that must now be closed to stay within `keep`.
     pub fn note_exit(&mut self, exit_code: i32, now_ms: u64, random: u64) -> Vec<Run> {
+        let was_live = self.phase.is_live();
         let pty = self.pty.take();
         self.last_exit = Some(exit_code);
         self.deadline_ms = 0;
@@ -159,7 +187,7 @@ impl Unit {
                 0,
                 Run {
                     pty,
-                    seq: self.seq,
+                    seq: self.current_seq(),
                     exit_code,
                     started_ms: self.started_ms,
                     ended_ms: now_ms,
@@ -170,7 +198,7 @@ impl Unit {
         // A run that lasted, or that ended cleanly, is not evidence of a loop.
         let healthy = exit_code == 0
             || now_ms.saturating_sub(self.started_ms) >= HEALTHY_AFTER.as_millis() as u64;
-        if healthy {
+        if was_live && healthy {
             self.failures = 0;
         }
 
@@ -209,11 +237,126 @@ impl Unit {
         self.deadline_ms = 0;
         self.kill_at_ms = 0;
         self.pty = None;
-        if self.file.restart_on_failure {
+        if self.file.restart_on_failure && self.file.unit_type != crate::config::UnitType::Oneshot {
             self.arm_retry(now_ms, random);
         } else {
             self.phase = Phase::Failed;
+            self.next_attempt_ms = 0;
         }
+    }
+
+    /// Readiness timed out after the terminal was created. Keep the terminal
+    /// attached while it is stopped, but decide the next attempt now so the
+    /// timeout cannot be recorded and signalled again on every reconcile.
+    pub fn note_failed_activation(&mut self, now_ms: u64, random: u64) {
+        self.deadline_ms = 0;
+        if self.file.restart_on_failure && self.file.unit_type != crate::config::UnitType::Oneshot {
+            self.arm_retry(now_ms, random);
+        } else {
+            self.phase = Phase::Failed;
+            self.next_attempt_ms = 0;
+        }
+    }
+
+    /// Whether a spec edit should replace this unit's previous attempt.
+    pub fn restarts_after_change(&self) -> bool {
+        if !self.file.restart_on_change {
+            return false;
+        }
+        match self.phase {
+            Phase::Activating | Phase::Running | Phase::Exited | Phase::Backoff | Phase::Failed => {
+                true
+            }
+            // A terminal still attached in Stopped is already on its way down.
+            // If dependency recovery wants it, `restart_pending` will apply
+            // the new spec when that stop completes; otherwise an edit must
+            // not revive it.
+            Phase::Stopped => self.pty.is_none() && self.last_exit.is_some(),
+            Phase::Waiting | Phase::Held => false,
+        }
+    }
+
+    /// Whether this unit should wait for a required dependency to return.
+    pub fn wants_dependency_recovery(&self) -> bool {
+        self.refresh_pending
+            || matches!(
+                self.phase,
+                Phase::Waiting
+                    | Phase::Activating
+                    | Phase::Running
+                    | Phase::Exited
+                    | Phase::Backoff
+            )
+    }
+
+    /// Preserve wanted state across an asynchronous stop.
+    pub fn resume_after_stop(&mut self) {
+        if self.pty.is_some() {
+            self.restart_pending = true;
+        } else {
+            self.phase = Phase::Waiting;
+            self.next_attempt_ms = 0;
+        }
+    }
+
+    /// Whether restarting this unit can leave its current result in service.
+    ///
+    /// `refresh_pending` keeps later attempts staged after the first one
+    /// fails, so a corrected explicit run still restarts dependents only after
+    /// it has produced a successful replacement.
+    pub fn can_stage_refresh(&self) -> bool {
+        self.file.unit_type == crate::config::UnitType::Oneshot
+            && (self.phase == Phase::Exited || self.refresh_pending)
+    }
+
+    /// Preserve a successful oneshot's dependents while its replacement runs.
+    pub fn begin_refresh(&mut self) {
+        debug_assert!(self.can_stage_refresh());
+        self.refresh_pending = true;
+    }
+
+    /// Whether this unit currently offers a usable result to its dependents.
+    /// A staged oneshot refresh keeps the prior successful result available
+    /// even though the replacement attempt itself is activating or failed.
+    pub fn is_ready_for_dependents(&self) -> bool {
+        self.phase.is_ready()
+            || (self.file.unit_type == crate::config::UnitType::Oneshot && self.refresh_pending)
+    }
+
+    /// A hard dependency stop invalidates any staged refresh promise.
+    pub fn cancel_refresh(&mut self) {
+        self.refresh_pending = false;
+    }
+
+    /// Decide the dependency cascade after [`Unit::note_exit`] has applied the
+    /// run's ordinary phase transition.
+    ///
+    /// `completed_attempt` is false when the terminal was already being
+    /// stopped. A process that handles SIGTERM by exiting 0 did not produce a
+    /// successful replacement and must not commit a staged refresh.
+    pub fn dependent_action_after_exit(
+        &mut self,
+        exit_code: i32,
+        completed_attempt: bool,
+    ) -> DependentAction {
+        if self.file.unit_type == crate::config::UnitType::Oneshot && self.refresh_pending {
+            if completed_attempt && exit_code == 0 {
+                self.refresh_pending = false;
+                DependentAction::Restart
+            } else {
+                DependentAction::None
+            }
+        } else if self.phase.is_ready() {
+            DependentAction::None
+        } else {
+            DependentAction::Stop
+        }
+    }
+
+    /// A user action or a corrected file grants a fresh failure budget.
+    pub fn reset_failure_budget(&mut self) {
+        self.failures = 0;
+        self.next_attempt_ms = 0;
     }
 
     /// Count the failure and either back off or give up.
@@ -221,6 +364,7 @@ impl Unit {
         self.failures += 1;
         if self.file.start_limit > 0 && self.failures >= self.file.start_limit {
             self.phase = Phase::Failed;
+            self.next_attempt_ms = 0;
             return;
         }
         self.phase = Phase::Backoff;
@@ -258,7 +402,7 @@ impl Unit {
                 soonest = Some(soonest.map_or(at, |s: u64| s.min(at)));
             }
         };
-        if self.phase == Phase::Backoff {
+        if self.phase == Phase::Backoff && self.pty.is_none() {
             consider(self.next_attempt_ms);
         }
         if self.phase == Phase::Activating {
@@ -498,6 +642,69 @@ mod tests {
     }
 
     #[test]
+    fn a_oneshot_that_fails_gives_up() {
+        let mut unit = unit_from(
+            r#"{"command":["a"],"type":"oneshot","restartOnFailure":true,"restartOnAbnormal":true}"#,
+        );
+        assert_eq!(unit.file.unit_type, UnitType::Oneshot);
+        unit.phase = Phase::Activating;
+        unit.note_exit(1, 1000, 0);
+        assert_eq!(unit.phase, Phase::Failed);
+        assert!(!unit.phase.is_ready());
+
+        let mut unit = unit_from(
+            r#"{"command":["a"],"type":"oneshot","restartOnFailure":true,"restartOnAbnormal":true}"#,
+        );
+        unit.phase = Phase::Activating;
+        unit.note_exit(-9, 1000, 0);
+        assert_eq!(unit.phase, Phase::Failed);
+
+        let mut unit = unit_from(r#"{"command":["a"],"type":"oneshot","restartOnFailure":true}"#);
+        unit.phase = Phase::Activating;
+        unit.note_failed_start(1000, 0);
+        assert_eq!(unit.phase, Phase::Failed);
+    }
+
+    #[test]
+    fn an_activation_timeout_is_armed_once_while_the_terminal_stops() {
+        let mut unit = plain();
+        unit.phase = Phase::Activating;
+        unit.pty = Some(7);
+        unit.deadline_ms = 900;
+        unit.note_failed_activation(1000, 0);
+        assert_eq!(unit.phase, Phase::Backoff);
+        assert_eq!(unit.failures, 1);
+        assert_eq!(unit.deadline_ms, 0);
+        assert_eq!(unit.pty, Some(7), "the caller still has to stop it");
+
+        // A graceful response to the supervisor's SIGTERM does not erase the
+        // readiness failure that caused it.
+        unit.note_exit(0, 1001, 0);
+        assert_eq!(unit.phase, Phase::Backoff);
+        assert_eq!(unit.failures, 1);
+
+        let mut no_retry = unit_from(r#"{"command":["a"],"restartOnFailure":false}"#);
+        no_retry.phase = Phase::Activating;
+        no_retry.pty = Some(8);
+        no_retry.note_failed_activation(1000, 0);
+        assert_eq!(no_retry.phase, Phase::Failed);
+        assert_eq!(no_retry.pty, Some(8));
+    }
+
+    #[test]
+    fn a_retry_deadline_waits_for_the_old_terminal_to_die() {
+        let mut unit = plain();
+        unit.phase = Phase::Backoff;
+        unit.pty = Some(7);
+        unit.next_attempt_ms = 1000;
+        unit.kill_at_ms = 2000;
+        assert_eq!(unit.next_deadline_ms(), Some(2000));
+
+        unit.pty = None;
+        assert_eq!(unit.next_deadline_ms(), Some(1000));
+    }
+
+    #[test]
     fn a_long_run_forgives_earlier_failures() {
         let mut unit = plain();
         unit.failures = 4;
@@ -545,7 +752,7 @@ mod tests {
         let mut unit = unit_from(r#"{"command":["a"],"keep":2,"restartOnFailure":true}"#);
         for run in 0..4u16 {
             unit.pty = Some(run);
-            unit.seq = run as u64;
+            unit.seq = u64::from(run) + 1;
             unit.phase = Phase::Running;
             let closed = unit.note_exit(1, 1000 + run as u64, 0);
             if run < 2 {
@@ -556,7 +763,18 @@ mod tests {
         }
         assert_eq!(unit.runs.len(), 2);
         assert_eq!(unit.runs[0].pty, 3, "newest first");
+        assert_eq!(unit.runs[0].seq, 3, "the tag's sequence is retained");
         assert_eq!(unit.runs[1].pty, 2);
+    }
+
+    #[test]
+    fn a_finished_run_keeps_the_sequence_used_at_create() {
+        let mut unit = plain();
+        unit.phase = Phase::Running;
+        unit.pty = Some(7);
+        unit.seq = 8;
+        unit.note_exit(1, 1000, 0);
+        assert_eq!(unit.runs[0].seq, 7);
     }
 
     #[test]
@@ -567,6 +785,158 @@ mod tests {
         let closed = unit.note_exit(1, 1000, 0);
         assert_eq!(closed.len(), 1);
         assert!(unit.runs.is_empty());
+    }
+
+    #[test]
+    fn file_changes_replace_prior_attempts_but_respect_held_and_waiting_units() {
+        for phase in [
+            Phase::Activating,
+            Phase::Running,
+            Phase::Exited,
+            Phase::Backoff,
+            Phase::Failed,
+        ] {
+            let mut unit = plain();
+            unit.phase = phase;
+            assert!(unit.restarts_after_change(), "{phase:?}");
+        }
+
+        let mut stopped = plain();
+        assert!(!stopped.restarts_after_change(), "never run");
+        stopped.last_exit = Some(0);
+        assert!(stopped.restarts_after_change(), "previously run");
+
+        for phase in [Phase::Waiting, Phase::Held] {
+            let mut unit = plain();
+            unit.phase = phase;
+            assert!(!unit.restarts_after_change(), "{phase:?}");
+        }
+
+        let mut disabled = unit_from(r#"{"command":["a"],"restartOnChange":false}"#);
+        disabled.phase = Phase::Running;
+        assert!(!disabled.restarts_after_change());
+    }
+
+    #[test]
+    fn dependency_recovery_preserves_wanted_state_only() {
+        for phase in [
+            Phase::Waiting,
+            Phase::Activating,
+            Phase::Running,
+            Phase::Exited,
+            Phase::Backoff,
+        ] {
+            let mut unit = plain();
+            unit.phase = phase;
+            assert!(unit.wants_dependency_recovery(), "{phase:?}");
+        }
+        for phase in [Phase::Stopped, Phase::Failed, Phase::Held] {
+            let mut unit = plain();
+            unit.phase = phase;
+            assert!(!unit.wants_dependency_recovery(), "{phase:?}");
+        }
+
+        let mut stopping = plain();
+        stopping.phase = Phase::Stopped;
+        stopping.pty = Some(7);
+        stopping.resume_after_stop();
+        assert!(stopping.restart_pending);
+        assert_eq!(stopping.phase, Phase::Stopped);
+
+        let mut stopped = plain();
+        stopped.phase = Phase::Stopped;
+        stopped.resume_after_stop();
+        assert_eq!(stopped.phase, Phase::Waiting);
+    }
+
+    #[test]
+    fn a_successful_oneshot_stages_refreshes_until_one_succeeds() {
+        let mut unit = unit_from(r#"{"command":["a"],"type":"oneshot"}"#);
+        unit.phase = Phase::Exited;
+        assert!(unit.can_stage_refresh());
+        unit.begin_refresh();
+
+        unit.phase = Phase::Activating;
+        unit.note_exit(1, 1000, 0);
+        assert_eq!(
+            unit.dependent_action_after_exit(1, true),
+            DependentAction::None,
+            "a failed replacement leaves the old result in service"
+        );
+        assert!(unit.refresh_pending);
+        assert!(
+            unit.is_ready_for_dependents(),
+            "the prior successful result remains usable"
+        );
+        assert!(
+            unit.can_stage_refresh(),
+            "a corrected attempt remains staged"
+        );
+
+        unit.phase = Phase::Activating;
+        unit.note_exit(0, 2000, 0);
+        assert_eq!(
+            unit.dependent_action_after_exit(0, true),
+            DependentAction::Restart
+        );
+        assert!(!unit.refresh_pending);
+    }
+
+    #[test]
+    fn stopping_a_staged_attempt_does_not_commit_it_on_exit_zero() {
+        let mut unit = unit_from(r#"{"command":["a"],"type":"oneshot"}"#);
+        unit.phase = Phase::Exited;
+        unit.begin_refresh();
+        unit.phase = Phase::Waiting;
+        unit.note_exit(0, 1000, 0);
+        assert_eq!(
+            unit.dependent_action_after_exit(0, false),
+            DependentAction::None
+        );
+        assert!(unit.refresh_pending);
+    }
+
+    #[test]
+    fn a_hard_stop_cancels_a_staged_oneshot_result() {
+        let mut unit = unit_from(r#"{"command":["a"],"type":"oneshot"}"#);
+        unit.phase = Phase::Exited;
+        unit.begin_refresh();
+        unit.phase = Phase::Failed;
+        assert!(unit.wants_dependency_recovery());
+        assert!(unit.is_ready_for_dependents());
+
+        unit.cancel_refresh();
+        assert!(!unit.wants_dependency_recovery());
+        assert!(!unit.is_ready_for_dependents());
+    }
+
+    #[test]
+    fn ordinary_dependency_exits_keep_the_existing_cascade_policy() {
+        let mut failed = plain();
+        failed.phase = Phase::Running;
+        failed.note_exit(1, 1000, 0);
+        assert_eq!(
+            failed.dependent_action_after_exit(1, true),
+            DependentAction::Stop
+        );
+
+        let mut ready = unit_from(r#"{"command":["a"],"type":"oneshot"}"#);
+        ready.phase = Phase::Activating;
+        ready.note_exit(0, 1000, 0);
+        assert_eq!(
+            ready.dependent_action_after_exit(0, true),
+            DependentAction::None
+        );
+    }
+
+    #[test]
+    fn an_explicit_attempt_gets_a_fresh_failure_budget() {
+        let mut unit = plain();
+        unit.failures = 4;
+        unit.next_attempt_ms = 1234;
+        unit.reset_failure_budget();
+        assert_eq!(unit.failures, 0);
+        assert_eq!(unit.next_attempt_ms, 0);
     }
 
     fn graph(pairs: &[(&str, &str)]) -> BTreeMap<String, Unit> {

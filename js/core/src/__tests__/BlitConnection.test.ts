@@ -60,6 +60,7 @@ import {
   SURFACE_TEXT_INPUT_ENABLED,
   SURFACE_TEXT_INPUT_REQUESTED,
   S2C_SURFACE_REMOTE_INPUT,
+  S2C_SURFACE_ORIGIN,
   REMOTE_INPUT_POINTER,
   REMOTE_INPUT_TOUCH,
   S2C_PING,
@@ -100,6 +101,30 @@ function createConnection(transport?: MockTransport) {
     autoConnect: false,
   });
   return { conn, transport: t };
+}
+
+function surfaceOriginMessage(
+  surfaceId: number,
+  sandboxEngine: string,
+  appId: string,
+  instanceId: string,
+): Uint8Array {
+  const fields = [sandboxEngine, appId, instanceId].map((value) =>
+    new TextEncoder().encode(value),
+  );
+  const message = new Uint8Array(
+    3 + fields.reduce((size, field) => size + 2 + field.length, 0),
+  );
+  const view = new DataView(message.buffer);
+  message[0] = S2C_SURFACE_ORIGIN;
+  view.setUint16(1, surfaceId, true);
+  let offset = 3;
+  for (const field of fields) {
+    view.setUint16(offset, field.length, true);
+    message.set(field, offset + 2);
+    offset += 2 + field.length;
+  }
+  return message;
 }
 
 class FakeClipboard extends EventTarget {
@@ -634,6 +659,16 @@ describe("BlitConnection", () => {
   it("tracks CREATED with empty tag", () => {
     transport.pushCreated(1);
     expect(conn.getSnapshot().sessions[0].tag).toBe("");
+  });
+
+  it("retains the server-stamped origin of a surface", () => {
+    conn.surfaceStore.handleSurfaceCreated(7, 0, 800, 600, "window", "app");
+    transport.push(surfaceOriginMessage(7, "wayland", "muster-abc", "41"));
+    expect(conn.surfaceStore.getSurfaces().get(7)?.origin).toEqual({
+      sandboxEngine: "wayland",
+      appId: "muster-abc",
+      instanceId: "41",
+    });
   });
 
   it("marks session closed on CLOSED", () => {

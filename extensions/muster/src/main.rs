@@ -5,16 +5,27 @@
 //! The shape matters. Every blocking entry point in the SDK waits for *its own*
 //! packet, so an extension parked in `CommandProvider::accept` cannot notice a
 //! unit that died and cannot let a backoff deadline come due. So this owns the
-//! loop — `wait_until(next deadline)`, then `recv`, then route by opcode — and
-//! uses the SDK's non-blocking `offer` to hand channel packets over.
+//! loop — `wait_until(next deadline)`, then `recv`, then route by opcode.
+//!
+//! The CLI channel is handled manually rather than through `CommandProvider::offer`,
+//! because `offer` blocks in `Invocation::begin` waiting for INVOKE. That wait
+//! can miss the DATA packet if it arrives while the loop is between `recv` and
+//! `offer`, or it can stall the whole supervisor while a channel sits open. The
+//! listener is still registered through the SDK so the descriptor is published;
+//! after that, `CHANNEL_ACCEPTED`, `DATA`, `ACK` and `CLOSED` are routed here.
 
 use blit_ext_muster::config::{
     self, ConfigError, InstanceFile, ReadyWhen, StackFile, TopLevel, UnitFile, UnitType,
+    WorktreeSourceFile,
 };
 use blit_ext_muster::envfile::{self, EnvFile, Origin};
 use blit_ext_muster::journal::{Cause, Event, Journal, Record};
-use blit_ext_muster::supervisor::{self, Phase, Run, Unit};
-use blit_guest::command::{CommandProvider, ProviderEvent};
+use blit_ext_muster::supervisor::{self, DependentAction, Phase, Run, Unit};
+use blit_ext_muster::worktrees::{self, PortLedger};
+use blit_guest::remote::extension::{
+    EXT_INFO, EXT_INFO_COMMAND_REGISTERED, ExtensionInfo, ExtensionMessage,
+    msg_extension_command_register, parse_extension_message,
+};
 use blit_guest::remote::{self, ServerMsg};
 use blit_guest::terminal::{CreateRequest, TerminalSubscriptions};
 use blit_guest::{Client, EXIT_BOOTSTRAP_FAILURE, MonotonicInstant, WaitOutcome};
@@ -85,7 +96,66 @@ const LOG_PROBE_INTERVAL: Duration = Duration::from_millis(100);
 /// An idle tick, so a directory that changed without an event is still noticed.
 const IDLE_TICK: Duration = Duration::from_secs(30);
 
+/// One durable record is enough: muster is its only writer, and a single CAS
+/// keeps allocations across every configured repository consistent.
+const PORT_LEDGER_KEY: &str = "ext/muster/worktree-ports/v1";
+
+/// Mirror only Git's linked-worktree pointers. Watching all of `.git` would
+/// index object storage and every ref merely to learn when one tiny `gitdir`
+/// file appears or disappears.
+const GIT_WORKTREES_EXCLUDE: &str = "*\n!worktrees/\n!worktrees/*/\n!worktrees/*/gitdir\n";
+
 fn main() {}
+
+fn register_descriptor(client: &mut Client, listener_id: u32) -> Result<(), String> {
+    let nonce = 1;
+    let request = msg_extension_command_register(nonce, listener_id, DESCRIPTOR)
+        .ok_or("invalid command descriptor")?;
+    client
+        .send(&request)
+        .map_err(|error| format!("command register: {error:?}"))?;
+    let packet = client
+        .recv_matching(|packet| {
+            packet.first() == Some(&EXT_INFO)
+                && packet.get(1) == Some(&EXT_INFO_COMMAND_REGISTERED)
+                && matches!(
+                    parse_extension_message(packet),
+                    Ok(Some(ExtensionMessage::Info(
+                        ExtensionInfo::CommandRegistered(registered)
+                    ))) if registered.nonce == nonce
+                )
+        })
+        .map_err(|error| format!("command register reply: {error:?}"))?
+        .ok_or("endpoint closed during command registration")?;
+    match parse_extension_message(&packet) {
+        Ok(Some(ExtensionMessage::Info(ExtensionInfo::CommandRegistered(registered))))
+            if registered.status == 0 =>
+        {
+            if registered.extension_id != client.context().extension_id
+                || registered.definition_revision != client.context().definition_revision
+            {
+                Err(String::from("command registration identity mismatch"))
+            } else {
+                Ok(())
+            }
+        }
+        Ok(Some(ExtensionMessage::Info(ExtensionInfo::CommandRegistered(registered)))) => {
+            Err(format!(
+                "command registration refused: status {} {}",
+                registered.status, registered.detail
+            ))
+        }
+        _ => Err(String::from("unexpected command registration reply")),
+    }
+}
+
+pub(crate) fn ext_log(client: &mut Client, msg: &str) {
+    if let Some(packet) =
+        remote::extension::msg_extension_event(remote::extension::EXT_EVENT_LOG, msg.as_bytes())
+    {
+        let _ = client.send(&packet);
+    }
+}
 
 // Not `blit_guest::entry!`: that bootstraps with `Client::bootstrap()`, which
 // discards the initial burst. `S2C_LIST` arrives exactly once, before `READY`,
@@ -117,8 +187,8 @@ struct Muster {
     /// Derived from `dir` once, because `~` expansion happens per env file and
     /// per probe and the answer never changes.
     home: String,
-    /// Watched directories. Root 0 is `dir`; the rest are named by pointer
-    /// files in it.
+    /// Watched directories. Root 0 is `dir`; pointer files in it name every
+    /// external stack/include and every filtered Git worktree root.
     roots: Vec<Root>,
     /// Roots the server refused, kept so `doctor` can say so on every run
     /// rather than only in the journal at the moment it happened.
@@ -132,6 +202,9 @@ struct Muster {
     units: BTreeMap<String, Unit>,
     stacks: BTreeMap<String, StackFile>,
     instances: BTreeMap<String, Instance>,
+    port_ledger: PortLedger,
+    port_ledger_hash: u128,
+    port_ledger_loaded: bool,
     journal: Journal,
     /// Everything `doctor` should say, rebuilt on every load.
     findings: Vec<ConfigError>,
@@ -166,6 +239,11 @@ struct Muster {
     /// adopted as the live run.
     exited: BTreeMap<u16, i32>,
     features: u32,
+    /// Listener id for the CLI command channel, zero when not registered.
+    cli_listener_id: u32,
+    /// Accepted CLI command channels, keyed by channel id. Invocations are
+    /// short, but accepts may overlap before their final CLOSED packets land.
+    cli_conns: BTreeMap<u32, cli::CliConn>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -179,6 +257,7 @@ struct Instance {
 /// One watched directory and the mirror of its contents.
 struct Root {
     path: String,
+    kind: RootKind,
     /// Correlates `S2C_FS_SYNCED`, which is the only thing that carries the
     /// sync id back.
     nonce: u16,
@@ -188,6 +267,14 @@ struct Root {
     /// arrival makes an empty mirror look like an empty directory.
     snapshot_done: bool,
     mirror: remote::fs::FsMirror,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RootKind {
+    /// Configuration, stack, or include directory: recursive JSON content.
+    Files,
+    /// A filtered `.git` tree containing only worktree `gitdir` pointers.
+    GitWorktrees,
 }
 
 fn run(mut client: Client, initial: &[Vec<u8>]) -> Result<(), String> {
@@ -212,6 +299,9 @@ fn run(mut client: Client, initial: &[Vec<u8>]) -> Result<(), String> {
         units: BTreeMap::new(),
         stacks: BTreeMap::new(),
         instances: BTreeMap::new(),
+        port_ledger: PortLedger::default(),
+        port_ledger_hash: 0,
+        port_ledger_loaded: false,
         journal: Journal::new(1),
         findings: Vec::new(),
         log_cursor: BTreeMap::new(),
@@ -235,20 +325,23 @@ fn run(mut client: Client, initial: &[Vec<u8>]) -> Result<(), String> {
         adoptable: adoptable.0,
         exited: adoptable.1,
         features,
+        cli_listener_id: 0,
+        cli_conns: BTreeMap::new(),
     };
 
     // A supervisor that silently ran something other than the file asked for
     // would be worse than one that refuses: neither exec block is probeable,
     // and an older server reads the environment as command text.
     if features & remote::FEATURE_CREATE_EXEC == 0 {
-        eprintln!(
+        ext_log(
+            &mut client,
             "muster: server does not advertise FEATURE_CREATE_EXEC; \
-             units with a command or env cannot be started"
+             units with a command or env cannot be started",
         );
     }
 
     let dir = muster.dir.clone();
-    muster.watch(&mut client, &dir);
+    muster.watch(&mut client, &dir, RootKind::Files);
     muster.open_panel(&mut client);
 
     let listener_name = format!(
@@ -256,17 +349,24 @@ fn run(mut client: Client, initial: &[Vec<u8>]) -> Result<(), String> {
         client.context().extension_id,
         client.context().attempt
     );
+    ext_log(
+        &mut client,
+        &format!(
+            "muster: starting dir={} listener={listener_name}",
+            muster.dir
+        ),
+    );
     let listener = client
         .listen_channel(&listener_name, b"")
         .map_err(|e| format!("cli listener: {e:?}"))?;
-    let mut provider = match CommandProvider::register(&mut client, listener, DESCRIPTOR) {
-        Ok(provider) => Some(provider),
-        // A transient run registers nothing; supervising still works.
-        Err(err) => {
-            eprintln!("muster: no @muster commands ({err:?})");
-            None
-        }
-    };
+    let cli_listener_id = listener.id();
+    muster.cli_listener_id = cli_listener_id;
+    if let Err(err) = register_descriptor(&mut client, cli_listener_id) {
+        ext_log(
+            &mut client,
+            &format!("muster: command registration failed: {err}"),
+        );
+    }
 
     loop {
         let now = muster.now_ms(&client);
@@ -278,12 +378,7 @@ fn run(mut client: Client, initial: &[Vec<u8>]) -> Result<(), String> {
                 let Ok(Some(packet)) = client.recv() else {
                     break;
                 };
-                if let Some(provider) = provider.as_mut()
-                    && let Ok(Some(event)) = provider.offer(&mut client, &packet)
-                {
-                    if let ProviderEvent::Invocation(invocation) = event {
-                        muster.serve(&mut client, invocation);
-                    }
+                if muster.route_cli(&mut client, &packet) {
                     continue;
                 }
                 muster.route(&mut client, &packet);
@@ -320,16 +415,31 @@ fn resolve_dir(client: &mut Client) -> Result<String, String> {
             .get(key.as_bytes())
             .and_then(|v| String::from_utf8(v.clone()).ok())
     };
+    resolve_dir_from(get)
+}
+
+fn resolve_dir_from(get: impl Fn(&str) -> Option<String>) -> Result<String, String> {
     if let Some(explicit) = get("BLIT_MUSTER_DIR") {
         return Ok(explicit);
     }
+    let name = get("BLIT_SERVER_NAME")
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "default".to_owned());
+    let valid = name.len() <= 64
+        && !name.ends_with('.')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
+    if !valid {
+        return Err("BLIT_SERVER_NAME is not a portable server name".to_owned());
+    }
     if let Some(xdg) = get("XDG_CONFIG_HOME").filter(|s| !s.is_empty()) {
-        return Ok(format!("{xdg}/blit/muster"));
+        return Ok(format!("{xdg}/blit/instances/{name}/muster"));
     }
     let home = get("HOME")
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "/root".into());
-    Ok(format!("{home}/.config/blit/muster"))
+    Ok(format!("{home}/.config/blit/instances/{name}/muster"))
 }
 
 /// PTYs a previous supervisor left running, from the one `S2C_LIST` that
@@ -379,26 +489,38 @@ impl Muster {
     ///
     /// The configuration directory is root 0 and is never dropped. Every other
     /// root is named by a pointer file in it — an instance whose `stack` is a
-    /// path, or an include — so discovery always begins somewhere the user
-    /// deliberately wrote, never in a checkout that merely happens to be there.
-    fn watch(&mut self, client: &mut Client, path: &str) {
+    /// path, an include, or an explicit worktree source — so discovery always
+    /// begins somewhere the user deliberately wrote, never in a checkout that
+    /// merely happens to be there.
+    fn watch(&mut self, client: &mut Client, path: &str, kind: RootKind) {
         if self.roots.iter().any(|root| root.path == path) {
             return;
         }
         let nonce = self.next_nonce();
-        let packet = remote::fs::msg_fs_sync(
-            nonce,
-            remote::fs::FS_SYNC_RECURSIVE | remote::fs::FS_SYNC_CONTENT,
-            SETTLE_MS,
-            // Zero takes the server's own inline ceiling. A 64 KiB cap here
-            // only ever meant "a unit file larger than this silently becomes
-            // invalid", which is a rule nobody wants and nobody would guess.
-            0,
-            path,
-        );
+        // Zero takes the server's own inline ceiling. A 64 KiB cap here only
+        // ever meant "a unit file larger than this silently becomes invalid",
+        // which is a rule nobody wants and nobody would guess.
+        let packet = match kind {
+            RootKind::Files => remote::fs::msg_fs_sync(
+                nonce,
+                remote::fs::FS_SYNC_RECURSIVE | remote::fs::FS_SYNC_CONTENT,
+                SETTLE_MS,
+                0,
+                path,
+            ),
+            RootKind::GitWorktrees => remote::fs::msg_fs_sync_excluding(
+                nonce,
+                remote::fs::FS_SYNC_RECURSIVE | remote::fs::FS_SYNC_CONTENT,
+                SETTLE_MS,
+                0,
+                path,
+                GIT_WORKTREES_EXCLUDE,
+            ),
+        };
         if client.send(&packet).is_ok() {
             self.roots.push(Root {
                 path: path.to_string(),
+                kind,
                 nonce,
                 sync_id: None,
                 snapshot_done: false,
@@ -443,10 +565,10 @@ impl Muster {
     /// first root by index, and the exemption then had to be re-remembered
     /// everywhere the same set was reused — `unwatchable` promptly forgot it and
     /// discarded the configuration directory's own status on every load.
-    fn prune_roots(&mut self, client: &mut Client, wanted: &BTreeSet<String>) {
+    fn prune_roots(&mut self, client: &mut Client, wanted: &BTreeMap<String, RootKind>) {
         let mut kept = Vec::with_capacity(self.roots.len());
         for root in std::mem::take(&mut self.roots) {
-            if wanted.contains(&root.path) {
+            if wanted.get(&root.path) == Some(&root.kind) {
                 kept.push(root);
                 continue;
             }
@@ -457,7 +579,7 @@ impl Muster {
         self.roots = kept;
     }
 
-    /// A `stack`/`include` value as an absolute directory.
+    /// A `stack`/`include`/`worktrees` value as an absolute directory.
     ///
     /// A bare word is a subdirectory of the configuration directory; anything
     /// else is a path, with `~` expanded here because the FS family does not
@@ -467,7 +589,7 @@ impl Muster {
             let expanded = expand_tilde(value, &self.home);
             // Relative paths would resolve against the *server's* cwd, which is
             // never what a pointer file meant.
-            if expanded.starts_with('/') {
+            if config::is_absolute_path(&expanded) {
                 expanded
             } else {
                 format!("{}/{expanded}", self.dir)
@@ -609,6 +731,30 @@ impl Muster {
             .collect()
     }
 
+    fn content_in(&self, path: &str) -> BTreeMap<String, Vec<u8>> {
+        let Some(root) = self.roots.iter().find(|root| root.path == path) else {
+            return BTreeMap::new();
+        };
+        root.mirror
+            .live
+            .iter()
+            .filter_map(|(path, node)| node.content.as_ref().map(|c| (path.clone(), c.clone())))
+            .collect()
+    }
+
+    fn worktrees_for(&self, source: &WorktreeSourceFile) -> Vec<worktrees::Worktree> {
+        let main = self.resolve_path(&source.worktrees);
+        let git = worktrees::stack_path(&main, ".git");
+        worktrees::discover(&main, &self.content_in(&git))
+    }
+
+    fn root_ready(&self, path: &str) -> bool {
+        self.roots
+            .iter()
+            .find(|root| root.path == path)
+            .is_some_and(|root| root.snapshot_done)
+    }
+
     fn next_deadline(&self, client: &Client, now: u64) -> MonotonicInstant {
         let mut soonest: Option<u64> = None;
         for unit in self.units.values() {
@@ -704,6 +850,93 @@ impl Muster {
         }
     }
 
+    /// Route packets for the manually-tracked CLI command channel.
+    ///
+    /// `CommandProvider::offer` blocks waiting for INVOKE, which can stall the
+    /// whole supervisor or miss the DATA packet entirely. After the descriptor
+    /// is registered we own the listener id and accepted channel state directly,
+    /// the same way the panel does.
+    fn route_cli(&mut self, client: &mut Client, packet: &[u8]) -> bool {
+        let message = match remote::channel::parse_channel_message(packet) {
+            Ok(Some(message)) => message,
+            _ => return false,
+        };
+        match message {
+            remote::channel::ChannelMessage::Accepted {
+                channel_id,
+                listener_id,
+                window,
+                ..
+            } => {
+                if listener_id != self.cli_listener_id || self.cli_listener_id == 0 {
+                    return false;
+                }
+                self.cli_conns.entry(channel_id).or_insert(cli::CliConn {
+                    channel_id,
+                    window,
+                    sent: 0,
+                    acked: 0,
+                    received: 0,
+                });
+                true
+            }
+            remote::channel::ChannelMessage::Data {
+                channel_id,
+                payload,
+            } => {
+                if self.cli_conns.contains_key(&channel_id) {
+                    self.dispatch_cli_data(client, channel_id, payload);
+                    return true;
+                }
+                // An unknown channel may belong to the panel listener. The
+                // server queues ACCEPTED before DATA on each endpoint, so a
+                // CLI channel is always in `cli_conns` by this point.
+                false
+            }
+            remote::channel::ChannelMessage::Ack { channel_id, bytes } => {
+                let Some(conn) = self.cli_conns.get_mut(&channel_id) else {
+                    return false;
+                };
+                conn.acked = conn.acked.max(bytes);
+                true
+            }
+            remote::channel::ChannelMessage::Closed { channel_id, .. } => {
+                if self.cli_conns.remove(&channel_id).is_some() {
+                    return true;
+                }
+                if channel_id == self.cli_listener_id {
+                    self.cli_listener_id = 0;
+                    self.cli_conns.clear();
+                    return true;
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    fn dispatch_cli_data(&mut self, client: &mut Client, channel_id: u32, payload: &[u8]) {
+        let Some(mut conn) = self.cli_conns.remove(&channel_id) else {
+            return;
+        };
+        conn.received = conn.received.saturating_add(payload.len() as u64);
+        let received = conn.received;
+        let _ = client.send(&remote::channel::msg_channel_ack(channel_id, received));
+        let mut tx = cli::CliTx::new(&mut conn);
+        if let Some(invocation) = cli::decode_invoke(payload) {
+            if let Err(err) = self.serve(client, &invocation, &mut tx) {
+                ext_log(client, &format!("muster: command failed to respond: {err}"));
+                let _ = tx.close_channel(client, remote::channel::CHANNEL_CLOSE_CANCELLED);
+            }
+        } else {
+            let _ = tx.close_channel(client, remote::channel::CHANNEL_CLOSE_CANCELLED);
+        }
+        // Keep the connection record until the server's CHANNEL_CLOSED tells us
+        // the channel is fully torn down. Without this the listener can stay
+        // half-closed and the server will not offer the next invocation.
+        self.cli_conns.insert(channel_id, conn);
+    }
+
     // ---------------------------------------------------------------- loading
 
     /// Rebuild the unit table from the mirror.
@@ -729,12 +962,14 @@ impl Muster {
             .filter(|(path, _)| path.matches('/').count() <= 1)
             .collect();
 
-        // Pass one: sort the top level into units, instances and includes, and
-        // learn which directories are named. The configuration directory is in
-        // the set from the start — it is a watched root like any other, and
-        // making it one removes every "except root 0" caveat downstream.
+        // Pass one: sort the top level into units, instances, includes, and
+        // worktree sources, and learn which directories are named. The
+        // configuration directory is in the set from the start — it is a
+        // watched root like any other, and making it one removes every "except
+        // root 0" caveat downstream.
         let mut pointers: Vec<(String, TopLevel)> = Vec::new();
-        let mut wanted_roots: BTreeSet<String> = BTreeSet::from([dir.clone()]);
+        let mut wanted_roots: BTreeMap<String, RootKind> =
+            BTreeMap::from([(dir.clone(), RootKind::Files)]);
         for (path, bytes) in &files {
             if path.contains('/') {
                 continue;
@@ -744,10 +979,25 @@ impl Muster {
                 Ok(top) => {
                     match &top {
                         TopLevel::Instance(instance) if config::is_path(&instance.stack) => {
-                            wanted_roots.insert(self.resolve_path(&instance.stack));
+                            wanted_roots
+                                .insert(self.resolve_path(&instance.stack), RootKind::Files);
+                        }
+                        TopLevel::WorktreeSource(source) => {
+                            let main = self.resolve_path(&source.worktrees);
+                            wanted_roots.insert(
+                                worktrees::stack_path(&main, ".git"),
+                                RootKind::GitWorktrees,
+                            );
+                            for worktree in self.worktrees_for(source) {
+                                wanted_roots.insert(
+                                    worktrees::stack_path(&worktree.path, &source.stack),
+                                    RootKind::Files,
+                                );
+                            }
                         }
                         TopLevel::Include(include) => {
-                            wanted_roots.insert(self.resolve_path(&include.include));
+                            wanted_roots
+                                .insert(self.resolve_path(&include.include), RootKind::Files);
                         }
                         _ => {}
                     }
@@ -773,9 +1023,9 @@ impl Muster {
         // load — so a new pointer costs one extra pass, not a missing stack.
         self.prune_roots(client, &wanted_roots);
         self.unwatchable
-            .retain(|path, _| wanted_roots.contains(path));
-        for path in &wanted_roots {
-            self.watch(client, path);
+            .retain(|path, _| wanted_roots.contains_key(path));
+        for (path, kind) in &wanted_roots {
+            self.watch(client, path, *kind);
         }
 
         // Stacks declared inside the configuration directory. External ones are
@@ -805,6 +1055,7 @@ impl Muster {
         let mut instances: BTreeMap<String, Instance> = BTreeMap::new();
         // Which pointer contributed each name, so a collision can name both.
         let mut provenance: BTreeMap<String, String> = BTreeMap::new();
+        let mut worktree_sources: Vec<(String, String, WorktreeSourceFile)> = Vec::new();
 
         for (name, top) in pointers {
             let file = format!("{name}.json");
@@ -830,6 +1081,9 @@ impl Muster {
                     }
                     Err(err) => self.findings.push(ConfigError::new(file, err)),
                 },
+                TopLevel::WorktreeSource(source) => {
+                    worktree_sources.push((name, file, *source));
+                }
                 TopLevel::Include(include) => {
                     let root = self.resolve_path(&include.include);
                     for (template, bytes) in self.files_in(&root) {
@@ -874,13 +1128,26 @@ impl Muster {
                             }
                             Ok(_) => self.findings.push(ConfigError::new(
                                 where_,
-                                "an included directory holds units, not stacks or instances",
+                                "an included directory holds units, not stacks, instances, or worktree sources",
                             )),
                             Err(err) => self.findings.push(err),
                         }
                     }
                 }
             }
+        }
+
+        for (name, file, source) in worktree_sources {
+            self.expand_worktree_source(
+                client,
+                &name,
+                &file,
+                &source,
+                &files,
+                &mut wanted,
+                &mut instances,
+                &mut provenance,
+            );
         }
 
         // Rebuilt every load so an adopted unit re-claims the surfaces its
@@ -907,6 +1174,266 @@ impl Muster {
         if !self.adoptable.is_empty() {
             self.adopt(client);
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn expand_worktree_source(
+        &mut self,
+        client: &mut Client,
+        source_name: &str,
+        source_file: &str,
+        source: &WorktreeSourceFile,
+        files: &BTreeMap<String, Vec<u8>>,
+        wanted: &mut BTreeMap<String, Unit>,
+        instances: &mut BTreeMap<String, Instance>,
+        provenance: &mut BTreeMap<String, String>,
+    ) {
+        let worktree_set: Vec<_> = self
+            .worktrees_for(source)
+            .into_iter()
+            .filter(|worktree| {
+                self.root_ready(&worktrees::stack_path(&worktree.path, &source.stack))
+            })
+            .collect();
+        let Some(main) = worktree_set.iter().find(|worktree| worktree.is_main) else {
+            // The main stack watch has been requested but its initial snapshot
+            // has not landed yet. That update calls `load` again; reporting a
+            // transient empty mirror as a broken source would be noise.
+            return;
+        };
+        let main_stack = worktrees::stack_path(&main.path, &source.stack);
+        let declarations = match self.declarations_of(&main_stack) {
+            Ok(declarations) => declarations,
+            Err(err) => {
+                self.findings.push(ConfigError::new(source_file, err));
+                return;
+            }
+        };
+
+        let mut port_assignment: Option<(String, BTreeMap<String, i64>)> = None;
+        if let Some((port_name, declaration)) = declarations
+            .vars
+            .iter()
+            .find(|(_, declaration)| declaration.is_ports())
+        {
+            if source
+                .vars
+                .get(port_name)
+                .and_then(serde_json::Value::as_str)
+                != Some("auto")
+            {
+                self.findings.push(ConfigError::new(
+                    source_file,
+                    format!("worktree source must bind port parameter {port_name:?} to \"auto\""),
+                ));
+                return;
+            }
+            let Some(start) = declaration.start else {
+                self.findings.push(ConfigError::new(
+                    source_file,
+                    format!("port parameter {port_name:?} needs start for a worktree source"),
+                ));
+                return;
+            };
+            if self.features & remote::kv::FEATURE_KV == 0 {
+                self.findings.push(ConfigError::new(
+                    source_file,
+                    "worktree port allocation needs server KV support",
+                ));
+                return;
+            }
+            let explicit: Vec<(i64, u32)> = instances
+                .values()
+                .filter_map(|instance| instance.ports)
+                .collect();
+            let assigned = match self.assign_worktree_ports(
+                client,
+                source_name,
+                &worktree_set,
+                start,
+                declaration.span,
+                &explicit,
+            ) {
+                Ok(assigned) => assigned,
+                Err(err) => {
+                    self.findings.push(ConfigError::new(source_file, err));
+                    return;
+                }
+            };
+            port_assignment = Some((port_name.clone(), assigned));
+        }
+
+        for worktree in &worktree_set {
+            let instance_name = worktrees::instance_name(source_name, worktree);
+            if let Some(first) = provenance.get(&instance_name) {
+                self.findings.push(ConfigError::new(
+                    source_file,
+                    format!("instance {instance_name:?} collides with a unit from {first}"),
+                ));
+                continue;
+            }
+            if let Some(first) = instances.get(&instance_name) {
+                self.findings.push(ConfigError::new(
+                    source_file,
+                    format!(
+                        "instance {instance_name:?} is already provided by stack {:?}",
+                        first.stack
+                    ),
+                ));
+                continue;
+            }
+            let mut vars = source.vars.clone();
+            if let Some((port_name, assigned)) = &port_assignment
+                && let Some(base) = assigned.get(&worktree.id)
+            {
+                vars.insert(port_name.clone(), serde_json::json!(*base));
+            }
+            let instance = InstanceFile {
+                stack: worktrees::stack_path(&worktree.path, &source.stack),
+                vars,
+                omit: source.omit.clone(),
+                autostart: source.autostart,
+            };
+            let expansion = match self.expand(&instance_name, &instance, files) {
+                Ok(expansion) => expansion,
+                Err(err) => {
+                    self.findings.push(ConfigError::new(source_file, err));
+                    continue;
+                }
+            };
+            if let Some((unit, first)) = expansion
+                .units
+                .iter()
+                .find_map(|unit| provenance.get(&unit.name).map(|first| (&unit.name, first)))
+            {
+                self.findings.push(ConfigError::new(
+                    source_file,
+                    format!("{unit:?} is already provided by {first}"),
+                ));
+                continue;
+            }
+            for unit in expansion.units {
+                provenance.insert(unit.name.clone(), source_file.to_string());
+                wanted.insert(unit.name.clone(), unit);
+            }
+            instances.insert(
+                instance_name,
+                Instance {
+                    stack: instance.stack,
+                    ports: expansion.ports,
+                    members: expansion.members,
+                },
+            );
+        }
+    }
+
+    fn assign_worktree_ports(
+        &mut self,
+        client: &mut Client,
+        source_name: &str,
+        worktrees: &[worktrees::Worktree],
+        start: i64,
+        span: u32,
+        explicit: &[(i64, u32)],
+    ) -> Result<BTreeMap<String, i64>, String> {
+        // An extension update briefly overlaps the retiring and replacement
+        // attempts. Both can read the same ledger revision, so the loser must
+        // merge from the winner instead of leaving this source empty until an
+        // unrelated filesystem event happens to reload it.
+        const CAS_ATTEMPTS: usize = 3;
+        for attempt in 0..CAS_ATTEMPTS {
+            if !self.port_ledger_loaded {
+                self.load_port_ledger(client)?;
+            }
+            let before = self.port_ledger.clone();
+            let assigned = worktrees::assign_ports(
+                source_name,
+                worktrees,
+                start,
+                span,
+                &mut self.port_ledger,
+                explicit,
+            )?;
+            if self.port_ledger == before {
+                return Ok(assigned);
+            }
+            match self.persist_port_ledger(client) {
+                Ok(()) => return Ok(assigned),
+                Err(_) if !self.port_ledger_loaded && attempt + 1 < CAS_ATTEMPTS => {
+                    self.port_ledger = before;
+                }
+                Err(err) => {
+                    self.port_ledger = before;
+                    return Err(err);
+                }
+            }
+        }
+        unreachable!("the bounded port-ledger retry always returns")
+    }
+
+    fn load_port_ledger(&mut self, client: &mut Client) -> Result<(), String> {
+        let nonce = self.next_nonce();
+        client
+            .send(&remote::kv::msg_kv_fetch(nonce, PORT_LEDGER_KEY))
+            .map_err(|err| format!("read worktree port ledger: {err:?}"))?;
+        let reply = self
+            .reply(client, remote::kv::S2C_KV_VALUE, nonce)
+            .ok_or("server never answered the worktree port ledger read")?;
+        let Some((_, status, hash, value)) = remote::kv::parse_kv_value(&reply) else {
+            return Err("malformed worktree port ledger reply".into());
+        };
+        match status {
+            remote::kv::KV_STATUS_NOT_FOUND => {
+                self.port_ledger = PortLedger::default();
+                self.port_ledger_hash = 0;
+            }
+            remote::kv::KV_STATUS_OK => {
+                self.port_ledger = serde_json::from_slice(&value)
+                    .map_err(|err| format!("invalid worktree port ledger: {err}"))?;
+                self.port_ledger_hash = hash;
+            }
+            other => {
+                return Err(format!(
+                    "cannot read worktree port ledger: {}",
+                    remote::kv::kv_status_text(other)
+                ));
+            }
+        }
+        self.port_ledger_loaded = true;
+        Ok(())
+    }
+
+    fn persist_port_ledger(&mut self, client: &mut Client) -> Result<(), String> {
+        let value = serde_json::to_vec(&self.port_ledger)
+            .map_err(|err| format!("serialize worktree port ledger: {err}"))?;
+        let nonce = self.next_nonce();
+        let put = remote::kv::KvPut {
+            nonce,
+            flags: remote::kv::KV_PUT_DURABLE,
+            base: self.port_ledger_hash,
+            key: PORT_LEDGER_KEY.into(),
+            value,
+        };
+        client
+            .send(&remote::kv::msg_kv_put(&put))
+            .map_err(|err| format!("write worktree port ledger: {err:?}"))?;
+        let reply = self
+            .reply(client, remote::kv::S2C_KV_DONE, nonce)
+            .ok_or("server never answered the worktree port ledger write")?;
+        let Some((_, status, hash, _)) = remote::kv::parse_kv_done(&reply) else {
+            return Err("malformed worktree port ledger write reply".into());
+        };
+        if status != remote::kv::KV_STATUS_OK {
+            if status == remote::kv::KV_STATUS_CONFLICT {
+                self.port_ledger_loaded = false;
+            }
+            return Err(format!(
+                "cannot write worktree port ledger: {}",
+                remote::kv::kv_status_text(status)
+            ));
+        }
+        self.port_ledger_hash = hash;
+        Ok(())
     }
 
     /// What a stack declares, without expanding anything.
@@ -1108,12 +1635,13 @@ impl Muster {
                         existing.stale = true;
                         let instance = existing.instance.clone();
                         let phase = existing.phase;
+                        let restart_after_change = existing.restarts_after_change();
                         self.record(
                             Record::new(name.clone(), Event::Changed, phase.as_str())
                                 .instance(instance),
                             now,
                         );
-                        if phase.is_live() && fresh.file.restart_on_change {
+                        if restart_after_change {
                             restart.push(name.clone());
                         }
                     } else {
@@ -1299,6 +1827,11 @@ impl Muster {
 
         // Autostart: a unit that has never run and says so.
         let names: Vec<String> = self.units.keys().cloned().collect();
+        // Resolve every readiness transition before trying waiting units.
+        // Unit names are lexical, not topological: a dependent such as
+        // `gateway` can sort before `server`. If gateway is checked first and
+        // server becomes ready later in this same pass, gateway otherwise has
+        // no deadline to wake the loop and may sit idle until unrelated I/O.
         for name in &names {
             let Some(unit) = self.units.get(name) else {
                 continue;
@@ -1330,7 +1863,15 @@ impl Muster {
                 }
                 continue;
             }
-            if unit.attempt_due(now) && self.deps_ready(name) {
+        }
+
+        // Readiness is now settled for the whole table, so start everything
+        // whose dependencies became ready in the pass above.
+        for name in &names {
+            let Some(unit) = self.units.get(name) else {
+                continue;
+            };
+            if unit.pty.is_none() && unit.attempt_due(now) && self.deps_ready(name) {
                 let cause = if unit.phase == Phase::Backoff {
                     Cause::Crash
                 } else {
@@ -1345,14 +1886,16 @@ impl Muster {
         let Some(unit) = self.units.get(name) else {
             return false;
         };
-        unit.file
-            .requires
-            .iter()
-            .all(|dep| self.units.get(dep).is_some_and(|d| d.phase.is_ready()))
+        unit.file.requires.iter().all(|dep| {
+            self.units
+                .get(dep)
+                .is_some_and(Unit::is_ready_for_dependents)
+        })
     }
 
     /// Record the intent to run something, pulling in what it needs.
     fn want(&mut self, client: &mut Client, name: &str, cause: Cause) {
+        let reset_root = cause == Cause::Command;
         let closure = supervisor::start_closure(&self.units, name);
         let order = match supervisor::start_order(&self.units, &closure) {
             Ok(order) => order,
@@ -1388,6 +1931,21 @@ impl Muster {
             }
             if unit.phase == Phase::Held && !is_root {
                 continue;
+            }
+            // A dependency that is already backing off from a previous failure
+            // must keep its retry timer. Resetting it to Waiting would let an
+            // autostarted dependent respawn the dependency immediately and
+            // create a terminal storm.
+            if unit.phase == Phase::Backoff && !is_root {
+                continue;
+            }
+            // A dependency that has given up is also not to be pulled back by a
+            // dependent. Leave it Failed until someone explicitly starts it.
+            if unit.phase == Phase::Failed && !is_root {
+                continue;
+            }
+            if is_root && reset_root {
+                unit.reset_failure_budget();
             }
             unit.phase = Phase::Waiting;
             unit.next_attempt_ms = 0;
@@ -1438,13 +1996,13 @@ impl Muster {
         let ResolvedEnv { vars: env, sources } = match resolved {
             Ok(resolved) => resolved,
             Err(failure) => {
+                let phase = self.note_failed_start(name, now);
                 self.record(
-                    Record::new(name.to_string(), Event::Failed, "backoff")
+                    Record::new(name.to_string(), Event::Failed, phase.as_str())
                         .detail(failure)
                         .instance(instance.clone()),
                     now,
                 );
-                self.note_failed_start(name, now);
                 return;
             }
         };
@@ -1515,32 +2073,43 @@ impl Muster {
                 // A refused create is a failed start, never a running unit:
                 // the server resolves the program before forking, so this is
                 // where "no such binary" surfaces.
+                let phase = self.note_failed_start(name, now);
                 self.record(
-                    Record::new(name.to_string(), Event::Exit, "backoff")
+                    Record::new(name.to_string(), Event::Exit, phase.as_str())
                         .detail(format!("create refused: {err:?}"))
                         .instance(instance),
                     now,
                 );
-                self.note_failed_start(name, now);
             }
         }
     }
 
-    fn note_failed_start(&mut self, name: &str, now: u64) {
+    fn note_failed_start(&mut self, name: &str, now: u64) -> Phase {
         let random = random();
         if let Some(unit) = self.units.get_mut(name) {
             unit.note_failed_start(now, random);
+            unit.phase
+        } else {
+            Phase::Failed
         }
     }
 
     fn fail_start(&mut self, client: &mut Client, name: &str, why: &str) {
         let now = self.now_ms(client);
-        let (pty, instance) = match self.units.get(name) {
-            Some(unit) => (unit.pty, unit.instance.clone()),
+        let random = random();
+        let (pty, instance, phase) = match self.units.get_mut(name) {
+            Some(unit) => {
+                unit.note_failed_activation(now, random);
+                let pty = unit.pty;
+                if pty.is_some() {
+                    unit.kill_at_ms = now + unit.file.timeout_stop.ms();
+                }
+                (pty, unit.instance.clone(), unit.phase)
+            }
             None => return,
         };
         self.record(
-            Record::new(name.to_string(), Event::Failed, "backoff")
+            Record::new(name.to_string(), Event::Failed, phase.as_str())
                 .detail(why.to_string())
                 .instance(instance),
             now,
@@ -1562,10 +2131,12 @@ impl Muster {
         else {
             return;
         };
-        let (stale, phase, instance) = {
+        let (stale, phase, instance, dependent_action) = {
             let unit = self.units.get_mut(&name).expect("just found");
+            let completed_attempt = unit.phase.is_live();
             let stale = unit.note_exit(exit_status, now, random);
-            (stale, unit.phase, unit.instance.clone())
+            let dependent_action = unit.dependent_action_after_exit(exit_status, completed_attempt);
+            (stale, unit.phase, unit.instance.clone(), dependent_action)
         };
         for run in &stale {
             let _ = client.send(&remote::msg_close(run.pty));
@@ -1587,15 +2158,18 @@ impl Muster {
             now,
         );
 
-        // A dependent may not outlive what it requires. Whether this unit left
-        // `running` does not change per dependent, so it is decided once.
-        if self.units.get(&name).is_some_and(|u| !u.phase.is_ready()) {
-            for dependent in supervisor::dependents(&self.units, &name) {
-                self.stop_unit(client, &dependent, Cause::Dependency(name.clone()), false);
+        // A normal dependency exit stops its dependents. Re-running a
+        // successful oneshot is a staged replacement instead: a failure keeps
+        // the old result in service, and success restarts dependents so they
+        // consume the new one.
+        match dependent_action {
+            DependentAction::None => {}
+            DependentAction::Stop | DependentAction::Restart => {
+                self.stop_dependents(client, &name);
             }
         }
 
-        // An explicit restart asked for a new terminal once this one died.
+        // Dependency recovery asked for a new terminal once this one died.
         if let Some(unit) = self.units.get_mut(&name)
             && std::mem::take(&mut unit.restart_pending)
         {
@@ -1629,15 +2203,39 @@ impl Muster {
     /// chain of depth *k* 2^(k-1) times, with a duplicate kill and a duplicate
     /// journal record each time.
     fn stop(&mut self, client: &mut Client, name: &str, cause: Cause, hold: bool) {
-        for dependent in supervisor::dependents(&self.units, name) {
+        self.stop_dependents(client, name);
+        if let Some(unit) = self.units.get_mut(name) {
+            unit.cancel_refresh();
+        }
+        self.stop_unit(client, name, cause, hold);
+    }
+
+    /// Stop dependents that are currently wanted, and leave them waiting for
+    /// this dependency to become ready again. Held and idle dependents retain
+    /// their intent rather than being accidentally autostarted.
+    fn stop_dependents(&mut self, client: &mut Client, name: &str) {
+        let dependents: Vec<String> = supervisor::dependents(&self.units, name)
+            .into_iter()
+            .filter(|dependent| {
+                self.units
+                    .get(dependent)
+                    .is_some_and(Unit::wants_dependency_recovery)
+            })
+            .collect();
+        for dependent in dependents {
+            if let Some(unit) = self.units.get_mut(&dependent) {
+                unit.cancel_refresh();
+            }
             self.stop_unit(
                 client,
                 &dependent,
                 Cause::Dependency(name.to_string()),
                 false,
             );
+            if let Some(unit) = self.units.get_mut(&dependent) {
+                unit.resume_after_stop();
+            }
         }
-        self.stop_unit(client, name, cause, hold);
     }
 
     /// Stop exactly one unit. Cascading is [`Muster::stop`]'s job.
@@ -1682,19 +2280,28 @@ impl Muster {
     /// Every restart is a new terminal: `C2S_RESTART` replays the spec the PTY
     /// was created with, so it cannot serve a restart caused by an edit.
     fn restart(&mut self, client: &mut Client, name: &str, cause: Cause) {
-        self.stop(client, name, cause, false);
-        if let Some(unit) = self.units.get_mut(name) {
-            if unit.pty.is_none() {
-                unit.phase = Phase::Waiting;
-            } else {
-                // The terminal is still dying. `note_exit` reads this and comes
-                // back — writing `file.autostart` instead would edit parsed
-                // configuration to carry a one-off intent, and a unit that says
-                // `"autostart": false` would be permanently flipped by a single
-                // `@muster restart`.
-                unit.restart_pending = true;
+        let reset_failure_budget = matches!(cause, Cause::Command | Cause::File);
+        let staged_refresh = self.units.get(name).is_some_and(Unit::can_stage_refresh);
+        if staged_refresh {
+            // A completed oneshot is still a usable dependency result. Keep
+            // its consumers alive while producing a replacement; note_exit
+            // commits the replacement only if it succeeds.
+            if let Some(unit) = self.units.get_mut(name) {
+                unit.begin_refresh();
             }
+            self.stop_unit(client, name, cause.clone(), false);
+        } else {
+            self.stop(client, name, cause.clone(), false);
         }
+        if let Some(unit) = self.units.get_mut(name)
+            && reset_failure_budget
+        {
+            unit.reset_failure_budget();
+        }
+        // Starting through the ordinary path pulls in newly added dependencies
+        // and checks the updated graph for cycles. The PTY guard in reconcile
+        // keeps the replacement from spawning before the old terminal exits.
+        self.want(client, name, cause);
     }
 
     /// Run a unit's `stopCommand` or `reloadCommand` in a terminal of its own.
@@ -1847,7 +2454,7 @@ impl Muster {
 
     /// The surfaces a unit's live run has open, newest id last.
     fn surfaces_of(&self, name: &str) -> Vec<(u16, &Surface)> {
-        let seq = self.units.get(name).map(|unit| unit.seq.saturating_sub(1));
+        let seq = self.units.get(name).map(Unit::current_seq);
         self.surfaces
             .iter()
             .filter(|(_, surface)| surface.unit.as_deref() == Some(name))
@@ -1994,11 +2601,9 @@ impl Muster {
         if client.send(&packet).is_err() {
             return false;
         }
-        let Ok(Some(reply)) = client.recv_matching(|p| {
-            p.first() == Some(&remote::fs::S2C_FS_READ)
-                && p.len() >= 3
-                && u16::from_le_bytes([p[1], p[2]]) == nonce
-        }) else {
+        let deadline = client.monotonic_now() + PROBE_INTERVAL;
+        let Some(reply) = self.reply_deadline(client, remote::fs::S2C_FS_READ, nonce, deadline)
+        else {
             return false;
         };
         remote::fs::parse_fs_read_result(&reply)
@@ -2016,11 +2621,11 @@ impl Muster {
         if client.send(&remote::net::msg_net_open(&open)).is_err() {
             return false;
         }
-        let Ok(Some(reply)) = client.recv_matching(|p| {
-            p.first() == Some(&remote::net::S2C_NET_OPENED)
-                && p.len() >= 3
-                && u16::from_le_bytes([p[1], p[2]]) == stream
-        }) else {
+        let deadline = client.monotonic_now() + PROBE_INTERVAL;
+        let Some(reply) =
+            self.reply_deadline(client, remote::net::S2C_NET_OPENED, stream, deadline)
+        else {
+            let _ = client.send(&remote::net::msg_net_close(stream, 0));
             return false;
         };
         let ok = remote::net::parse_net_opened(&reply)
@@ -2049,14 +2654,12 @@ impl Muster {
         if client.send(&remote::net::msg_net_open(&open)).is_err() {
             return false;
         }
-        let opened = client.recv_matching(|p| {
-            p.first() == Some(&remote::net::S2C_NET_OPENED)
-                && p.len() >= 3
-                && u16::from_le_bytes([p[1], p[2]]) == stream
-        });
-        let connected = matches!(&opened, Ok(Some(reply))
-            if remote::net::parse_net_opened(reply)
-                .is_some_and(|(_, status, _, _)| status == remote::net::NET_STATUS_OK));
+        let deadline = client.monotonic_now() + PROBE_INTERVAL;
+        let opened = self.reply_deadline(client, remote::net::S2C_NET_OPENED, stream, deadline);
+        let connected = opened
+            .as_ref()
+            .and_then(|reply| remote::net::parse_net_opened(reply))
+            .is_some_and(|(_, status, _, _)| status == remote::net::NET_STATUS_OK);
         if !connected {
             let _ = client.send(&remote::net::msg_net_close(stream, 0));
             return false;
@@ -2064,13 +2667,10 @@ impl Muster {
         let request =
             format!("GET {path} HTTP/1.0\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
         let _ = client.send(&remote::net::msg_net_data_c2s(stream, request.as_bytes()));
-        let answer = client.recv_matching(|p| {
-            p.first() == Some(&remote::net::S2C_NET_DATA)
-                && p.len() >= 3
-                && u16::from_le_bytes([p[1], p[2]]) == stream
-        });
+        let deadline = client.monotonic_now() + PROBE_INTERVAL;
+        let answer = self.reply_deadline(client, remote::net::S2C_NET_DATA, stream, deadline);
         let _ = client.send(&remote::net::msg_net_close(stream, 0));
-        let Ok(Some(data)) = answer else { return false };
+        let Some(data) = answer else { return false };
         // [op][stream:2][payload...]
         let body = &data[3.min(data.len())..];
         let head = String::from_utf8_lossy(&body[..body.len().min(64)]);
@@ -2181,12 +2781,30 @@ impl Muster {
     /// in the same two bytes, so this is the one place that offset is written
     /// down. `recv_matching` buffers everything else for the loop.
     fn reply(&mut self, client: &mut Client, opcode: u8, id: u16) -> Option<Vec<u8>> {
+        self.reply_deadline(client, opcode, id, MonotonicInstant::MAX)
+    }
+
+    /// Like `reply`, but returns `None` if the deadline expires first.
+    ///
+    /// Probes use this so a single unresponsive check cannot park the whole
+    /// supervisor loop: the packet they were waiting for is kept in `pending`
+    /// and will be handled on the next loop iteration.
+    fn reply_deadline(
+        &mut self,
+        client: &mut Client,
+        opcode: u8,
+        id: u16,
+        deadline: MonotonicInstant,
+    ) -> Option<Vec<u8>> {
         client
-            .recv_matching(|packet| {
-                packet.first() == Some(&opcode)
-                    && packet.len() >= 3
-                    && u16::from_le_bytes([packet[1], packet[2]]) == id
-            })
+            .recv_matching_deadline(
+                |packet| {
+                    packet.first() == Some(&opcode)
+                        && packet.len() >= 3
+                        && u16::from_le_bytes([packet[1], packet[2]]) == id
+                },
+                deadline,
+            )
             .ok()?
     }
 
@@ -2232,12 +2850,16 @@ impl Muster {
 // ------------------------------------------------------------------ helpers
 
 fn same_spec(a: &UnitFile, b: &UnitFile) -> bool {
-    a.command == b.command
+    a.requires == b.requires
+        && a.wants == b.wants
+        && a.after == b.after
+        && a.command == b.command
         && a.shell == b.shell
         && a.cwd == b.cwd
         && a.env == b.env
         && a.env_file == b.env_file
         && a.unit_type == b.unit_type
+        && a.ready_when == b.ready_when
 }
 
 fn expand_tilde(path: &str, home: &str) -> String {
@@ -2276,7 +2898,9 @@ fn describe_ready(ready: &ReadyWhen) -> String {
         ReadyWhen::Path(p) => format!("path:{p}"),
         ReadyWhen::Log(l) => format!("log:{l}"),
         ReadyWhen::Tcp(t) => format!("tcp:{t}"),
-        ReadyWhen::Http(u) => format!("http:{u}"),
+        // The scheme already names the probe. Prefixing it produced the
+        // user-facing `http:http://…` in status and journal output.
+        ReadyWhen::Http(u) => u.clone(),
     }
 }
 
@@ -2368,4 +2992,60 @@ fn is_surface_message(packet: &[u8]) -> bool {
                 | remote::S2C_SURFACE_ORIGIN
         )
     )
+}
+
+#[cfg(test)]
+mod spec_tests {
+    use super::*;
+
+    #[test]
+    fn default_and_named_servers_get_separate_muster_directories() {
+        let vars = BTreeMap::from([("HOME", "/home/me"), ("BLIT_SERVER_NAME", "work")]);
+        assert_eq!(
+            resolve_dir_from(|key| vars.get(key).map(|value| (*value).to_owned())).unwrap(),
+            "/home/me/.config/blit/instances/work/muster"
+        );
+        assert_eq!(
+            resolve_dir_from(|key| (key == "HOME").then(|| "/home/me".to_owned())).unwrap(),
+            "/home/me/.config/blit/instances/default/muster"
+        );
+    }
+
+    #[test]
+    fn explicit_muster_directory_still_wins() {
+        let vars = BTreeMap::from([
+            ("BLIT_MUSTER_DIR", "/srv/muster"),
+            ("BLIT_SERVER_NAME", "work"),
+        ]);
+        assert_eq!(
+            resolve_dir_from(|key| vars.get(key).map(|value| (*value).to_owned())).unwrap(),
+            "/srv/muster"
+        );
+    }
+
+    fn file(json: &str) -> UnitFile {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn execution_readiness_and_dependencies_are_spec() {
+        let base = file(r#"{"command":["api"]}"#);
+        for changed in [
+            file(r#"{"command":["api","--debug"]}"#),
+            file(r#"{"command":["api"],"requires":["db"]}"#),
+            file(r#"{"command":["api"],"wants":["mail"]}"#),
+            file(r#"{"command":["api"],"after":["migrate"]}"#),
+            file(r#"{"command":["api"],"readyWhen":{"tcp":"127.0.0.1:80"}}"#),
+        ] {
+            assert!(!same_spec(&base, &changed));
+        }
+    }
+
+    #[test]
+    fn policy_changes_apply_without_replacing_the_process() {
+        let base = file(r#"{"command":["api"]}"#);
+        let changed =
+            file(r#"{"command":["api"],"description":"new","restartOnFailure":false,"keep":4}"#);
+        assert!(same_spec(&base, &changed));
+    }
 }

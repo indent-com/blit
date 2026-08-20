@@ -28,6 +28,7 @@ Manage named remotes and connect to them:
 ```bash
 blit remote add rabbit ssh:rabbit          # save a named remote
 blit remote add prod ssh:alice@prod.co     # another one
+blit remote add work local:work            # a named local server
 blit remote list                           # show all remotes
 blit remote set-default rabbit             # make rabbit the default
 
@@ -41,7 +42,8 @@ The default remote is stored in `~/.config/blit/blit.conf` as `blit.target = rab
 and can also be set via the `BLIT_TARGET` environment variable. Named remotes
 are stored in `~/.config/blit/blit.remotes` (mode 0600). `blit open` reads this
 file and shows all remotes in the browser's Remotes dialog (Cmd+K). SSH remotes
-are auto-installed on first connection.
+are auto-installed on first connection. `local:NAME` entries work in the CLI,
+`blit open`, and gateways.
 
 Forward ports to whatever the server can reach — `ssh -L` over any blit
 transport, plus UDP:
@@ -111,6 +113,25 @@ blit surface type 1 "hello{Return}" # type into a GUI window
 
 The server auto-starts when needed.
 
+Run isolated local instances by giving the server a name, or address one as
+`local:<name>` and let the client auto-start it:
+
+```bash
+blit server --name work
+blit --on local:work terminal list
+blit --on local:test terminal start htop # auto-starts a second instance
+```
+
+Every server has a name; omitting `--name` uses `default`. Each instance uses a
+named socket and stores its KV database, installed extensions, and Wasm cache
+under `blit/instances/<name>/` in the platform state/cache directories. The
+`@session` extension's intent is in that instance's KV database, while
+`@muster` reads the corresponding platform configuration directory at
+`blit/instances/<name>/muster/`. Explicit `BLIT_SOCK`, `BLIT_KV_PATH`,
+`BLIT_EXTENSION_PATH`, `BLIT_WASM_CACHE`, and `BLIT_MUSTER_DIR` overrides still
+win. Add `--export-sock` if commands launched in an instance's terminals should
+automatically target that instance.
+
 ## Supported platforms
 
 | Platform | Arch          | Wayland compositor | Notes                 |
@@ -166,25 +187,26 @@ For wire protocol details, frame encoding, and transport internals, see [ARCHITE
 
 ## Configuration
 
-| Variable                 | Default                                                                                                                | Purpose                                                                                                                                                                                                                                   |
-| ------------------------ | ---------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `BLIT_SOCK`              | `$TMPDIR/blit.sock`, `/tmp/blit-$USER.sock`, `/run/blit/$USER.sock`, `$XDG_RUNTIME_DIR/blit.sock`, or `/tmp/blit.sock` | Unix socket path                                                                                                                                                                                                                          |
-| `BLIT_EXPORT_SOCK`       | unset                                                                                                                  | Set to `1` (or pass `--export-sock` to `blit server`) to export the server's socket path as `BLIT_SOCK` in spawned terminals, so `blit` commands inside them target that server                                                           |
-| `BLIT_INJECT_PATH`       | unset                                                                                                                  | Set to `1` (or pass `--inject-path` to `blit server`) to append the server binary's directory to `PATH` in spawned terminals, so `blit` itself is callable inside them                                                                    |
-| `BLIT_UPLINK_TOKEN`      | unset                                                                                                                  | Bearer token for the `blit uplink` control endpoint                                                                                                                                                                                       |
-| `BLIT_TARGET`            | unset                                                                                                                  | Default remote: a URI or named remote (overrides `target` in `blit.conf`)                                                                                                                                                                 |
-| `BLIT_REMOTES`           | `~/.config/blit/blit.remotes`                                                                                          | Gateway remotes file path (overrides default location)                                                                                                                                                                                    |
-| `BLIT_SCROLLBACK`        | `10000`                                                                                                                | Scrollback rows per PTY                                                                                                                                                                                                                   |
-| `BLIT_HUB`               | `hub.blit.sh`                                                                                                          | Signaling hub URL for WebRTC sharing. On `blit gateway`, sets the default hub for `share:` remotes when `BLIT_GATEWAY_WEBRTC=1`.                                                                                                          |
-| `BLIT_GATEWAY_WEBRTC`    | unset                                                                                                                  | Set to `1` on `blit gateway` to proxy `share:` remotes via WebRTC. The gateway connects as a WebRTC consumer and bridges terminals to browsers over WebSocket/WebTransport. Without this, `share:` entries in `blit.remotes` are ignored. |
-| `BLIT_PASSPHRASE`        | unset                                                                                                                  | Browser passphrase for `blit gateway`; may be plaintext or an argon2 PHC hash generated by `blit hash-passphrase`. Browsers still enter the plaintext passphrase.                                                                         |
-| `BLIT_PREFIX`            | `/usr/local` or `~/.local` (Unix)                                                                                      | Override install prefix (`bin/`, `lib/`, `share/` go under this)                                                                                                                                                                          |
-| `BLIT_INSTALL_DIR`       | `%LOCALAPPDATA%\blit\bin` (Windows)                                                                                    | Override install location (Windows PowerShell installer)                                                                                                                                                                                  |
-| `BLIT_SURFACE_ENCODERS`  | see below                                                                                                              | Comma-separated encoder priority list (see below)                                                                                                                                                                                         |
-| `BLIT_SURFACE_BANDWIDTH` | `ultra`                                                                                                                | Ceiling on video bandwidth: `low`, `medium`, `high`, `ultra`, or a raw AV1 quantizer `10`–`255`. Adaptation is always on and only moves cheaper than this                                                                                 |
-| `BLIT_SURFACE_SPEED`     | `realtime`                                                                                                             | Encoder speed preset: `slow`, `medium`, `fast`, `realtime`, or a raw `10`–`255` (10 = slowest, 255 = fastest)                                                                                                                             |
-| `BLIT_VAAPI_DEVICE`      | `/dev/dri/renderD128`                                                                                                  | VA-API render node for hardware-accelerated encoding                                                                                                                                                                                      |
-| `BLIT_CUDA_DEVICE`       | `0`                                                                                                                    | CUDA device ordinal for NVENC hardware encoding                                                                                                                                                                                           |
+| Variable                 | Default                                                                                                            | Purpose                                                                                                                                                                                                                                   |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `BLIT_SOCK`              | `$TMPDIR/blit-NAME.sock`, `$XDG_RUNTIME_DIR/blit-NAME.sock`, `/tmp/blit-$USER-NAME.sock`, or `/tmp/blit-NAME.sock` | Unix socket path                                                                                                                                                                                                                          |
+| `BLIT_SERVER_NAME`       | `default`                                                                                                          | Server instance name (also `blit server --name NAME`); isolates the socket, state, cache, and built-in extension settings. Address it with `--on local:NAME`                                                                              |
+| `BLIT_EXPORT_SOCK`       | unset                                                                                                              | Set to `1` (or pass `--export-sock` to `blit server`) to export the server's socket path as `BLIT_SOCK` in spawned terminals, so `blit` commands inside them target that server                                                           |
+| `BLIT_INJECT_PATH`       | unset                                                                                                              | Set to `1` (or pass `--inject-path` to `blit server`) to append the server binary's directory to `PATH` in spawned terminals, so `blit` itself is callable inside them                                                                    |
+| `BLIT_UPLINK_TOKEN`      | unset                                                                                                              | Bearer token for the `blit uplink` control endpoint                                                                                                                                                                                       |
+| `BLIT_TARGET`            | unset                                                                                                              | Default remote: a URI or named remote (overrides `target` in `blit.conf`)                                                                                                                                                                 |
+| `BLIT_REMOTES`           | `~/.config/blit/blit.remotes`                                                                                      | Gateway remotes file path (overrides default location)                                                                                                                                                                                    |
+| `BLIT_SCROLLBACK`        | `10000`                                                                                                            | Scrollback rows per PTY                                                                                                                                                                                                                   |
+| `BLIT_HUB`               | `hub.blit.sh`                                                                                                      | Signaling hub URL for WebRTC sharing. On `blit gateway`, sets the default hub for `share:` remotes when `BLIT_GATEWAY_WEBRTC=1`.                                                                                                          |
+| `BLIT_GATEWAY_WEBRTC`    | unset                                                                                                              | Set to `1` on `blit gateway` to proxy `share:` remotes via WebRTC. The gateway connects as a WebRTC consumer and bridges terminals to browsers over WebSocket/WebTransport. Without this, `share:` entries in `blit.remotes` are ignored. |
+| `BLIT_PASSPHRASE`        | unset                                                                                                              | Browser passphrase for `blit gateway`; may be plaintext or an argon2 PHC hash generated by `blit hash-passphrase`. Browsers still enter the plaintext passphrase.                                                                         |
+| `BLIT_PREFIX`            | `/usr/local` or `~/.local` (Unix)                                                                                  | Override install prefix (`bin/`, `lib/`, `share/` go under this)                                                                                                                                                                          |
+| `BLIT_INSTALL_DIR`       | `%LOCALAPPDATA%\blit\bin` (Windows)                                                                                | Override install location (Windows PowerShell installer)                                                                                                                                                                                  |
+| `BLIT_SURFACE_ENCODERS`  | see below                                                                                                          | Comma-separated encoder priority list (see below)                                                                                                                                                                                         |
+| `BLIT_SURFACE_BANDWIDTH` | `ultra`                                                                                                            | Ceiling on video bandwidth: `low`, `medium`, `high`, `ultra`, or a raw AV1 quantizer `10`–`255`. Adaptation is always on and only moves cheaper than this                                                                                 |
+| `BLIT_SURFACE_SPEED`     | `realtime`                                                                                                         | Encoder speed preset: `slow`, `medium`, `fast`, `realtime`, or a raw `10`–`255` (10 = slowest, 255 = fastest)                                                                                                                             |
+| `BLIT_VAAPI_DEVICE`      | `/dev/dri/renderD128`                                                                                              | VA-API render node for hardware-accelerated encoding                                                                                                                                                                                      |
+| `BLIT_CUDA_DEVICE`       | `0`                                                                                                                | CUDA device ordinal for NVENC hardware encoding                                                                                                                                                                                           |
 
 ### Surface video encoders
 

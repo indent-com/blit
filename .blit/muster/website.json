@@ -1,0 +1,10 @@
+{
+  "description": "Astro website dev server on :${PORTS+2} (${INSTANCE})",
+  "requires": ["js-deps"],
+  "command": ["direnv", "exec", "${STACK_DIR}", "dev-website", "${PORTS+2}"],
+  "readyWhen": { "log": "ready in" },
+  "timeoutStart": "2m",
+  "restartOnFailure": true,
+  "restartOnAbnormal": true,
+  "restartOnSuccess": true
+}

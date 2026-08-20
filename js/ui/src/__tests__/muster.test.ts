@@ -1,9 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   EVENT_CAP,
+  followMuster,
   groupUnits,
   MusterMirror,
   openMuster,
+  unitCanStop,
+  unitStartVerb,
   type MusterUnit,
 } from "../muster";
 
@@ -221,6 +224,31 @@ describe("groupUnits", () => {
   });
 });
 
+describe("unitStartVerb", () => {
+  it("restarts completed oneshots instead of sending a no-op start", () => {
+    expect(unitStartVerb({ phase: "exited" })).toBe("restart");
+  });
+
+  it("restarts live units and starts inactive units", () => {
+    expect(unitStartVerb({ phase: "running" })).toBe("restart");
+    expect(unitStartVerb({ phase: "activating" })).toBe("restart");
+    expect(unitStartVerb({ phase: "stopped" })).toBe("start");
+    expect(unitStartVerb({ phase: "failed" })).toBe("start");
+  });
+});
+
+describe("unitCanStop", () => {
+  it("hides Stop for a completed oneshot", () => {
+    expect(unitCanStop({ phase: "exited", type: "oneshot" })).toBe(false);
+  });
+
+  it("keeps Stop for live oneshots and ordinary units", () => {
+    expect(unitCanStop({ phase: "activating", type: "oneshot" })).toBe(true);
+    expect(unitCanStop({ phase: "running", type: "simple" })).toBe(true);
+    expect(unitCanStop({ phase: "exited", type: "simple" })).toBe(true);
+  });
+});
+
 describe("openMuster", () => {
   function fakeChannel() {
     const sent: string[] = [];
@@ -280,5 +308,46 @@ describe("openMuster", () => {
     expect(handle.dir).toBe("/d");
     expect(handle.ready).toBe(true);
     expect(handle.units.get("api")?.pty).toBe(7);
+  });
+});
+
+describe("followMuster", () => {
+  it("opens a fresh handle after the supervisor channel closes", async () => {
+    vi.useFakeTimers();
+    try {
+      const closures: Array<() => void> = [];
+      const connection = {
+        connectChannel: vi.fn(async (_name: string, options?: any) => {
+          closures.push(() => options?.onClosed?.(0, "replaced"));
+          return {
+            channelId: closures.length,
+            name: "blit.muster.v1",
+            peer: "ext:1:0",
+            metadata: new Uint8Array(),
+            availableCredit: 1_000_000n,
+            send: () => true,
+            close: () => {},
+          };
+        }),
+      };
+      const handles: Array<"open" | "closed"> = [];
+      const stop = followMuster(() => connection, {
+        onHandle: (handle) => handles.push(handle ? "open" : "closed"),
+        retryDelayMs: 10,
+      });
+
+      await vi.advanceTimersByTimeAsync(0);
+      expect(connection.connectChannel).toHaveBeenCalledTimes(1);
+      expect(handles).toEqual(["open"]);
+
+      closures[0]?.();
+      expect(handles).toEqual(["open", "closed"]);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(connection.connectChannel).toHaveBeenCalledTimes(2);
+      expect(handles).toEqual(["open", "closed", "open"]);
+      stop();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

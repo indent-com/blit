@@ -269,7 +269,7 @@ pub struct UnitFile {
     pub stop_signal: String,
     #[serde(default = "timeout_stop_default")]
     pub timeout_stop: Duration,
-    #[serde(default)]
+    #[serde(default = "start_limit_default")]
     pub start_limit: u32,
     /// Keys muster does not know. Warned about by `doctor`, never fatal: the
     /// editor's schema is the fast path for a typo, and a newer muster may
@@ -283,6 +283,9 @@ const fn yes() -> bool {
 }
 const fn one() -> u32 {
     1
+}
+fn start_limit_default() -> u32 {
+    5
 }
 fn timeout_start_default() -> Duration {
     Duration(30_000)
@@ -348,6 +351,10 @@ pub struct VarDecl {
     pub kind: Option<String>,
     #[serde(default = "one")]
     pub span: u32,
+    /// First block assigned by an automatic allocator. Keeping the seed with
+    /// the stack makes the main instance deterministic and lets `auto` work
+    /// for the first instance rather than guessing a machine-wide range.
+    pub start: Option<i64>,
 }
 
 impl VarDecl {
@@ -382,6 +389,24 @@ pub struct InstanceFile {
     pub autostart: bool,
 }
 
+/// A top-level source that instantiates one repository-resident stack for the
+/// main checkout and every linked Git worktree.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeSourceFile {
+    /// The main worktree. Naming it is the deliberate act that authorizes
+    /// discovery; muster never searches from a process cwd.
+    pub worktrees: String,
+    /// Path to the stack directory, relative to every worktree root.
+    pub stack: String,
+    #[serde(default)]
+    pub vars: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub omit: Vec<String>,
+    #[serde(default = "yes")]
+    pub autostart: bool,
+}
+
 /// A top-level file naming a directory of ordinary units.
 ///
 /// Unlike an instance, an include adds no suffix: the units keep their own
@@ -403,6 +428,7 @@ pub struct IncludeFile {
 pub enum TopLevel {
     Unit(Box<UnitFile>),
     Instance(Box<InstanceFile>),
+    WorktreeSource(Box<WorktreeSourceFile>),
     Include(Box<IncludeFile>),
 }
 
@@ -413,26 +439,51 @@ pub enum TopLevel {
 /// There is no third syntax to remember, and a subdirectory name containing a
 /// slash was never meaningful.
 pub fn is_path(value: &str) -> bool {
-    value.starts_with('~') || value.starts_with('/') || value.contains('/')
+    value.starts_with('~')
+        || value.starts_with(['/', '\\'])
+        || value.contains(['/', '\\'])
+        || is_absolute_path(value)
+}
+
+pub fn is_absolute_path(value: &str) -> bool {
+    value.starts_with(['/', '\\'])
+        || value.as_bytes().get(1) == Some(&b':')
+            && value
+                .as_bytes()
+                .get(2)
+                .is_some_and(|byte| matches!(byte, b'/' | b'\\'))
 }
 
 /// A top-level file is a unit unless it has a `stack` or an `include`.
 pub fn parse_top_level(file: &str, bytes: &[u8]) -> Result<TopLevel, ConfigError> {
     let value = parse_json(file, bytes)?;
     let named = |field: &str| value.get(field).is_some();
-    match (named("stack"), named("include")) {
-        (true, true) => Err(ConfigError::new(
+    match (named("stack"), named("include"), named("worktrees")) {
+        (_, true, true) | (true, true, false) => Err(ConfigError::new(
             file,
-            "stack and include are mutually exclusive: one instantiates a \
-             template, the other adopts units as they are",
+            "worktrees, stack instances, and include are mutually exclusive",
         )),
-        (true, false) => serde_json::from_value(value)
+        (true, false, true) => {
+            let source: WorktreeSourceFile =
+                serde_json::from_value(value).map_err(|e| ConfigError::new(file, e.to_string()))?;
+            if !is_path(&source.worktrees) {
+                return Err(ConfigError::new(
+                    file,
+                    "worktrees must name a path to the main checkout",
+                ));
+            }
+            crate::worktrees::validate_stack_path(&source.stack)
+                .map_err(|e| ConfigError::new(file, e))?;
+            Ok(TopLevel::WorktreeSource(Box::new(source)))
+        }
+        (true, false, false) => serde_json::from_value(value)
             .map(|i| TopLevel::Instance(Box::new(i)))
             .map_err(|e| ConfigError::new(file, e.to_string())),
-        (false, true) => serde_json::from_value(value)
+        (false, true, false) => serde_json::from_value(value)
             .map(|i| TopLevel::Include(Box::new(i)))
             .map_err(|e| ConfigError::new(file, e.to_string())),
-        (false, false) => {
+        (false, false, true) => Err(ConfigError::new(file, "worktrees requires stack")),
+        (false, false, false) => {
             let unit: UnitFile =
                 serde_json::from_value(value).map_err(|e| ConfigError::new(file, e.to_string()))?;
             unit.validate(file)?;
@@ -692,7 +743,7 @@ mod tests {
         assert_eq!(unit.keep, 1);
         assert_eq!(unit.timeout_start.ms(), 30_000);
         assert_eq!(unit.timeout_stop.ms(), 10_000);
-        assert_eq!(unit.start_limit, 0);
+        assert_eq!(unit.start_limit, 5);
     }
 
     #[test]
@@ -709,6 +760,23 @@ mod tests {
         assert!(matches!(unit, TopLevel::Unit(_)));
         let inst = parse_top_level("b.json", br#"{"stack":"blit","vars":{}}"#).unwrap();
         assert!(matches!(inst, TopLevel::Instance(_)));
+    }
+
+    #[test]
+    fn worktrees_and_stack_make_a_worktree_source() {
+        let source = parse_top_level(
+            "blit.json",
+            br#"{"worktrees":"/src/blit","stack":".blit/muster","vars":{"PORTS":"auto"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(source, TopLevel::WorktreeSource(_)));
+        assert!(
+            parse_top_level(
+                "bad.json",
+                br#"{"worktrees":"blit","stack":".blit/muster"}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -749,9 +817,10 @@ mod tests {
     #[test]
     fn binding_rejects_undeclared_and_missing_parameters() {
         let stack: StackFile = serde_json::from_str(
-            r#"{"vars":{"ROOT":{"required":true},"PORTS":{"kind":"ports","span":4}}}"#,
+            r#"{"vars":{"ROOT":{"required":true},"PORTS":{"kind":"ports","span":4,"start":10000}}}"#,
         )
         .unwrap();
+        assert_eq!(stack.vars["PORTS"].start, Some(10000));
         let ok = bind_vars(
             "epic",
             "blit",
@@ -829,6 +898,8 @@ mod outside_tests {
         assert!(is_path("/src/blit/.blit/muster"));
         assert!(is_path("~/work/stacks/web"));
         assert!(is_path("stacks/web"));
+        assert!(is_path(r"C:\work\stacks\web"));
+        assert!(is_absolute_path(r"C:\work\stacks\web"));
     }
 
     #[test]

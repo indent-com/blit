@@ -16,13 +16,17 @@ import type {
   TerminalPalette,
 } from "@blit-sh/core";
 import {
+  EXT_CONTROL_CANCEL,
   EXT_CONTROL_DISABLE,
+  EXT_CONTROL_ENABLE,
   EXT_CONTROL_REMOVE,
   EXT_CONTROL_RESTART,
   EXT_FLAG_ENABLED,
   EXT_FLAG_PERSIST,
+  EXT_PHASE_BLOCKED,
   EXT_PHASE_NAMES,
   EXT_PHASE_RUNNING,
+  EXT_PHASE_STOPPED,
   formatExtensionId,
 } from "@blit-sh/core";
 import {
@@ -137,7 +141,26 @@ export function ExtensionsPanel(props: {
     });
   };
 
+  const control = (
+    record: BlitExtensionRecord,
+    action: number,
+    noteKey: string,
+  ) => {
+    const connection = host();
+    if (!connection) return;
+    void act(record.name, async () => {
+      await connection.controlExtension(record.extensionId, action);
+      setNote(tp(noteKey, { name: record.name }));
+    });
+  };
+
   const short = (digest: string) => digest.slice(0, 12);
+  const isStopped = (record: BlitExtensionRecord) =>
+    record.phase === EXT_PHASE_STOPPED || record.phase === EXT_PHASE_BLOCKED;
+  const isPersistent = (record: BlitExtensionRecord) =>
+    (record.flags & EXT_FLAG_PERSIST) !== 0;
+  const isEnabled = (record: BlitExtensionRecord) =>
+    (record.flags & EXT_FLAG_ENABLED) !== 0;
 
   return (
     <>
@@ -219,98 +242,104 @@ export function ExtensionsPanel(props: {
             <div
               data-extension={row.label}
               style={{
-                display: "grid",
-                // Every row is its own grid, so the tracks have to be fixed for
-                // the columns to line up — a `max-content` action track makes
-                // each row as wide as its own button count. Wide enough for
-                // all three (Update, Restart, Remove), right-aligned so the
-                // rows that carry fewer still end at the same edge.
-                "grid-template-columns": "minmax(0, 1fr) 6em 13em 7em 14.5em",
-                gap: `${scale().sm}px`,
-                "align-items": "center",
+                display: "flex",
+                "flex-direction": "column",
+                gap: `${scale().xs}px`,
                 padding: `${scale().xs}px 0`,
                 "border-bottom": `1px solid ${theme().border}`,
               }}
             >
-              <span style={{ "min-width": 0 }}>
-                <span
-                  title={
-                    row.installed
-                      ? `id:${formatExtensionId(row.installed.extensionId)}`
-                      : undefined
-                  }
-                >
-                  {row.label}
-                </span>
-                <Show when={row.description}>
-                  <div
-                    style={{
-                      color: theme().dimFg,
-                      "font-size": `${scale().xs}px`,
-                    }}
+              <div
+                style={{
+                  display: "grid",
+                  // The info line keeps fixed columns so phase/digest/flags line
+                  // up across rows. Actions live on their own line below.
+                  "grid-template-columns": "minmax(0, 1fr) 6em 13em 7em",
+                  gap: `${scale().sm}px`,
+                  "align-items": "center",
+                }}
+              >
+                <span style={{ "min-width": 0 }}>
+                  <span
+                    title={
+                      row.installed
+                        ? `id:${formatExtensionId(row.installed.extensionId)}`
+                        : undefined
+                    }
                   >
-                    {row.description}
-                  </div>
-                </Show>
-              </span>
+                    {row.label}
+                  </span>
+                  <Show when={row.description}>
+                    <div
+                      style={{
+                        color: theme().dimFg,
+                        "font-size": `${scale().xs}px`,
+                      }}
+                    >
+                      {row.description}
+                    </div>
+                  </Show>
+                </span>
 
-              <span
-                style={{
-                  color: !row.installed
-                    ? theme().dimFg
-                    : row.installed.phase === EXT_PHASE_RUNNING
-                      ? theme().success
-                      : theme().dimFg,
-                }}
-              >
-                {row.installed
-                  ? (EXT_PHASE_NAMES[row.installed.phase] ??
-                    row.installed.phase)
-                  : t("extensions.available")}
-              </span>
+                <span
+                  style={{
+                    color: !row.installed
+                      ? theme().dimFg
+                      : row.installed.phase === EXT_PHASE_RUNNING
+                        ? theme().success
+                        : theme().dimFg,
+                  }}
+                >
+                  {row.installed
+                    ? (EXT_PHASE_NAMES[row.installed.phase] ??
+                      row.installed.phase)
+                    : t("extensions.available")}
+                </span>
 
-              {/* The digest is the identity, so an update is shown as one. */}
-              <span
-                style={{
-                  color: isOutdated(row) ? theme().warning : theme().dimFg,
-                }}
-                title={
-                  row.installed && row.offered
-                    ? `${row.installed.hash}\n${row.offered.blake3}`
-                    : (row.installed?.hash ?? row.offered?.blake3)
-                }
-              >
-                {short(row.installed?.hash ?? row.offered?.blake3 ?? "")}
-                <Show when={isOutdated(row)}>
-                  {" → "}
-                  {short(row.offered!.blake3)}
-                </Show>
-              </span>
-
-              <span style={{ color: theme().dimFg }}>
-                <Show
-                  when={row.installed}
-                  fallback={
-                    row.offered?.brotliBytes
-                      ? `${Math.round(row.offered.brotliBytes / 1024)} KiB`
-                      : ""
+                {/* The digest is the identity, so an update is shown as one. */}
+                <span
+                  style={{
+                    color: isOutdated(row) ? theme().warning : theme().dimFg,
+                  }}
+                  title={
+                    row.installed && row.offered
+                      ? `${row.installed.hash}\n${row.offered.blake3}`
+                      : (row.installed?.hash ?? row.offered?.blake3)
                   }
                 >
-                  {row.installed!.flags & EXT_FLAG_PERSIST
-                    ? t("extensions.persistent")
-                    : t("extensions.transient")}
-                  {row.installed!.flags & EXT_FLAG_ENABLED
-                    ? ""
-                    : ` ${t("extensions.disabled")}`}
-                </Show>
-              </span>
+                  {short(row.installed?.hash ?? row.offered?.blake3 ?? "")}
+                  <Show when={isOutdated(row)}>
+                    {" → "}
+                    {short(row.offered!.blake3)}
+                  </Show>
+                </span>
 
-              <span
+                <span style={{ color: theme().dimFg }}>
+                  <Show
+                    when={row.installed}
+                    fallback={
+                      row.offered?.brotliBytes
+                        ? `${Math.round(row.offered.brotliBytes / 1024)} KiB`
+                        : ""
+                    }
+                  >
+                    {row.installed!.flags & EXT_FLAG_PERSIST
+                      ? t("extensions.persistent")
+                      : t("extensions.transient")}
+                    {row.installed!.flags & EXT_FLAG_ENABLED
+                      ? ""
+                      : ` ${t("extensions.disabled")}`}
+                  </Show>
+                </span>
+              </div>
+
+              <div
                 style={{
                   display: "flex",
                   gap: `${scale().xs}px`,
                   "align-items": "center",
                   "justify-content": "flex-end",
+                  "flex-wrap": "wrap",
                 }}
               >
                 <Show when={row.offered && !row.installed}>
@@ -344,35 +373,94 @@ export function ExtensionsPanel(props: {
                   </span>
                 </Show>
                 <Show when={row.installed}>
-                  <button
-                    type="button"
-                    disabled={busy() !== null}
-                    style={mergeStyle(ui.btn, {
-                      "font-size": `${scale().sm}px`,
-                    })}
-                    onClick={() =>
-                      void act(row.label, () =>
-                        host()!.controlExtension(
-                          row.installed!.extensionId,
+                  <Show when={isEnabled(row.installed!)}>
+                    <button
+                      type="button"
+                      disabled={busy() !== null}
+                      style={mergeStyle(ui.btn, {
+                        "font-size": `${scale().sm}px`,
+                      })}
+                      onClick={() =>
+                        control(
+                          row.installed!,
                           EXT_CONTROL_RESTART,
-                        ),
-                      )
-                    }
-                  >
-                    {t("extensions.restart")}
-                  </button>
-                  <button
-                    type="button"
-                    disabled={busy() !== null}
-                    style={mergeStyle(ui.btn, {
-                      "font-size": `${scale().sm}px`,
-                    })}
-                    onClick={() => remove(row.installed!)}
-                  >
-                    {t("extensions.remove")}
-                  </button>
+                          isStopped(row.installed!)
+                            ? "extensions.started"
+                            : "extensions.restarted",
+                        )
+                      }
+                    >
+                      {isStopped(row.installed!)
+                        ? t("extensions.start")
+                        : t("extensions.restart")}
+                    </button>
+                  </Show>
+                  <Show when={!isStopped(row.installed!)}>
+                    <button
+                      type="button"
+                      disabled={busy() !== null}
+                      style={mergeStyle(ui.btn, {
+                        "font-size": `${scale().sm}px`,
+                      })}
+                      onClick={() =>
+                        control(row.installed!, EXT_CONTROL_CANCEL, "extensions.stopped")
+                      }
+                    >
+                      {t("extensions.stop")}
+                    </button>
+                  </Show>
+                  <Show when={isPersistent(row.installed!)}>
+                    <Show
+                      when={isEnabled(row.installed!)}
+                      fallback={
+                        <button
+                          type="button"
+                          disabled={busy() !== null}
+                          style={mergeStyle(ui.btn, {
+                            "font-size": `${scale().sm}px`,
+                          })}
+                          onClick={() =>
+                            control(
+                              row.installed!,
+                              EXT_CONTROL_ENABLE,
+                              "extensions.enabledNote",
+                            )
+                          }
+                        >
+                          {t("extensions.enable")}
+                        </button>
+                      }
+                    >
+                      <button
+                        type="button"
+                        disabled={busy() !== null}
+                        style={mergeStyle(ui.btn, {
+                          "font-size": `${scale().sm}px`,
+                        })}
+                        onClick={() =>
+                          control(
+                            row.installed!,
+                            EXT_CONTROL_DISABLE,
+                            "extensions.disabledNote",
+                          )
+                        }
+                      >
+                        {t("extensions.disable")}
+                      </button>
+                    </Show>
+                    <button
+                      type="button"
+                      disabled={busy() !== null}
+                      style={mergeStyle(ui.btn, {
+                        "font-size": `${scale().sm}px`,
+                      })}
+                      onClick={() => remove(row.installed!)}
+                    >
+                      {t("extensions.remove")}
+                    </button>
+                  </Show>
                 </Show>
-              </span>
+              </div>
             </div>
           )}
         </For>

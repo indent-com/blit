@@ -98,6 +98,7 @@ export default bin.buffer;
       },
     },
     server: {
+      strictPort: true,
       fs: {
         allow: [resolve(__dirname, "../..")],
       },

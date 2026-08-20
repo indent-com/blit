@@ -1,0 +1,9 @@
+{
+  "description": "Watch and rebuild browser WASM (${INSTANCE})",
+  "command": ["direnv", "exec", "${STACK_DIR}", "dev-browser-wasm"],
+  "readyWhen": { "log": "browser WASM ready" },
+  "timeoutStart": "10m",
+  "restartOnFailure": true,
+  "restartOnAbnormal": true,
+  "restartOnSuccess": true
+}

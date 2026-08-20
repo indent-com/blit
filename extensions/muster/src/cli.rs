@@ -9,9 +9,130 @@ use blit_ext_muster::config::{self, InstanceFile};
 use blit_ext_muster::journal::{Cause, Record};
 use blit_ext_muster::supervisor::{self, Phase, Unit};
 use blit_guest::Client;
-use blit_guest::command::Invocation;
+use blit_guest::command::{exit_payload, result_payload, stdout_payload};
+use blit_guest::remote;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+
+/// One decoded `blit.cli.v1` INVOKE message.
+#[derive(Clone, Debug)]
+pub(crate) struct CliInvocation {
+    pub args: Vec<String>,
+}
+
+/// Live state of one CLI command channel, tracked manually so the main loop
+/// never blocks waiting for INVOKE.
+pub(crate) struct CliConn {
+    pub channel_id: u32,
+    pub window: u64,
+    pub sent: u64,
+    pub acked: u64,
+    pub received: u64,
+}
+
+/// Sender for one CLI invocation response.
+pub(crate) struct CliTx<'a> {
+    conn: &'a mut CliConn,
+}
+
+impl<'a> CliTx<'a> {
+    pub(crate) fn new(conn: &'a mut CliConn) -> Self {
+        Self { conn }
+    }
+
+    pub(crate) fn stdout(&mut self, client: &mut Client, data: &[u8]) -> Result<(), String> {
+        self.send(client, &stdout_payload(data).map_err(|e| format!("{e}"))?)
+    }
+
+    pub(crate) fn result(
+        &mut self,
+        client: &mut Client,
+        content_type: &str,
+        data: &[u8],
+    ) -> Result<(), String> {
+        self.send(
+            client,
+            &result_payload(content_type, data).map_err(|e| format!("{e}"))?,
+        )
+    }
+
+    pub(crate) fn exit(
+        &mut self,
+        client: &mut Client,
+        code: i32,
+        detail: &str,
+    ) -> Result<(), String> {
+        self.send(
+            client,
+            &exit_payload(code, detail).map_err(|e| format!("{e}"))?,
+        )?;
+        self.close_channel(client, remote::channel::CHANNEL_CLOSE_NORMAL)
+    }
+
+    pub(crate) fn close_channel(&mut self, client: &mut Client, reason: u8) -> Result<(), String> {
+        let packet = remote::channel::msg_channel_close(self.conn.channel_id, reason)
+            .ok_or("invalid cli channel close")?;
+        client.send(&packet).map_err(|e| format!("close: {e:?}"))
+    }
+
+    fn send(&mut self, client: &mut Client, payload: &[u8]) -> Result<(), String> {
+        let len = payload.len() as u64;
+        let available = self
+            .conn
+            .window
+            .saturating_add(self.conn.acked)
+            .saturating_sub(self.conn.sent);
+        if len > available {
+            return Err("cli channel credit exhausted".into());
+        }
+        let packet = remote::channel::msg_channel_data(self.conn.channel_id, payload)
+            .ok_or("cli payload too large")?;
+        client.send(&packet).map_err(|e| format!("send: {e:?}"))?;
+        self.conn.sent = self.conn.sent.saturating_add(len);
+        Ok(())
+    }
+}
+
+/// Decode the first DATA payload on a `blit.cli.v1` channel.
+pub(crate) fn decode_invoke(payload: &[u8]) -> Option<CliInvocation> {
+    const INVOKE: u8 = 1;
+
+    if payload.first() != Some(&INVOKE) || payload.len() < 4 {
+        return None;
+    }
+    let flags = payload[1];
+    if flags & !1 != 0 {
+        return None;
+    }
+    let count = u16::from_le_bytes([payload[2], payload[3]]) as usize;
+    if count > remote::extension::EXT_MAX_ARGS {
+        return None;
+    }
+    let mut offset = 4usize;
+    let mut args = Vec::with_capacity(count);
+    let mut argument_bytes = 0usize;
+    for _ in 0..count {
+        let len_end = offset.checked_add(4)?;
+        let len_bytes = payload.get(offset..len_end)?;
+        let len = u32::from_le_bytes(len_bytes.try_into().ok()?) as usize;
+        if len > remote::extension::EXT_MAX_ARG {
+            return None;
+        }
+        argument_bytes = argument_bytes.checked_add(len)?;
+        if argument_bytes > remote::extension::EXT_MAX_ARGUMENT_BYTES {
+            return None;
+        }
+        offset = len_end;
+        let arg_end = offset.checked_add(len)?;
+        let arg = payload.get(offset..arg_end)?;
+        args.push(String::from_utf8(arg.to_vec()).ok()?);
+        offset = arg_end;
+    }
+    if offset != payload.len() {
+        return None;
+    }
+    Some(CliInvocation { args })
+}
 
 /// Emitted by `@muster schema`, so an editor validates a unit file as it is
 /// typed. Kept deliberately shallow: it is a completion and typo aid, not a
@@ -33,8 +154,13 @@ struct Instantiate<'a> {
 }
 
 impl Muster {
-    pub(crate) fn serve(&mut self, client: &mut Client, mut invocation: Invocation) {
-        let args = invocation.request().args.clone();
+    pub(crate) fn serve(
+        &mut self,
+        client: &mut Client,
+        invocation: &CliInvocation,
+        tx: &mut CliTx<'_>,
+    ) -> Result<(), String> {
+        let args = invocation.args.clone();
         let json = args.iter().any(|a| a == "--json");
         let values = args.iter().any(|a| a == "--values");
         let positional: Vec<&str> = args
@@ -125,12 +251,12 @@ impl Muster {
             other => (2, format!("unknown verb {other:?}\n")),
         };
 
-        let _ = if structured {
-            invocation.result(client, "application/json", text.as_bytes())
+        if structured {
+            tx.result(client, "application/json", text.as_bytes())?
         } else {
-            invocation.stdout(client, text.as_bytes())
+            tx.stdout(client, text.as_bytes())?
         };
-        let _ = invocation.exit(client, code, "");
+        tx.exit(client, code, "")
     }
 
     // ------------------------------------------------------------------ verbs
@@ -287,12 +413,13 @@ impl Muster {
                 .values()
                 .filter_map(|instance| instance.ports)
                 .collect();
-            let seed = self
-                .instances
-                .values()
-                .filter(|instance| instance.stack == stack)
-                .filter_map(|instance| instance.ports.map(|(base, _)| base))
-                .min();
+            let seed = decl.start.or_else(|| {
+                self.instances
+                    .values()
+                    .filter(|instance| instance.stack == stack)
+                    .filter_map(|instance| instance.ports.map(|(base, _)| base))
+                    .min()
+            });
             match config::next_port_block(&taken, seed, decl.span) {
                 Some(base) => {
                     vars.insert(port_var.clone(), json!(base));
@@ -395,6 +522,10 @@ impl Muster {
                     .map(|(name, instance)| json!({
                         "name": name,
                         "stack": instance.stack,
+                        "ports": instance.ports.map(|(base, span)| json!({
+                            "base": base,
+                            "span": span,
+                        })),
                         "ready": self.ready_count(instance),
                         "total": instance.members.len(),
                     }))
@@ -411,8 +542,11 @@ impl Muster {
             out.push_str(&self.unit_row(name, unit));
         }
         for (name, instance) in &self.instances {
+            let ports = instance
+                .ports
+                .map_or_else(String::new, |(base, span)| format!(", ports {base}+{span}"));
             out.push_str(&format!(
-                "{name}\t—\t-\t-\t{}, {}/{} ready\n",
+                "{name}\t—\t-\t-\t{}{ports}, {}/{} ready\n",
                 instance.stack,
                 self.ready_count(instance),
                 instance.members.len()

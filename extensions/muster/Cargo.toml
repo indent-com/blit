@@ -1,6 +1,6 @@
 [package]
 name = "blit-ext-muster"
-description = "Supervise units that run in terminals, from ~/.config/blit/muster"
+description = "Supervise units that run in terminals, from the server instance's muster directory"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

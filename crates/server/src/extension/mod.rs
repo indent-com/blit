@@ -416,7 +416,7 @@ pub(crate) struct ExtensionService {
 }
 
 impl ExtensionService {
-    pub(crate) fn from_env(persist_allowed: bool) -> Arc<Self> {
+    pub(crate) fn from_env(persist_allowed: bool, name: &crate::ServerName) -> Arc<Self> {
         let enabled = crate::extensions_enabled();
         let max_running =
             crate::deployment_usize("BLIT_EXT_MAX_RUNNING", host_running_default()).clamp(1, 4);
@@ -442,11 +442,11 @@ impl ExtensionService {
         let mut definitions = HashMap::new();
 
         if enabled {
-            let opened = ObjectStoreConfig::from_env()
+            let opened = ObjectStoreConfig::from_env(name)
                 .ok_or_else(|| "extension cache directory is unavailable".to_owned())
                 .and_then(|config| ObjectStore::open(config).map_err(|error| error.to_string()));
             match opened {
-                Ok(mut opened_store) => match ExtensionCatalog::from_env() {
+                Ok(mut opened_store) => match ExtensionCatalog::from_env(name) {
                     Ok(mut opened_catalog) => {
                         for persistent in opened_catalog.list() {
                             let mut definition = definition_from_persistent(persistent);
@@ -5729,6 +5729,7 @@ mod tests {
         let boot_generation = 73;
         Arc::new(super::super::AppStateInner {
             config: super::super::Config {
+                name: crate::ServerName::default(),
                 shell: "/bin/sh".into(),
                 shell_flags: String::new(),
                 scrollback: 100,

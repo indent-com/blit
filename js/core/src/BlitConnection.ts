@@ -51,6 +51,7 @@ import {
   S2C_READY,
   S2C_SEARCH_RESULTS,
   S2C_SURFACE_APP_ID,
+  S2C_SURFACE_ORIGIN,
   S2C_SURFACE_ACTIVATED,
   S2C_SURFACE_TEXT_INPUT,
   S2C_SURFACE_CURSOR,
@@ -643,6 +644,51 @@ function readClientOrigin(
     };
   }
   return { kind: "unknown", originKind };
+}
+
+/**
+ * `S2C_SURFACE_ORIGIN` shares 0x32 with desktop tray updates. A surface origin
+ * is self-delimiting, so parse its complete shape before the dispatcher falls
+ * back to the compressed tray format.
+ */
+function readSurfaceOrigin(bytes: Uint8Array): {
+  surfaceId: number;
+  sandboxEngine: string;
+  appId: string;
+  instanceId: string;
+} | null {
+  if (bytes.length < 9 || bytes[0] !== S2C_SURFACE_ORIGIN) return null;
+  try {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    let offset = 3;
+    const takeText = (): string | null => {
+      if (offset + 2 > bytes.length) return null;
+      const length = view.getUint16(offset, true);
+      offset += 2;
+      if (offset + length > bytes.length) return null;
+      const value = textDecoder.decode(bytes.subarray(offset, offset + length));
+      offset += length;
+      return value;
+    };
+    const sandboxEngine = takeText();
+    const appId = takeText();
+    const instanceId = takeText();
+    if (
+      sandboxEngine === null ||
+      appId === null ||
+      instanceId === null ||
+      offset !== bytes.length
+    )
+      return null;
+    return {
+      surfaceId: view.getUint16(1, true),
+      sandboxEngine,
+      appId,
+      instanceId,
+    };
+  } catch {
+    return null;
+  }
 }
 
 /** Unacked upload bytes allowed on the wire at once. Kept small on purpose:
@@ -5965,6 +6011,19 @@ export class BlitConnection {
         return;
       }
       case S2C_TRAY_UPDATE: {
+        const origin = readSurfaceOrigin(bytes);
+        // SurfaceCreated precedes SurfaceOrigin on both the live and initial
+        // paths. Requiring that known id disambiguates the shared opcode
+        // without letting an unlucky compressed tray packet impersonate one.
+        if (origin && this.surfaceStore.getSurfaces().has(origin.surfaceId)) {
+          this.surfaceStore.handleSurfaceOrigin(
+            origin.surfaceId,
+            origin.sandboxEngine,
+            origin.appId,
+            origin.instanceId,
+          );
+          return;
+        }
         if (!this.desktopStore.handleTrayUpdate(bytes)) {
           this._logger.warn(`${this.id}: malformed TRAY_UPDATE`);
         }

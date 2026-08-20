@@ -1430,6 +1430,7 @@ export class SurfaceStore {
       parentId,
       title,
       appId,
+      origin: null,
       width,
       height,
       // S2C_SURFACE_CREATED carries no scale; the S2C_SURFACE_RESIZED the
@@ -1978,6 +1979,22 @@ export class SurfaceStore {
     const surface = this.surfaces.get(surfaceId);
     if (surface) {
       this.surfaces.set(surfaceId, { ...surface, appId });
+      this.emitChange();
+    }
+  }
+
+  handleSurfaceOrigin(
+    surfaceId: number,
+    sandboxEngine: string,
+    appId: string,
+    instanceId: string,
+  ): void {
+    const surface = this.surfaces.get(surfaceId);
+    if (surface) {
+      this.surfaces.set(surfaceId, {
+        ...surface,
+        origin: { sandboxEngine, appId, instanceId },
+      });
       this.emitChange();
     }
   }

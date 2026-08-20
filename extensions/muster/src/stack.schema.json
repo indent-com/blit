@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "muster stack",
+  "type": "object",
+  "properties": {
+    "$schema": { "type": "string" },
+    "description": { "type": "string" },
+    "vars": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "description": { "type": "string" },
+          "required": { "type": "boolean", "default": false },
+          "kind": { "enum": ["ports"] },
+          "span": { "type": "integer", "minimum": 1, "default": 1 },
+          "start": {
+            "description": "First automatic port block; the main worktree receives this exact base.",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

@@ -137,6 +137,12 @@ import { LeftDock, LEFT_PANELS, type LeftPanel } from "./LeftDock";
 import { foldedSections, liveOverrides, toggleSection } from "./dockSections";
 import { settleAttention } from "./surfaceAttention";
 import {
+  groupMusterPreviewResources,
+  isMusterSession,
+  musterSessionLabel,
+  previewSessionsToWatch,
+} from "./musterPreview";
+import {
   formatExpandedHash,
   formatPanelsHash,
   parseExpandedHash,
@@ -746,6 +752,8 @@ function WorkspaceScreen(props: {
   const [previewPanelOpen, setPreviewPanelOpen] = createSignal(
     initPanels?.preview ?? true,
   );
+  const [musterPreviewExpanded, setMusterPreviewExpanded] =
+    createSignal(true);
   const [previewPanelWidth, setPreviewPanelWidth] = createSignal(
     preferredPreviewPanelWidth(),
   );
@@ -2305,6 +2313,9 @@ function WorkspaceScreen(props: {
       (s) => s.state !== "closed" && s.id !== wsState().focusedSessionId,
     );
   });
+  const watchedPreviewSessions = createMemo(() =>
+    previewSessionsToWatch(offScreenSessions(), musterPreviewExpanded()),
+  );
 
   function toggleDebug() {
     setDebugPanel((v) => !v);
@@ -3237,10 +3248,18 @@ function WorkspaceScreen(props: {
     if (al && ov !== "expose") return;
     const desired = new Set<SessionId>();
     const fid = wsState().focusedSessionId;
-    if (fid) desired.add(fid);
+    // A focused terminal can be displaced by a surface/tile while remaining
+    // the core's focus fallback. Do not let that special case keep a folded
+    // off-screen Muster terminal subscribed.
+    const focusedMusterIsFolded =
+      !musterPreviewExpanded() &&
+      offScreenSessions().some(
+        (session) => session.id === fid && isMusterSession(session),
+      );
+    if (fid && !focusedMusterIsFolded) desired.add(fid);
     // Parked terminals are watched only while their thumbnails are rendered.
     if (previewPanelVisible()) {
-      for (const s of offScreenSessions()) desired.add(s.id);
+      for (const s of watchedPreviewSessions()) desired.add(s.id);
     }
     if (ov === "expose") {
       for (const session of sessions()) {
@@ -4789,7 +4808,7 @@ function WorkspaceScreen(props: {
                     manageVisibility={overlay() !== "expose"}
                     extraVisibleSessions={
                       previewPanelVisible()
-                        ? offScreenSessions().map((s) => s.id)
+                        ? watchedPreviewSessions().map((s) => s.id)
                         : []
                     }
                     onAssignmentsChange={setLayoutAssignments}
@@ -4848,6 +4867,7 @@ function WorkspaceScreen(props: {
               parkDropActive={paneDragActive()}
               onParkDrop={parkDraggedAssignment}
               offScreenSessions={offScreenSessions()}
+              allSessions={sessions()}
               surfaces={offScreenSurfaces()}
               focusedSurfaceId={focusedSurfaceId()}
               focusedSurfaceConnId={focusedSurfaceConnId()}
@@ -4871,6 +4891,10 @@ function WorkspaceScreen(props: {
               width={previewPanelWidth()}
               onResize={persistPreviewPanelWidth}
               onClose={togglePreviewPanel}
+              musterExpanded={musterPreviewExpanded()}
+              onToggleMuster={() =>
+                setMusterPreviewExpanded((expanded) => !expanded)
+              }
               backgroundEditors={
                 <For each={backgroundTiles()}>
                   {(assignment, index) => {
@@ -5536,8 +5560,11 @@ function WorkspaceScreen(props: {
 }
 
 function PreviewPanel(props: {
-  offScreenSessions: BlitSession[];
-  surfaces: BlitSurface[];
+  offScreenSessions: readonly BlitSession[];
+  /** Includes displayed terminals so their parked surfaces still have an
+   *  ownership parent in the Muster hierarchy. */
+  allSessions: readonly BlitSession[];
+  surfaces: readonly BlitSurface[];
   focusedSurfaceId: number | null;
   focusedSurfaceConnId: ConnectionId | null;
   /** Is this pane assignment currently lit by an activation? */
@@ -5557,6 +5584,8 @@ function PreviewPanel(props: {
   width: number;
   onResize: (width: number) => void;
   onClose: () => void;
+  musterExpanded: boolean;
+  onToggleMuster: () => void;
   /** Live background-editor cards (rendered by WorkspaceScreen, which owns the
    *  tile assignments), shown above the terminal/surface thumbnails. */
   backgroundEditors?: JSX.Element;
@@ -5570,6 +5599,13 @@ function PreviewPanel(props: {
   const [resizeActive, setResizeActive] = createSignal(false);
   /** The grip drag is hovering the panel (parallel to a pane's highlight). */
   const [parkOver, setParkOver] = createSignal(false);
+  const resources = createMemo(() =>
+    groupMusterPreviewResources(
+      props.offScreenSessions,
+      props.allSessions,
+      props.surfaces,
+    ),
+  );
 
   function handleResizePointerDown(e: PointerEvent) {
     e.preventDefault();
@@ -5735,11 +5771,13 @@ function PreviewPanel(props: {
             flex: "1 1 0",
             "min-height": 0,
             "overflow-y": "auto",
+            display: "flex",
+            "flex-direction": "column",
             ...scrollbarStyle(props.theme),
           }}
         >
           {props.backgroundEditors}
-          <Index each={props.offScreenSessions}>
+          <Index each={resources().sessions}>
             {(s) => (
               <SessionThumbnail
                 session={s()}
@@ -5755,7 +5793,7 @@ function PreviewPanel(props: {
               />
             )}
           </Index>
-          <Index each={props.surfaces}>
+          <Index each={resources().surfaces}>
             {(s) => (
               <SurfaceThumbnail
                 surface={s()}
@@ -5780,6 +5818,152 @@ function PreviewPanel(props: {
               />
             )}
           </Index>
+          <Show when={resources().muster.length > 0}>
+            <div
+              data-blit-muster-preview=""
+              style={{
+                "margin-top": "auto",
+                "border-top": `1px solid ${props.theme.subtleBorder}`,
+              }}
+            >
+              <button
+                type="button"
+                data-blit-muster-toggle=""
+                aria-expanded={props.musterExpanded}
+                aria-controls="blit-muster-preview-body"
+                onClick={props.onToggleMuster}
+                style={mergeStyle(ui.btn, {
+                  width: "100%",
+                  display: "flex",
+                  "align-items": "center",
+                  gap: `${props.scale.tightGap}px`,
+                  padding: `${props.scale.controlY}px ${props.scale.tightGap}px`,
+                  color: props.theme.dimFg,
+                  "font-size": `${props.scale.xs}px`,
+                  "font-weight": "bold",
+                  "letter-spacing": "0.08em",
+                  "text-transform": "uppercase",
+                  "text-align": "left",
+                  opacity: 1,
+                })}
+              >
+                <span aria-hidden="true">
+                  {props.musterExpanded ? "▾" : "▸"}
+                </span>
+                Muster
+              </button>
+              <div
+                id="blit-muster-preview-body"
+                data-blit-muster-body=""
+                hidden={!props.musterExpanded}
+              >
+                <Show when={props.musterExpanded}>
+                  <Index each={resources().muster}>
+                    {(group) => (
+                      <div
+                        data-blit-muster-terminal={group().session.id}
+                        data-blit-muster-tag={group().session.tag}
+                      >
+                        <div
+                          style={{
+                            display: "flex",
+                            "align-items": "center",
+                            gap: `${props.scale.tightGap}px`,
+                            padding: `${props.scale.controlY}px ${props.scale.tightGap}px`,
+                            "border-top": `1px solid ${props.theme.subtleBorder}`,
+                            "font-size": `${props.scale.xs}px`,
+                          }}
+                        >
+                          <span
+                            style={{
+                              flex: 1,
+                              overflow: "hidden",
+                              "text-overflow": "ellipsis",
+                              "white-space": "nowrap",
+                            }}
+                          >
+                            {musterSessionLabel(group().session)}
+                          </span>
+                          <Show when={!group().showTerminal}>
+                            <span style={{ color: props.theme.dimFg }}>
+                              on screen
+                            </span>
+                          </Show>
+                        </div>
+                        <Show when={group().showTerminal}>
+                          <SessionThumbnail
+                            session={group().session}
+                            connectionLabel={props.connectionLabels?.get(
+                              group().session.connectionId,
+                            )}
+                            theme={props.theme}
+                            scale={props.scale}
+                            palette={props.palette}
+                            fontFamily={props.fontFamily}
+                            fontSize={props.fontSize}
+                            isMobileTouch={props.isMobileTouch}
+                            onFocus={() =>
+                              props.onFocusSession(group().session.id)
+                            }
+                            onClose={() =>
+                              props.onCloseSession(group().session.id)
+                            }
+                          />
+                        </Show>
+                        <Show when={group().surfaces.length > 0}>
+                          <div
+                            data-blit-muster-surfaces=""
+                            style={{
+                              "margin-left": `${props.scale.gap}px`,
+                              "border-left": `1px solid ${props.theme.subtleBorder}`,
+                            }}
+                          >
+                            <Index each={group().surfaces}>
+                              {(s) => (
+                                <SurfaceThumbnail
+                                  surface={s()}
+                                  connectionId={s().connectionId}
+                                  connectionLabel={props.connectionLabels?.get(
+                                    s().connectionId,
+                                  )}
+                                  theme={props.theme}
+                                  scale={props.scale}
+                                  focused={
+                                    s().surfaceId === props.focusedSurfaceId &&
+                                    s().connectionId ===
+                                      props.focusedSurfaceConnId
+                                  }
+                                  attention={props.hasAttention(
+                                    surfaceAssignment(
+                                      s().connectionId,
+                                      s().surfaceId,
+                                    ),
+                                  )}
+                                  isMobileTouch={props.isMobileTouch}
+                                  onFocus={() =>
+                                    props.onFocusSurface(
+                                      s().connectionId,
+                                      s().surfaceId,
+                                    )
+                                  }
+                                  onClose={() =>
+                                    props.onCloseSurface(
+                                      s().connectionId,
+                                      s().surfaceId,
+                                    )
+                                  }
+                                />
+                              )}
+                            </Index>
+                          </div>
+                        </Show>
+                      </div>
+                    )}
+                  </Index>
+                </Show>
+              </div>
+            </div>
+          </Show>
         </div>
       </div>
     </div>

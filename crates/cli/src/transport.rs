@@ -451,6 +451,7 @@ pub async fn connect_via_proxy(upstream_uri: &str) -> Result<Transport, String> 
 ///   share:passphrase           — WebRTC via hub
 ///   uplink:token[?control=url] — upsidedown relay attach
 ///   local                      — local blit-server (auto-start)
+///   local:NAME                 — named local blit-server (auto-start)
 ///   proxy:<upstream-uri>       — explicitly route via blit-proxy
 ///   <name>                     — bare name: looked up in `blit.remotes`
 ///
@@ -548,6 +549,14 @@ async fn connect_uri_inner(
         ensure_local_server(&path).await?;
         return connect_ipc(&path).await;
     }
+    if let Some(raw_name) = uri.strip_prefix("local:") {
+        let name: blit_server::ServerName = raw_name
+            .parse()
+            .map_err(|error| format!("invalid local server name: {error}"))?;
+        let path = blit_webserver::config::local_socket_for_name(name.as_str());
+        ensure_local_server_with_name(&path, Some(&name)).await?;
+        return connect_ipc(&path).await;
+    }
     // Bare name — look up in blit.remotes, with cycle detection.
     let entries = blit_webserver::config::read_remotes();
     if let Some((_, target_uri)) = entries.into_iter().find(|(name, _)| name == uri) {
@@ -558,7 +567,7 @@ async fn connect_uri_inner(
     }
     Err(format!(
         "unknown target '{uri}' \
-         (expected ssh:, tcp:, ws://, wss://, wt://, socket:, share:, proxy:, local, \
+         (expected ssh:, tcp:, ws://, wss://, wt://, socket:, share:, proxy:, local[:NAME], \
           or a name from blit.remotes)"
     ))
 }
@@ -602,6 +611,15 @@ pub async fn connect_for_completion(on: &Option<String>, hub: &str) -> Result<Tr
     let effective_target = on.clone().or_else(default_target);
     match effective_target.as_deref() {
         None | Some("local") => connect_ipc(&default_local_socket()).await,
+        Some(uri) if uri.starts_with("local:") => {
+            let name: blit_server::ServerName = uri[6..]
+                .parse()
+                .map_err(|error| format!("invalid local server name: {error}"))?;
+            connect_ipc(&blit_webserver::config::local_socket_for_name(
+                name.as_str(),
+            ))
+            .await
+        }
         Some(uri) => connect_uri(uri, hub).await,
     }
 }
@@ -613,50 +631,116 @@ pub async fn connect_for_completion(on: &Option<String>, hub: &str) -> Result<Tr
 /// died with each short-lived CLI invocation. The spawned `blit server`
 /// outlives us and is shared by later invocations; `blit quit` shuts it
 /// down.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub async fn ensure_local_server(socket_path: &str) -> Result<(), String> {
-    if tokio::net::UnixStream::connect(socket_path).await.is_ok() {
+    ensure_local_server_with_name(socket_path, None).await
+}
+
+pub(crate) async fn ensure_local_server_with_name(
+    socket_path: &str,
+    name: Option<&blit_server::ServerName>,
+) -> Result<(), String> {
+    if local_server_alive(socket_path).await {
         return Ok(());
     }
     // A socket file nobody answers on is a leftover from a dead server;
     // the fresh one must be able to bind.
+    #[cfg(unix)]
     if std::path::Path::new(socket_path).exists() {
         let _ = std::fs::remove_file(socket_path);
     }
-    spawn_detached_server(socket_path)?;
+    let mut spawned = spawn_detached_server(socket_path, name)?;
     for _ in 0..100 {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        if tokio::net::UnixStream::connect(socket_path).await.is_ok() {
+        // Another concurrent auto-start may have won the bind while our
+        // child exited. A live endpoint is success regardless of which child
+        // created it, so check availability before reporting our exit.
+        if local_server_alive(socket_path).await {
             return Ok(());
         }
+        match spawned.try_wait() {
+            Ok(Some(status)) => {
+                if local_server_alive(socket_path).await {
+                    return Ok(());
+                }
+                return Err(spawned.exit_error(status));
+            }
+            Ok(None) => {}
+            Err(error) => return Err(format!("cannot monitor blit server startup: {error}")),
+        }
     }
-    Err("server did not accept connections in time".into())
-}
-
-#[cfg(windows)]
-pub async fn ensure_local_server(pipe_path: &str) -> Result<(), String> {
-    if connect_ipc(pipe_path).await.is_ok() {
+    if local_server_alive(socket_path).await {
         return Ok(());
     }
-    spawn_detached_server(pipe_path)?;
-    for _ in 0..100 {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        if connect_ipc(pipe_path).await.is_ok() {
-            return Ok(());
+    match spawned.try_wait() {
+        Ok(Some(status)) => Err(spawned.exit_error(status)),
+        Ok(None) => Err(spawned.timeout_error()),
+        Err(error) => Err(format!("cannot monitor blit server startup: {error}")),
+    }
+}
+
+async fn local_server_alive(path: &str) -> bool {
+    #[cfg(unix)]
+    {
+        tokio::net::UnixStream::connect(path).await.is_ok()
+    }
+    #[cfg(windows)]
+    {
+        connect_ipc(path).await.is_ok()
+    }
+}
+
+struct SpawnedServer {
+    child: Option<std::process::Child>,
+}
+
+impl SpawnedServer {
+    fn monitor(child: std::process::Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.child.as_mut().expect("child already taken").try_wait()
+    }
+
+    fn exit_error(self, status: std::process::ExitStatus) -> String {
+        format!("server exited before accepting connections ({status})")
+    }
+
+    fn timeout_error(&self) -> String {
+        "server did not accept connections within 5 seconds \
+         (process was still running when last checked)"
+            .to_string()
+    }
+}
+
+impl Drop for SpawnedServer {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            // The server is detached, but it still needs reaping if it exits
+            // while this CLI remains alive.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
         }
     }
-    Err("server did not accept connections in time".into())
 }
 
 /// Spawn `blit server --socket <path>` detached from this process's
 /// session, stdio to the void. Configuration flows through inherited
 /// `BLIT_*`/`SHELL` env vars, which the server command reads itself —
 /// `BLIT_PASSPHRASE` excepted, which is not the server's to hold.
-fn spawn_detached_server(socket_path: &str) -> Result<(), String> {
+fn spawn_detached_server(
+    socket_path: &str,
+    name: Option<&blit_server::ServerName>,
+) -> Result<SpawnedServer, String> {
     let exe = std::env::current_exe().map_err(|e| format!("cannot locate blit executable: {e}"))?;
     let mut cmd = std::process::Command::new(exe);
-    cmd.arg("server")
-        .arg("--socket")
+    cmd.arg("server");
+    if let Some(name) = name {
+        cmd.arg("--name").arg(name.as_str());
+    }
+    cmd.arg("--socket")
         .arg(socket_path)
         // One-shot fs/git/lsp use never touches a surface; skip the
         // compositor/VAAPI bring-up the daemon would otherwise pay for.
@@ -691,20 +775,44 @@ fn spawn_detached_server(socket_path: &str) -> Result<(), String> {
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     }
-    let mut child = cmd
+    let child = cmd
         .spawn()
         .map_err(|e| format!("cannot start blit server: {e}"))?;
-    // Reap in the background so a daemon that exits while a long-lived
-    // client (interactive, share) is still running leaves no zombie.
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
-    Ok(())
+    Ok(SpawnedServer::monitor(child))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn monitored_child_reports_early_exit() {
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = std::process::Command::new("sh");
+            command.args(["-c", "exit 23"]);
+            command
+        };
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = std::process::Command::new("cmd.exe");
+            command.args(["/C", "exit /b 23"]);
+            command
+        };
+        command.stderr(std::process::Stdio::null());
+        let mut spawned = SpawnedServer::monitor(command.spawn().unwrap());
+        let status = loop {
+            if let Some(status) = spawned.try_wait().unwrap() {
+                break status;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+
+        let error = spawned.exit_error(status);
+        assert!(error.contains("server exited before accepting connections"));
+        assert!(error.contains("23"));
+        assert!(!status.success());
+    }
 
     // ── make_frame ──
 

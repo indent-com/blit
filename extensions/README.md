@@ -10,11 +10,11 @@ a `wasm32-unknown-unknown` module, so keeping them out of the root workspace
 stops a plain `cargo build`/`clippy`/`test` at the root from trying to build a
 Wasm guest for the host. The root manifest lists `extensions` in its `exclude`.
 
-| extension            | what it does                                                                                                                                                                                                       |
-| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| [`muster`](muster)   | supervise units that run in terminals, from `~/.config/blit/muster`, with a unit ▸ terminal ▸ windows tree on the `blit.muster.v1` channel: `@muster list\|status\|start\|stop\|restart\|instantiate\|log\|doctor` |
-| [`session`](session) | autostart and supervise GUI applications: `@session list\|enable\|disable\|start\|stop\|forget\|status`                                                                                                            |
-| [`systemd`](systemd) | live system and user unit state on the `blit.systemd.v1` channel, plus a live/paged journal reader: `@systemd list\|get\|watch\|logs\|status`                                                                      |
+| extension            | what it does                                                                                                                                                                                                                      |
+| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`muster`](muster)   | supervise units that run in terminals, from `~/.config/blit/instances/NAME/muster`, with a unit ▸ terminal ▸ windows tree on the `blit.muster.v1` channel: `@muster list\|status\|start\|stop\|restart\|instantiate\|log\|doctor` |
+| [`session`](session) | autostart and supervise GUI applications: `@session list\|enable\|disable\|start\|stop\|forget\|status`                                                                                                                           |
+| [`systemd`](systemd) | live system and user unit state on the `blit.systemd.v1` channel, plus a live/paged journal reader: `@systemd list\|get\|watch\|logs\|status`                                                                                     |
 
 ## Building
 
@@ -84,8 +84,9 @@ anything.
 The Extensions tab of an expanded remote installs from a registry — a
 `manifest.json` and the modules beside it. It defaults to
 `https://install.blit.sh/ext`, except under `vite dev`, where it defaults to
-the dev stack's own registry: `bin/dev` builds `extensions/dist` and serves it
-on the UI's port plus three, so what you install is what you just compiled.
+the dev stack's own registry: `.blit/muster/extensions.json` builds
+`extensions/dist` and serves it on the UI's port plus three, so what you install
+is what you just compiled.
 
 Installed and offered are one list, named once. An extension the server already
 runs shows _Update_ when the registry offers a different digest under the same

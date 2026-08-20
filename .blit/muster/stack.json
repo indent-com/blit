@@ -1,0 +1,12 @@
+{
+  "$schema": "../../extensions/muster/src/stack.schema.json",
+  "description": "blit development stack",
+  "vars": {
+    "PORTS": {
+      "description": "base port block (ui, gateway, website, extensions)",
+      "kind": "ports",
+      "span": 4,
+      "start": 10000
+    }
+  }
+}

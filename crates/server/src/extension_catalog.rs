@@ -138,9 +138,9 @@ impl ExtensionCatalog {
         })
     }
 
-    pub fn from_env() -> Result<Self, CatalogError> {
+    pub fn from_env(name: &crate::ServerName) -> Result<Self, CatalogError> {
         Self::open(
-            catalog_path(),
+            catalog_path(name),
             crate::deployment_usize("BLIT_EXT_MAX_PERSISTENT", DEFAULT_MAX_PERSISTENT),
         )
     }
@@ -724,7 +724,7 @@ impl<'a> Decoder<'a> {
     }
 }
 
-pub fn catalog_path() -> Option<PathBuf> {
+pub fn catalog_path(name: &crate::ServerName) -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("BLIT_EXTENSION_PATH") {
         return Some(PathBuf::from(path));
     }
@@ -740,7 +740,7 @@ pub fn catalog_path() -> Option<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")));
     #[cfg(windows)]
     let base = std::env::var_os("APPDATA").map(PathBuf::from);
-    base.map(|base| base.join("blit/extensions.redb"))
+    base.map(|base| crate::server_name::server_path(&base, name, "extensions.redb"))
 }
 
 #[cfg(unix)]

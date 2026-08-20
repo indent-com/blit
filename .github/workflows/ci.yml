@@ -24,15 +24,6 @@ jobs:
       - name: Check crates.io publication plan
         run: ./bin/publish-crates --plan
 
-  dev-check:
-    runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v7
-      - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
-      - run: nix develop --command ./bin/dev-check
-
   test:
     runs-on: blacksmith-8vcpu-ubuntu-2404
     steps:

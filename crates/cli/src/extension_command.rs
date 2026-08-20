@@ -91,7 +91,7 @@ pub(super) fn parse_external(tokens: Vec<String>) -> Result<(String, Vec<String>
 
 pub(super) async fn list(client: &mut Client) -> Result<i32, String> {
     for record in discover(client).await? {
-        println!("@{}\t{}", record.name, sanitize(&record.descriptor.summary));
+        println!("@{}\t{}", record.name, sanitize(&record.descriptor.summary),);
     }
     Ok(0)
 }

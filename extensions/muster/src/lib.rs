@@ -9,3 +9,4 @@ pub mod config;
 pub mod envfile;
 pub mod journal;
 pub mod supervisor;
+pub mod worktrees;

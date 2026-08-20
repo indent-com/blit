@@ -32,6 +32,10 @@ what is left is an installed application like any other.
 unless the operator passed `--no-persistent-extensions` — which is also what
 makes the intent outlive a restart.
 
+The intent is stored in the server KV database. Consequently servers started
+with different `--name` values have independent application settings, as well
+as independent installed copies of the extension itself.
+
 ## How it starts an application
 
 Three server features do the work, none of which the extension could fake:

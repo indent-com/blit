@@ -36,21 +36,22 @@ let
     ++ lib.optional cfg.audio.enable audioLibSearchPath
   );
 
-  # `XDG_DATA_DIRS` for the server unit, which is where the list of installed
-  # applications comes from: the `session` extension asks the server for its
-  # environment (`ENV_GET`) and scans `$XDG_DATA_DIRS/*/applications` for
-  # `.desktop` files (extensions/session/src/main.rs). A unit inherits none of
-  # the login environment, so without this the extension falls back to the
-  # spec's default of `/usr/local/share:/usr/share` — neither of which exists on
-  # NixOS — and the only applications anyone can launch are whatever happens to
-  # be under `~/.local/share/applications`. Everything installed through a Nix
-  # profile is invisible.
+  # Resolve the user's normal Nix profiles once for both PATH and
+  # `XDG_DATA_DIRS`. The latter is where the list of installed applications
+  # comes from: the `session` extension asks the server for its environment
+  # (`ENV_GET`) and scans `$XDG_DATA_DIRS/*/applications` for `.desktop` files
+  # (extensions/session/src/main.rs). A unit inherits none of the login
+  # environment, so without this the extension falls back to the spec's default
+  # of `/usr/local/share:/usr/share` — neither of which exists on NixOS — and the
+  # only applications anyone can launch are whatever happens to be under
+  # `~/.local/share/applications`. Everything installed through a Nix profile is
+  # invisible.
   #
   # `environment.profiles` is the same list `/etc/profile` turns into
   # `XDG_DATA_DIRS` for an interactive shell, so a session sees the applications
   # its user would see on the console, in the same precedence order, including
   # whatever other modules (Flatpak) have added.
-  userDataDirs =
+  userProfileRoots =
     user:
     let
       home = lib.attrByPath [ user "home" ] "/home/${user}" config.users.users;
@@ -58,9 +59,11 @@ let
       # in terms of another variable would land as a literal and resolve to
       # nothing. Drop those rather than ship a root that cannot exist.
       resolvable = lib.filter (profile: !(lib.hasInfix "\${" profile)) config.environment.profiles;
-      dataDir = profile: lib.replaceStrings [ "$HOME" "$USER" ] [ home user ] profile + "/share";
     in
-    lib.concatMapStringsSep ":" dataDir resolvable;
+    map (profile: lib.replaceStrings [ "$HOME" "$USER" ] [ home user ] profile) resolvable;
+
+  userDataDirs =
+    user: lib.concatMapStringsSep ":" (profile: profile + "/share") (userProfileRoots user);
 in
 {
   options.services.blit = {
@@ -82,7 +85,7 @@ in
       ];
       description = ''
         Users to enable blit for. Each user gets a socket-activated
-        blit server instance at /run/blit/<user>.sock.
+        blit server instance at /run/blit/<user>-default.sock.
       '';
     };
 
@@ -130,9 +133,11 @@ in
           starts in; transient extensions still run without it.
 
           Definitions live in
-          <filename>~/.local/state/blit/extensions.redb</filename> and module
-          bytes in <filename>~/.cache/blit/wasm</filename>, so clearing the
-          cache blocks every persistent extension until one is uploaded again.
+          <filename>~/.local/state/blit/instances/default/extensions.redb</filename>
+          and module bytes in
+          <filename>~/.cache/blit/instances/default/wasm</filename>, so
+          clearing the cache blocks every persistent extension until one is
+          uploaded again.
         '';
       };
 
@@ -439,7 +444,13 @@ in
               ++ lib.optional (pkgs.stdenv.isLinux && cfg.x11.enable) cfg.x11.package
               ++ cfg.languageServers
               # Whatever the extensions on this server shell out to.
-              ++ cfg.extensions.path;
+              ++ cfg.extensions.path
+              # A socket-activated system service does not source /etc/profile,
+              # but exact-argv terminals and extensions still need the user's
+              # normal Nix profiles. In particular, muster can find `direnv`
+              # in the per-user profile and `nix` in the default profile before
+              # entering a checkout's flake environment.
+              ++ userProfileRoots user;
             serviceConfig = {
               Type = "notify";
               User = user;
@@ -493,6 +504,7 @@ in
                 Environment = [
                   "BLIT_ADDR=${gw.addr}:${toString gw.port}"
                 ]
+                ++ lib.optional (gw.user != null) "BLIT_SOCK=/run/blit/${gw.user}-default.sock"
                 ++ lib.optional (effectiveRemoteFile != null) "BLIT_REMOTES=${effectiveRemoteFile}"
                 ++ lib.optional (gw.fontDirs != [ ]) "BLIT_FONT_DIRS=${lib.concatStringsSep ":" gw.fontDirs}"
                 ++ lib.optional gw.storeConfig "BLIT_STORE_CONFIG=1"
@@ -531,7 +543,7 @@ in
                 + lib.optionalString shr.quiet " --quiet"
                 + lib.optionalString shr.verbose " --verbose";
               Environment = [
-                "BLIT_SOCK=/run/blit/${shr.user}.sock"
+                "BLIT_SOCK=/run/blit/${shr.user}-default.sock"
               ]
               ++ lib.optional (shr.hub != null) "BLIT_HUB=${shr.hub}"
               ++ lib.optional shr.verboseWebrtc "BLIT_WEBRTC_VERBOSE=1";
@@ -549,7 +561,7 @@ in
           description = "blit terminal multiplexer socket for ${user}";
           wantedBy = [ "sockets.target" ];
           socketConfig = {
-            ListenStream = "/run/blit/${user}.sock";
+            ListenStream = "/run/blit/${user}-default.sock";
             SocketUser = user;
             SocketMode = "0700";
             RuntimeDirectory = "blit";

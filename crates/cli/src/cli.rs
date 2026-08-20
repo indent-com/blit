@@ -62,7 +62,7 @@ pub struct Cli {
 
 #[derive(Args, Clone)]
 pub struct ConnectOpts {
-    /// Remote to connect to: a URI (ssh:host, tcp:h:p, socket:/p, share:pass, local)
+    /// Remote to connect to: a URI (ssh:host, tcp:h:p, socket:/p, share:pass, local[:name])
     /// or a named remote from blit.remotes. Overrides BLIT_TARGET and blit.conf `target`.
     #[arg(long, global = true)]
     pub on: Option<String>,
@@ -506,6 +506,16 @@ pub enum Command {
     Learn,
     /// Run the blit terminal multiplexer server
     Server {
+        /// Isolate this server's socket, databases, caches, and extension
+        /// settings under NAME (or set BLIT_SERVER_NAME)
+        #[arg(
+            long,
+            env = "BLIT_SERVER_NAME",
+            value_name = "NAME",
+            default_value = "default"
+        )]
+        name: blit_server::ServerName,
+
         /// IPC socket/pipe path (or set BLIT_SOCK)
         #[arg(long)]
         socket: Option<String>,
@@ -2460,5 +2470,25 @@ mod tests {
             panic!("expected server command");
         };
         deployment.into_overrides().unwrap();
+    }
+
+    #[test]
+    fn server_name_defaults_and_is_validated() {
+        let cli = Cli::try_parse_from(["blit", "server", "--name", "work-tree.2"]).unwrap();
+        let Command::Server { name, .. } = cli.command else {
+            panic!("expected server command");
+        };
+        assert_eq!(name.as_str(), "work-tree.2");
+
+        let cli = Cli::try_parse_from(["blit", "server"]).unwrap();
+        let Command::Server { name, .. } = cli.command else {
+            panic!("expected server command");
+        };
+        assert_eq!(name.as_str(), "default");
+
+        let error = Cli::try_parse_from(["blit", "server", "--name", "../other"])
+            .err()
+            .expect("path-like names must be rejected");
+        assert!(error.to_string().contains("server name"));
     }
 }

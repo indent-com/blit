@@ -17,22 +17,9 @@ import type { JSX } from "solid-js";
 import { createSignal, Show } from "solid-js";
 import type { Theme, UIScale } from "./theme";
 import { ui } from "./theme";
+import { pillColor, type PanelTone } from "./panelTone";
 
-/** Semantic status, mapped to a colour by {@link pillColor}. */
-export type PanelTone = "ok" | "warn" | "bad" | "idle";
-
-export function pillColor(theme: Theme, tone: PanelTone): string {
-  switch (tone) {
-    case "ok":
-      return theme.accent;
-    case "warn":
-      return theme.errorText;
-    case "bad":
-      return theme.error;
-    case "idle":
-      return theme.dimFg;
-  }
-}
+export { pillColor, type PanelTone } from "./panelTone";
 
 /**
  * A section label with its count, and room for a control on the right.

@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# One-off install of the repository's worktree source into one server
+# instance's local muster config directory. The main worktree gets the stack's
+# declared port start (10000); linked worktrees receive durable allocations.
+# The server name defaults to BLIT_SERVER_NAME or "default". The connection
+# defaults to blit's effective target and can be selected explicitly:
+#   bin/install-in-muster [--name SERVER] [--on TARGET] [--force]
+#
+# The muster extension is *not* started by this script; run it first, e.g.:
+#   blit ext run --persist --restart always muster extensions/dist/muster.wasm
+
+cd "$(dirname "$0")/.."
+CHECKOUT=$(pwd -P)
+REPO=$(git -C "$CHECKOUT" worktree list --porcelain | sed -n 's/^worktree //p;q')
+STACK_REL=.blit/muster
+STACK_DIR="$REPO/$STACK_REL"
+SERVER_NAME="${BLIT_SERVER_NAME:-default}"
+TARGET=
+FORCE=0
+
+usage() {
+  local status=${1:-2}
+  echo "usage: $0 [--name SERVER] [--on TARGET] [--force]" >&2
+  exit "$status"
+}
+
+while (( $# )); do
+  case "$1" in
+    --name)
+      (( $# >= 2 )) || usage
+      SERVER_NAME=$2
+      shift 2
+      ;;
+    --name=*)
+      SERVER_NAME=${1#--name=}
+      shift
+      ;;
+    --on)
+      (( $# >= 2 )) || usage
+      TARGET=$2
+      shift 2
+      ;;
+    --on=*)
+      TARGET=${1#--on=}
+      shift
+      ;;
+    --force)
+      FORCE=1
+      shift
+      ;;
+    -h|--help)
+      usage 0
+      ;;
+    *)
+      usage
+      ;;
+  esac
+done
+
+if (( ${#SERVER_NAME} == 0 || ${#SERVER_NAME} > 64 )) \
+  || ! [[ "$SERVER_NAME" =~ ^[A-Za-z0-9_.-]+$ ]] \
+  || [[ "$SERVER_NAME" == *. ]]; then
+  echo "invalid server name: $SERVER_NAME" >&2
+  exit 2
+fi
+WINDOWS_STEM=${SERVER_NAME%%.*}
+WINDOWS_STEM=${WINDOWS_STEM^^}
+case "$WINDOWS_STEM" in
+  CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])
+    echo "invalid server name: $SERVER_NAME" >&2
+    exit 2
+    ;;
+esac
+
+if [ ! -d "$STACK_DIR" ]; then
+  echo "FATAL: $STACK_DIR does not exist" >&2
+  exit 1
+fi
+
+NAME=$(basename "$REPO" | tr -c 'A-Za-z0-9_.-' '-' | sed 's/^[.-]*//;s/[.-]*$//')
+[ -z "$NAME" ] && NAME=dev
+
+if [ -n "${BLIT_MUSTER_DIR:-}" ]; then
+  MUSTER_DIR="$BLIT_MUSTER_DIR"
+elif [ -n "${XDG_CONFIG_HOME:-}" ]; then
+  MUSTER_DIR="$XDG_CONFIG_HOME/blit/instances/$SERVER_NAME/muster"
+else
+  MUSTER_DIR="${HOME:-/root}/.config/blit/instances/$SERVER_NAME/muster"
+fi
+
+mkdir -p "$MUSTER_DIR"
+
+FILE="$MUSTER_DIR/$NAME.json"
+if [ -e "$FILE" ] && (( FORCE == 0 )); then
+  echo "$FILE already exists; leaving it unchanged"
+  echo "pass --force to replace it with the worktree source" >&2
+  exit 0
+fi
+
+if ! command -v blit >/dev/null 2>&1; then
+  echo "FATAL: blit is required to verify the running muster extension" >&2
+  exit 1
+fi
+BLIT=(blit)
+if [ -n "$TARGET" ]; then
+  BLIT+=(--on "$TARGET")
+fi
+if ! SCHEMA=$(BLIT_SERVER_NAME="$SERVER_NAME" "${BLIT[@]}" @muster schema); then
+  echo "FATAL: cannot query the running muster extension; build and update it first" >&2
+  exit 1
+fi
+case "$SCHEMA" in
+  *'"worktrees"'*) ;;
+  *)
+    echo "FATAL: the running muster extension does not support worktree sources" >&2
+    echo "build and update muster before replacing its configuration" >&2
+    exit 1
+    ;;
+esac
+
+cat > "$FILE" <<EOF
+{
+  "//": "Managed by bin/install-in-muster",
+  "worktrees": "$REPO",
+  "stack": "$STACK_REL",
+  "vars": {
+    "PORTS": "auto"
+  }
+}
+EOF
+
+echo "installed $NAME -> $FILE"
+
+# If muster is already running, prod it to watch the external stack path.
+if ! BLIT_SERVER_NAME="$SERVER_NAME" "${BLIT[@]}" @muster rewatch >/dev/null; then
+  echo "warning: installed the source, but muster did not accept rewatch" >&2
+fi

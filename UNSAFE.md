@@ -113,7 +113,7 @@ The invariants: Vulkan objects must be destroyed in the correct order — images
 
 ## `PR_SET_PDEATHSIG` on long-lived service children
 
-`AudioPipeline::shutdown` and `DesktopBus::drop` kill their child processes and wait for them. But when the blit server is killed via SIGKILL (e.g. process-compose restart after a rebuild), Rust destructors don't run and the children become orphans reparented to PID 1.
+`AudioPipeline::shutdown` and `DesktopBus::drop` kill their child processes and wait for them. But when the blit server is killed via SIGKILL (for example, during a forced supervisor restart after a rebuild), Rust destructors don't run and the children become orphans reparented to PID 1.
 
 To prevent this, every long-lived service `Command::new()…spawn()` in [`crates/server/src/audio.rs`](crates/server/src/audio.rs) and [`crates/server/src/desktop_bus.rs`](crates/server/src/desktop_bus.rs) uses `pre_exec(pdeathsig_hook())` to call `prctl(PR_SET_PDEATHSIG, SIGTERM)` in the child between fork and exec. This makes the kernel send SIGTERM to the child when its parent dies, regardless of how the parent exits.
 

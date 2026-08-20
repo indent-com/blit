@@ -243,7 +243,7 @@ Seven workflow files live in `.github/workflows/`. The three `_`-prefixed files 
 
 | Workflow                                                             | Trigger                                                                                        | Purpose                                                                                             |
 | -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| [`ci.yml`](.github/workflows/ci.yml)                                 | Push to `main`, PRs                                                                            | Lint, test, e2e, coverage, dev-check, verify builds                                                 |
+| [`ci.yml`](.github/workflows/ci.yml)                                 | Push to `main`, PRs                                                                            | Lint, test, e2e, coverage, verify builds                                                            |
 | [`release.yml`](.github/workflows/release.yml)                       | `v*` tag push                                                                                  | Verify tag signature, build artifacts, create GitHub Release, publish packages, deploy install site |
 | [`deploy-hub.yml`](.github/workflows/deploy-hub.yml)                 | Push to `main` (paths: `js/hub/**`)                                                            | Deploy signaling hub to Fly.io                                                                      |
 | [`deploy-website.yml`](.github/workflows/deploy-website.yml)         | Push to `main` (paths: `js/website/**`, `js/core/**`, `js/react/**`, `crates/browser/**`), PRs | Build website via Nix, deploy to Vercel (prod on main, preview on PRs)                              |
@@ -253,13 +253,12 @@ Seven workflow files live in `.github/workflows/`. The three `_`-prefixed files 
 
 ### CI (ci.yml)
 
-Runs on every push to `main` and on every pull request. Consolidates what was previously separate `test.yml`, `dev-check.yml`, and `coverage.yml` workflows. Build jobs are delegated to reusable workflows (`_build-packages.yml`, `_build-windows.yml`) shared with the release pipeline. On Linux, each architecture builds both debs and tarballs in a single job so they share the Nix store cache.
+Runs on every push to `main` and on every pull request. Build jobs are delegated to reusable workflows (`_build-packages.yml`, `_build-windows.yml`) shared with the release pipeline. On Linux, each architecture builds both debs and tarballs in a single job so they share the Nix store cache.
 
 ```mermaid
 flowchart LR
     PR[Push / PR] --> nix[nix-syntax]
     PR --> lint[lint]
-    PR --> dev[dev-check]
     PR --> test_linux[test<br>linux]
     PR --> test_mac[test<br>macOS]
     PR --> e2e[e2e<br>+ Playwright report]
@@ -274,7 +273,6 @@ flowchart LR
 | ---------------- | ------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
 | `nix-syntax`     | ubuntu (4 vCPU)           | `nix-instantiate --parse` on all `.nix` files — catches syntax errors in modules that aren't evaluated by `nix flake check` |
 | `lint`           | ubuntu (4 vCPU)           | `./bin/lint --check` — `cargo fmt --check` + `prettier --check` + clippy                                                    |
-| `dev-check`      | ubuntu (8 vCPU)           | Enters the Nix devshell and runs `bin/dev-check` (smoke-tests the full dev stack)                                           |
 | `test`           | ubuntu (8 vCPU), macOS    | `./bin/tests` — `cargo test --workspace`                                                                                    |
 | `e2e`            | ubuntu (8 vCPU)           | `./bin/e2e` — Playwright against the full stack; uploads report artifact                                                    |
 | `coverage`       | ubuntu (8 vCPU)           | `./bin/coverage` — runs tests with coverage; uploads HTML report and posts summary on PRs                                   |

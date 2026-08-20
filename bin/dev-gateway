@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+if (( $# != 1 )); then
+  echo "usage: bin/dev-gateway PORT" >&2
+  exit 2
+fi
+
+runtime="/run/user/$(id -u)"
+unset BLIT_SOCK TMPDIR
+if [[ -d "$runtime" ]]; then
+  export XDG_RUNTIME_DIR="$runtime"
+else
+  unset XDG_RUNTIME_DIR
+fi
+
+export BLIT_ADDR="${BLIT_DEV_GW_HOST:-127.0.0.1}:$1"
+export BLIT_QUIC_PUBLIC_ADDR="${BLIT_DEV_WT_ADDR:-:$1}"
+export BLIT_PASSPHRASE="${BLIT_PASSPHRASE:-dev}"
+exec ./target/profiling/blit gateway

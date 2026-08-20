@@ -55,11 +55,22 @@ export function cardAspectRatio(
  * silently keeps a stale shape.
  */
 export function surfaceCardSignature(
-  surface: SurfaceAspectDims & { title: string; appId: string },
+  surface: SurfaceAspectDims & {
+    title: string;
+    appId: string;
+    origin?: {
+      sandboxEngine: string;
+      appId: string;
+      instanceId: string;
+    } | null;
+  },
 ): string {
   return [
     surface.title,
     surface.appId,
+    surface.origin?.sandboxEngine ?? "",
+    surface.origin?.appId ?? "",
+    surface.origin?.instanceId ?? "",
     `${surface.width}x${surface.height}`,
     `${surface.logicalWidth}x${surface.logicalHeight}`,
   ].join("\0");

@@ -10,6 +10,11 @@
 One request, one reply: a client asks for the blit server's environment and
 receives every variable, sorted by key.
 
+`BLIT_SERVER_NAME` is the one derived entry: the effective name (`default` when
+no override was supplied) is included even if it was not present in the process
+environment. This gives built-in extensions the same instance identity without
+mutating the process environment.
+
 It exists because **a client has no other way to learn anything about the
 session it is attached to.** Before this, `WAYLAND_DISPLAY` appeared exactly once
 in the whole server — inside a dead function — and no message carried the

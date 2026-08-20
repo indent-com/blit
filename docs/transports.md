@@ -51,24 +51,26 @@ The primary transport. `blit server` binds a `UnixListener`. All other transport
 **Socket path resolution** (in order):
 
 1. `$BLIT_SOCK` environment variable
-2. `$TMPDIR/blit.sock`
-3. `$XDG_RUNTIME_DIR/blit.sock`
-4. `/tmp/blit-$USER.sock`
-5. `/run/blit/$USER.sock`
-6. `/tmp/blit.sock`
+2. An existing `$TMPDIR/blit-$BLIT_SERVER_NAME.sock`
+3. An existing `$XDG_RUNTIME_DIR/blit-$BLIT_SERVER_NAME.sock`
+4. An existing `/tmp/blit-$USER-$BLIT_SERVER_NAME.sock`
+5. An existing `/run/blit/$USER-$BLIT_SERVER_NAME.sock` packaged system socket
+6. Otherwise the server bind default: `$TMPDIR`, `$XDG_RUNTIME_DIR`, the
+   user-qualified `/tmp` path, then `/tmp/blit-$BLIT_SERVER_NAME.sock`
 
-The CLI and gateway also try `$TMPDIR` and `$XDG_RUNTIME_DIR` variants before falling back, so the same path is found regardless of whether the process is a user service, a session daemon, or an ad-hoc background process.
+`BLIT_SERVER_NAME` defaults to `default`. The CLI, gateway, and SSH transport
+consider only name-suffixed sockets; there is no unnamed socket probe.
 
 ### systemd socket activation
 
 When `LISTEN_FDS=1` is set, the server adopts fd 3 as its listening socket instead of binding. Provided units:
 
-| Unit                                           | Scope                | Socket                              |
-| ---------------------------------------------- | -------------------- | ----------------------------------- |
-| `blit-server.socket` / `blit-server.service`   | user                 | `%t/blit.sock` (runs `blit server`) |
-| `blit.socket` / `blit.service`                 | user                 | `%t/blit.sock` (runs `blit server`) |
-| `blit-server@.socket` / `blit-server@.service` | system, per-user     | `/run/blit/%i.sock`                 |
-| `blit-share@.service`                          | system, per-instance | reads `/etc/blit/share-%i.env`      |
+| Unit                                           | Scope                | Socket                                      |
+| ---------------------------------------------- | -------------------- | ------------------------------------------- |
+| `blit-server.socket` / `blit-server.service`   | user                 | `%t/blit-default.sock` (runs `blit server`) |
+| `blit.socket` / `blit.service`                 | user                 | `%t/blit-default.sock` (runs `blit server`) |
+| `blit-server@.socket` / `blit-server@.service` | system, per-user     | `/run/blit/%i-default.sock`                 |
+| `blit-share@.service`                          | system, per-instance | reads `/etc/blit/share-%i.env`              |
 
 ### fd-channel
 
@@ -390,16 +392,22 @@ When no explicit connection flags are given, the CLI resolves the remote in this
 4. Local blit server (auto-start)
 
 Named targets (bare names with no `:`) are looked up in `~/.config/blit/blit.remotes`. A bare name in `blit.remotes` is not allowed (no recursive resolution).
+`local:NAME` addresses the correspondingly named local server and auto-starts
+it with `blit server --name NAME` when absent. It is also a valid
+`blit.remotes` value; browser and gateway destination lists resolve it to the
+same named socket.
 
 ```bash
 # Save a remote and set it as default
 blit remote add prod ssh:prod.example.com
+blit remote add work local:work
 blit remote set-default prod
 
 # All agent subcommands and blit open now target prod
 blit terminal list
 blit open
 blit --on staging terminal list       # one-off override
+blit --on local:work terminal list    # isolated named local instance
 ```
 
 ---

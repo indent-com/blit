@@ -1,0 +1,22 @@
+{
+  "//": [
+    "The Muster instance is also the named local server instance, so",
+    "blit --on local:${INSTANCE} reaches this exact development server.",
+    "The server's socket lock replaces an older attempt and removes stale sockets.",
+    "Muster cannot probe a Unix socket as a path, and the server's logging stream",
+    "is not observed by its log probe, so readiness uses a short fixed delay.",
+    "restartOnSuccess stays false: the flock-based replacement exits 0 on purpose",
+    "and retrying that loops forever.",
+    "timeoutStop 15s so AudioPipeline::drop can kill dbus/pipewire/pw-cat in order."
+  ],
+  "description": "blit server (${INSTANCE})",
+  "requires": ["build"],
+  "command": ["direnv", "exec", "${STACK_DIR}", "dev-server"],
+  "env": { "BLIT_SERVER_NAME": "${INSTANCE}" },
+  "readyWhen": { "delay": "1s" },
+  "timeoutStart": "10m",
+  "restartDelay": "2s",
+  "startLimit": 5,
+  "keep": 3,
+  "timeoutStop": "15s"
+}

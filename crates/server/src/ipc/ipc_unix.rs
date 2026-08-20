@@ -6,16 +6,39 @@ use tokio::net::UnixListener;
 pub type IpcStream = tokio::net::UnixStream;
 
 pub fn default_ipc_path() -> String {
+    default_ipc_path_for(&crate::ServerName::default())
+}
+
+pub fn default_ipc_path_for(name: &crate::ServerName) -> String {
+    let socket = format!("blit-{}.sock", name.as_str());
     if let Ok(dir) = std::env::var("TMPDIR") {
-        return format!("{dir}/blit.sock");
+        return format!("{dir}/{socket}");
     }
     if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-        return format!("{dir}/blit.sock");
+        return format!("{dir}/{socket}");
     }
     if let Ok(user) = std::env::var("USER") {
-        return format!("/tmp/blit-{user}.sock");
+        return format!("/tmp/blit-{user}-{}.sock", name.as_str());
     }
-    "/tmp/blit.sock".into()
+    format!("/tmp/{socket}")
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    #[test]
+    fn named_socket_has_an_instance_suffix() {
+        let name: crate::ServerName = "work".parse().unwrap();
+        let path = default_ipc_path_for(&name);
+        assert!(path.ends_with("blit-work.sock"), "{path}");
+        assert_ne!(path, default_ipc_path());
+    }
+
+    #[test]
+    fn default_socket_has_the_default_instance_suffix() {
+        assert!(default_ipc_path().ends_with("blit-default.sock"));
+    }
 }
 
 pub struct IpcListener {

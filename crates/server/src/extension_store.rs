@@ -39,8 +39,8 @@ pub struct ObjectStoreConfig {
 }
 
 impl ObjectStoreConfig {
-    pub fn from_env() -> Option<Self> {
-        let root = object_root()?;
+    pub fn from_env(name: &crate::ServerName) -> Option<Self> {
+        let root = object_root(name)?;
         Some(Self {
             allocation_quantum: filesystem_allocation_quantum_near(&root),
             root,
@@ -1807,7 +1807,7 @@ fn set_owner_file(_path: &Path) -> Result<(), ObjectStoreError> {
     Ok(())
 }
 
-fn object_root() -> Option<PathBuf> {
+fn object_root(name: &crate::ServerName) -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("BLIT_WASM_CACHE") {
         return Some(PathBuf::from(path));
     }
@@ -1819,7 +1819,7 @@ fn object_root() -> Option<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")));
     #[cfg(windows)]
     let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
-    base.map(|base| base.join("blit/wasm"))
+    base.map(|base| crate::server_name::server_path(&base, name, "wasm"))
 }
 
 fn encode_hash(hash: &ObjectHash) -> String {

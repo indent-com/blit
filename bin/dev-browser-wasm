@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+exec cargo watch \
+  -w crates/browser/src \
+  -w crates/remote/src \
+  -s 'cd crates/browser && wasm-pack build --target web --release --out-dir pkg && echo "browser WASM ready"'

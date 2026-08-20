@@ -67,7 +67,7 @@ in
     socketPath = mkOption {
       type = types.nullOr types.str;
       default = null;
-      description = "Unix socket path for blit server. Defaults to $TMPDIR/blit.sock.";
+      description = "Unix socket path for blit server. Defaults to $TMPDIR/blit-default.sock.";
     };
 
     gateways = mkOption {
@@ -265,6 +265,9 @@ in
               ];
               EnvironmentVariables = {
                 BLIT_ADDR = "${gw.addr}:${toString gw.port}";
+              }
+              // lib.optionalAttrs (cfg.socketPath != null) {
+                BLIT_SOCK = cfg.socketPath;
               }
               // lib.optionalAttrs (effectiveRemoteFile != null) {
                 BLIT_REMOTES = effectiveRemoteFile;

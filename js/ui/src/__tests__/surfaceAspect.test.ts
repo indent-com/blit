@@ -75,6 +75,18 @@ describe("surfaceCardSignature", () => {
     );
   });
 
+  it("changes when the server-stamped origin arrives", () => {
+    const stamped = {
+      ...base,
+      origin: {
+        sandboxEngine: "wayland",
+        appId: "muster-e74fc019056aae07",
+        instanceId: "7",
+      },
+    };
+    expect(surfaceCardSignature(stamped)).not.toBe(surfaceCardSignature(base));
+  });
+
   it("is stable when nothing the card reads moved", () => {
     expect(surfaceCardSignature({ ...base })).toBe(surfaceCardSignature(base));
   });

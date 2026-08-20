@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+# The Rust embed only needs these files to exist. Preserve real UI builds and
+# create placeholders when the UI has not been built in this worktree yet.
+mkdir -p js/ui/dist
+for asset in index.html sw.js mux-worker.js buffer-recycler-worker.js; do
+  if [[ ! -f "js/ui/dist/$asset.br" ]]; then
+    case "$asset" in
+      *.html) echo '<html><body>stub</body></html>' >"js/ui/dist/$asset" ;;
+      *) echo '/* stub */' >"js/ui/dist/$asset" ;;
+    esac
+    brotli -f -q 11 "js/ui/dist/$asset"
+  fi
+done
+
+exec cargo build -p blit-cli --profile profiling

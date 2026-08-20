@@ -161,6 +161,7 @@ export type {
   BlitDebug,
   BlitSearchResult,
   BlitSurface,
+  BlitSurfaceOrigin,
   BlitWorkspaceSnapshot,
   BlitTransport,
   BlitTransportData,

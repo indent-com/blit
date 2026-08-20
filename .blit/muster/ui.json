@@ -1,0 +1,14 @@
+{
+  "description": "Vite UI dev server on :${PORTS} (${INSTANCE})",
+  "requires": ["js-deps"],
+  "command": ["direnv", "exec", "${STACK_DIR}", "dev-ui", "${PORTS}"],
+  "env": {
+    "BLIT_DEV_GW_PORT": "${PORTS+1}",
+    "BLIT_DEV_EXT_PORT": "${PORTS+3}"
+  },
+  "readyWhen": { "log": "ready in" },
+  "timeoutStart": "2m",
+  "restartOnFailure": true,
+  "restartOnAbnormal": true,
+  "restartOnSuccess": true
+}

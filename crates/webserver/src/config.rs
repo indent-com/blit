@@ -423,34 +423,75 @@ pub fn remotes_path() -> PathBuf {
 
 /// Resolve the local blit server IPC socket path.
 ///
-/// Checks `BLIT_SOCK` first (explicit override), then probes well-known
-/// paths with existence checks so we find a running server regardless of
-/// which fallback it used at startup.
+/// Checks `BLIT_SOCK` first. Otherwise the effective server name is
+/// `BLIT_SERVER_NAME` or `default`, matching `blit server`.
 #[cfg(unix)]
 pub fn default_local_socket() -> String {
     if let Ok(p) = std::env::var("BLIT_SOCK") {
         return p;
     }
-    if let Ok(dir) = std::env::var("TMPDIR") {
-        let p = format!("{dir}/blit.sock");
-        if std::path::Path::new(&p).exists() {
-            return p;
-        }
+    let name = std::env::var("BLIT_SERVER_NAME").unwrap_or_else(|_| "default".into());
+    local_socket_for_name(&name)
+}
+
+/// Whether a server name is a portable socket, named-pipe, and path suffix.
+/// Callers accepting names from configuration use this before passing them to
+/// [`local_socket_for_name`].
+pub fn valid_server_name(name: &str) -> bool {
+    if name.is_empty()
+        || name.len() > 64
+        || name.ends_with('.')
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return false;
     }
-    if let Ok(user) = std::env::var("USER") {
-        let p = format!("/tmp/blit-{user}.sock");
-        if std::path::Path::new(&p).exists() {
-            return p;
-        }
-        let sys = format!("/run/blit/{user}.sock");
-        if std::path::Path::new(&sys).exists() {
-            return sys;
+    let windows_stem = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
+    !matches!(windows_stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        && !windows_stem
+            .strip_prefix("COM")
+            .or_else(|| windows_stem.strip_prefix("LPT"))
+            .is_some_and(|number| number.len() == 1 && matches!(number.as_bytes()[0], b'1'..=b'9'))
+}
+
+/// Resolve one named local server, including the system-service path used by
+/// the packaged per-user socket unit. Only name-suffixed paths are considered.
+#[cfg(unix)]
+pub fn local_socket_for_name(name: &str) -> String {
+    let socket = format!("blit-{name}.sock");
+    if let Ok(dir) = std::env::var("TMPDIR") {
+        let path = format!("{dir}/{socket}");
+        if std::path::Path::new(&path).exists() {
+            return path;
         }
     }
     if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-        return format!("{dir}/blit.sock");
+        let path = format!("{dir}/{socket}");
+        if std::path::Path::new(&path).exists() {
+            return path;
+        }
     }
-    "/tmp/blit.sock".into()
+    if let Ok(user) = std::env::var("USER") {
+        let path = format!("/tmp/blit-{user}-{name}.sock");
+        if std::path::Path::new(&path).exists() {
+            return path;
+        }
+        let system = format!("/run/blit/{user}-{name}.sock");
+        if std::path::Path::new(&system).exists() {
+            return system;
+        }
+    }
+    if let Ok(dir) = std::env::var("TMPDIR") {
+        return format!("{dir}/{socket}");
+    }
+    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
+        return format!("{dir}/{socket}");
+    }
+    if let Ok(user) = std::env::var("USER") {
+        return format!("/tmp/blit-{user}-{name}.sock");
+    }
+    format!("/tmp/{socket}")
 }
 
 /// Resolve the local blit server IPC pipe path (Windows).
@@ -459,8 +500,14 @@ pub fn default_local_socket() -> String {
     if let Ok(p) = std::env::var("BLIT_SOCK") {
         return p;
     }
+    let name = std::env::var("BLIT_SERVER_NAME").unwrap_or_else(|_| "default".into());
+    local_socket_for_name(&name)
+}
+
+#[cfg(windows)]
+pub fn local_socket_for_name(name: &str) -> String {
     let user = std::env::var("USERNAME").unwrap_or_else(|_| "default".into());
-    format!(r"\\.\pipe\blit-{user}")
+    format!(r"\\.\pipe\blit-{user}-{name}")
 }
 
 /// Acquire an exclusive cross-process lock for the config directory.

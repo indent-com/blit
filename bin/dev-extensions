@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+if (( $# != 1 )); then
+  echo "usage: bin/dev-extensions PORT" >&2
+  exit 2
+fi
+
+./bin/extensions
+exec ./bin/ext-registry "$1"

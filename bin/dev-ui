@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/../js/ui"
+
+if (( $# != 1 )); then
+  echo "usage: bin/dev-ui PORT" >&2
+  exit 2
+fi
+
+exec pnpm exec vite --host --port "$1" --strictPort

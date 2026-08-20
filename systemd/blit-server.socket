@@ -3,7 +3,7 @@ Description=blit terminal multiplexer socket
 Conflicts=blit.socket
 
 [Socket]
-ListenStream=%t/blit.sock
+ListenStream=%t/blit-default.sock
 SocketMode=0700
 
 [Install]

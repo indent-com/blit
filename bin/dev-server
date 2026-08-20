@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+: "${BLIT_SERVER_NAME:?BLIT_SERVER_NAME is required}"
+
+runtime="/run/user/$(id -u)"
+unset BLIT_SOCK TMPDIR
+if [[ -d "$runtime" ]]; then
+  export XDG_RUNTIME_DIR="$runtime"
+else
+  unset XDG_RUNTIME_DIR
+fi
+
+exec ./target/profiling/blit server --verbose --name "$BLIT_SERVER_NAME"

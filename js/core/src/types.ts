@@ -548,6 +548,9 @@ export const SURFACE_TEXT_INPUT_ENABLED = 1 << 0;
 /** A fresh committed enable, rather than metadata/reconnect state. */
 export const SURFACE_TEXT_INPUT_REQUESTED = 1 << 1;
 export const S2C_SURFACE_APP_ID = 0x28;
+/** Stamped identity for a surface:
+ * [0x32][surface_id:2][engine_len:2][engine][app_len:2][app][inst_len:2][inst]. */
+export const S2C_SURFACE_ORIGIN = 0x32;
 /** The Wayland client asked for its toplevel to be activated
  *  (xdg_activation_v1): [0x2D][surface_id:2] — raise and focus the pane. */
 export const S2C_SURFACE_ACTIVATED = 0x2d;
@@ -721,12 +724,28 @@ export const S2C_AUDIO_FRAME = 0x30;
 export const AUDIO_FRAME_CODEC_MASK = 0b110;
 export const AUDIO_FRAME_CODEC_OPUS = 0 << 1;
 
+/** Server-stamped identity of the socket a Wayland surface arrived on. */
+export type BlitSurfaceOrigin = {
+  sandboxEngine: string;
+  appId: string;
+  instanceId: string;
+};
+
 export type BlitSurface = {
   connectionId: ConnectionId;
   surfaceId: u16;
   parentId: u16;
   title: string;
   appId: string;
+  /**
+   * Trusted application identity supplied by the server, when the surface
+   * arrived on a stamped app socket. This is distinct from `appId`, which is
+   * self-reported by the Wayland client.
+   *
+   * Optional so callers constructing surface-shaped fixtures remain source
+   * compatible; surfaces created by SurfaceStore set it explicitly.
+   */
+  origin?: BlitSurfaceOrigin | null;
   /** Composited size in physical pixels — what the video stream carries. */
   width: number;
   height: number;

@@ -22,7 +22,10 @@
       "description": "A command line for the server's login shell. Excludes command.",
       "type": "string"
     },
-    "cwd": { "type": "string", "pattern": "^[/~]" },
+    "cwd": {
+      "description": "Working directory. Relative paths in stack templates resolve from STACK_DIR.",
+      "type": "string"
+    },
     "env": { "type": "object", "additionalProperties": { "type": "string" } },
     "envFile": {
       "oneOf": [
@@ -91,10 +94,14 @@
       "minItems": 1
     },
     "timeoutStop": { "type": ["string", "integer"], "default": "10s" },
-    "startLimit": { "type": "integer", "minimum": 0, "default": 0 },
+    "startLimit": { "type": "integer", "minimum": 0, "default": 5 },
 
     "stack": {
-      "description": "A subdirectory name, or a path to a directory anywhere. Makes this file an instance.",
+      "description": "For an instance, a subdirectory name or path. With worktrees, a repository-relative stack path.",
+      "type": "string"
+    },
+    "worktrees": {
+      "description": "Path to a repository's main worktree. With stack, derives one instance per Git worktree.",
       "type": "string"
     },
     "include": {
@@ -110,7 +117,22 @@
       "then": { "not": { "required": ["shell"] } }
     },
     {
-      "if": { "not": { "required": ["stack"] } },
+      "if": { "required": ["worktrees"] },
+      "then": {
+        "required": ["stack"],
+        "not": { "required": ["include"] }
+      }
+    },
+    {
+      "if": {
+        "not": {
+          "anyOf": [
+            { "required": ["stack"] },
+            { "required": ["include"] },
+            { "required": ["worktrees"] }
+          ]
+        }
+      },
       "then": {
         "anyOf": [{ "required": ["command"] }, { "required": ["shell"] }]
       }

@@ -1,9 +1,11 @@
 # `muster`
 
 Supervise units that run in terminals. `muster` reads
-`~/.config/blit/muster/`, starts what it finds in dependency order, restarts
-what crashes or what you edit, and journals every decision. A supervised unit
-is an ordinary blit PTY, so _supervised_ and _attachable_ are the same thing.
+`~/.config/blit/instances/NAME/muster/` (`NAME` defaults to `default`), starts
+what it finds in dependency order, restarts what crashes or what you edit, and
+journals every decision. A supervised unit is an ordinary blit PTY, so
+_supervised_ and _attachable_ are the same thing. `BLIT_MUSTER_DIR` remains an
+explicit override.
 
 ```bash
 blit ext run --persist --restart always muster extensions/dist/muster.wasm
@@ -12,7 +14,7 @@ blit @muster list                      # every unit and instance
 blit @muster status epic/gateway       # one unit, with its retained runs
 blit @muster start|stop|restart NAME   # a unit, or a whole instance
 blit @muster instantiate blit epic \
-     ROOT=/src/blit/wt/epic PORTS=auto  # a stack for a worktree, running
+     PORTS=auto                         # a stack instance, running
 blit @muster log -n 20                 # why something is not running
 blit @muster doctor                    # everything wrong with the directory
 blit @muster env api --values          # which .env file won
@@ -26,12 +28,12 @@ need to run it.
 ## The directory
 
 An entry's name is its basename without `.json`, unique because the filesystem
-says so. A top-level file is a unit unless it has a `"stack"` field, in which
-case it is an instance of the subdirectory it names. Leading `.` is ignored,
-and nothing below the second level is read.
+says so. A top-level file is a unit unless `stack`, `include`, or `worktrees`
+selects an instance, an included unit directory, or a dynamic worktree source.
+Leading `.` is ignored, and nothing below the second level is read.
 
 ```
-~/.config/blit/muster/
+~/.config/blit/instances/default/muster/
   postgres.json          a unit
   blit/                  a stack of templates
     stack.json             its parameter declarations
@@ -51,11 +53,11 @@ the repository it starts and the configuration directory holds only a pointer.
 A bare word is a subdirectory; anything with a `/` or a leading `~` is a path.
 
 ```json
-// ~/.config/blit/muster/epic.json — instantiates a stack from a worktree
+// ~/.config/blit/instances/default/muster/epic.json — a worktree stack
 { "stack": "/src/blit/.claude/worktrees/epic/.blit/muster",
   "vars": { "PORTS": 10010 } }
 
-// ~/.config/blit/muster/work.json — adopts a directory of ordinary units
+// ~/.config/blit/instances/default/muster/work.json — ordinary units
 { "include": "~/work/units" }
 ```
 
@@ -70,7 +72,8 @@ subdirectories are not stacks, because an instance names a stack by path.
 
 Inside a stack, `${STACK_DIR}` is the stack's own directory, and a relative
 `cwd` or `envFile` resolves against it. So a stack at `<repo>/.blit/muster/`
-reaches its checkout with `"cwd": "../.."` and needs no `ROOT` parameter at all.
+reaches its checkout with `"cwd": "../.."`; the stack location is the checkout
+identity.
 
 **Discovery never leaves the configuration directory.** Muster does not look for
 `.blit/muster` in a repository, a cwd, or any ancestor of one: cloning a
@@ -83,6 +86,36 @@ effect the way any other does.
 
 Each distinct external directory costs one `FS_SYNC`, shared between pointers
 that name the same one, and dropped when the last pointer goes away.
+
+### One stack per Git worktree
+
+A worktree source is one deliberate pointer to a repository's main checkout
+and a stack path inside it:
+
+```json
+{
+  "worktrees": "/src/blit",
+  "stack": ".blit/muster",
+  "vars": { "PORTS": "auto" }
+}
+```
+
+The source file's name is the main instance name. If this is `blit.json`, the
+main units are `blit/server` and so on; a linked worktree whose Git
+administrative id is `epic` becomes `blit-epic/server`. Muster watches only
+Git's `worktrees/*/gitdir` pointers and each selected stack directory, not the
+repository or object database.
+
+A port parameter used this way declares both its span and its first block:
+
+```json
+{ "kind": "ports", "span": 4, "start": 10000 }
+```
+
+The main worktree receives `start` exactly. Linked worktrees receive the first
+free block above it; the concrete leases are durable in kv, so inserting or
+removing another worktree does not move them. A removed worktree keeps its
+reservation and receives it again if it returns.
 
 ### Nothing needs telling — except a watch that was refused
 
@@ -121,8 +154,12 @@ load with every member named.
 Ready means `readyWhen`: `spawn` (the fork worked), `{"delay":"2s"}`,
 `{"path":"/tmp/x.sock"}`, `{"log":"listening on"}`, `{"tcp":"127.0.0.1:5432"}`,
 `{"http":"http://127.0.0.1:10001/"}`, or `manual`. A `oneshot` is ready when it
-exits 0, which is how one keyword covers what `process-compose` spells
-`process_completed_successfully` and `process_healthy`.
+exits 0, so successful completion is both its health and its readiness signal.
+
+Re-running a successful `oneshot` is staged. Its dependents keep using the last
+successful result while the new run is in progress or failed; they restart only
+when a later run exits 0. An initial run still gates dependents normally, and an
+explicit `stop` still takes the dependency tree down immediately.
 
 ## Restarting, and never in place
 
@@ -130,6 +167,11 @@ exits 0, which is how one keyword covers what `process-compose` spells
 `restartOnSuccess` does not, because a process that exits 0 usually meant it —
 and the blit dev server exits 0 on purpose when it is replaced, so retrying that
 is an infinite loop.
+
+Retries start with a one-second jittered backoff, capped at 30 seconds. After
+five consecutive failures a unit stays `failed`; set `startLimit` to `0` for no
+limit. A failed `oneshot` is never retried automatically: it is a task with a
+result, and can be started again explicitly after the failure is fixed.
 
 `restartOnAbnormal` is separate from `restartOnFailure` because they answer
 different questions. A process that returns 1 has decided something; a process
@@ -203,7 +245,7 @@ no `cargo`, no `pnpm`, no `node`. The server resolves `command[0]` against the
 child's _own_ environment, so the fix is one shared env file:
 
 ```sh
-# ~/.config/blit/muster/path.env
+# ~/.config/blit/instances/default/muster/path.env
 PATH=/home/you/.nix-profile/bin:/run/current-system/sw/bin:/usr/bin:/bin
 ```
 
@@ -227,7 +269,7 @@ produce `http://127.0.0.1:/`.
 shell's variable.
 
 ```json
-{ "stack": "blit", "vars": { "ROOT": "/src/blit", "PORTS": 10000 } }
+{ "stack": "blit", "vars": { "PORTS": 10000 } }
 ```
 
 Dependencies inside a stack name templates unqualified and always resolve within
@@ -235,15 +277,15 @@ the same instance. `"omit": ["website"]` drops one; anything requiring an
 omitted template fails to load, by name. `"autostart": false` holds the whole
 instance.
 
-Declaring a parameter `{"kind":"ports","span":4}` lets `doctor` report two
-instances whose blocks overlap — the failure mode of several dev stacks, which
-otherwise presents as `EADDRINUSE` in whichever one lost.
+Declaring a parameter `{"kind":"ports","span":4,"start":10000}` lets `auto`
+allocate the first instance and lets `doctor` report two instances whose blocks
+overlap — the failure mode of several dev stacks, which otherwise presents as
+`EADDRINUSE` in whichever one lost.
 
-### One command per worktree
+### One command for a manual instance
 
 ```bash
-cd /src/blit/wt/epic
-blit @muster instantiate blit "$(basename "$PWD")" ROOT="$PWD" PORTS=auto
+blit @muster instantiate blit epic PORTS=auto
 ```
 
 That writes the instance file and starts it, in one command, because those were
@@ -256,9 +298,9 @@ reconcile happen before the answer is sent.
 is a boolean, and everything else is the text you typed, so paths need no
 quoting. `PORTS=auto` takes the lowest free block for a parameter declared
 `{"kind":"ports"}` — free against **every** instance's block, not just this
-stack's. The first instance of a stack has to say a number: nothing declares
-which range the machine has spare, and inventing one would collide with whatever
-already lives there.
+stack's. Its first instance uses the declaration's `start`; without one, the
+first instance still has to say a number rather than guessing a machine-wide
+range.
 
 Nothing is written if the instance would not load — the expansion runs first,
 against the same code that will run it for real, so a forgotten parameter is an
@@ -326,24 +368,21 @@ which is the restart storm adoption exists to prevent.
 the host: unit-file parsing, substitution, dotenv merging, backoff, retention
 and dependency order. Nothing there needs a server.
 
-For the rest, point a private server at a scratch directory — `BLIT_MUSTER_DIR`
-is read from the **server's** environment, since that is whose filesystem is
-being watched:
+For the rest, use a named private server, which gives the socket, extension
+catalog, KV database, cache, and muster directory independent defaults:
 
 ```bash
-blit server --socket /tmp/mus.sock   # with BLIT_MUSTER_DIR=/tmp/mus set on it
-blit --on socket:/tmp/mus.sock ext run --persist --restart always \
+blit server --name mus
+blit --on local:mus ext run --persist --restart always \
      muster extensions/dist/muster.wasm
-blit --on socket:/tmp/mus.sock @muster list
+blit --on local:mus @muster list
 ```
 
-Give it its own `BLIT_EXTENSION_PATH` too, or it will fail to open the catalog
-another server already holds and report the whole extension subsystem as
-disabled — which reads as "this build has no extensions" rather than "that
-database is in use".
+Set `BLIT_MUSTER_DIR` on that server when the automatically namespaced
+configuration directory is not the scratch location you want.
 
-Without `--on socket:…` the CLI talks to whatever server it finds, which is
-usually not the one under test.
+Without `--on local:mus` the CLI talks to its default target, which is usually
+not the server under test.
 
 The browser half is exercised by `e2e/tests/muster-panel.spec.ts`, which brings
 its own units: `start-servers.sh` points the supervisor at an empty
@@ -356,13 +395,6 @@ or starts — whatever you actually supervise.
   is frontend-only work — the pty is already in the client's session list, and
   what is missing is a way for a BSP tile to hand the workspace something to
   place, which is `ide/activeEditor.ts`'s registry pointed the other way.
-- Instances derived from git worktrees. The set is enumerable and watchable
-  (`.git/worktrees/<name>/gitdir` holds each path; the main worktree is not in
-  there and has to be added by hand), and `${ROOT}`/`${INSTANCE}` are exactly a
-  worktree's path and name. The blocker is `PORTS: "auto"` needing to be
-  _stable_: derived from sort order it moves every time an earlier worktree is
-  removed, so it wants a kv-backed ledger — the same kv the durable journal
-  wants.
 - The durable journal tail in kv: the ring is in memory, so `@muster log` starts
   empty after the supervisor restarts.
 - `@muster remove`, the other half of `instantiate`. Deleting an instance file

@@ -27,8 +27,9 @@ const DEV_REGISTRY_PATH = "/ext";
  * Where the panel looks first.
  *
  * Under `vite dev` that is the stack's own registry, reached through the page
- * itself: the dev server proxies `/ext` to the port `bin/dev` allocated for
- * this instance, so a second stack's page still offers that stack's modules.
+ * itself: the dev server proxies `/ext` to the port the development stack
+ * allocated for this instance, so a second stack's page still offers that
+ * stack's modules.
  * Going through the origin rather than a derived port is what makes it work
  * behind a reverse proxy — a page served at https://host/ has no port to
  * offset from, and the registry listens on loopback only, so the offset only

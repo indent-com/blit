@@ -157,10 +157,10 @@ The server persists **nothing** today — terminals survive client
 disconnects only because the server process holds the PTYs, and die
 with it. The KV store is blit's first at-rest state:
 
-- **One [redb](https://github.com/cberner/redb) database** at the
-  platform state path (`$XDG_STATE_HOME/blit/kv.redb`,
-  `~/Library/Application Support/blit/kv.redb` on macOS;
-  `BLIT_KV_PATH` overrides): a single table, key bytes →
+- **One [redb](https://github.com/cberner/redb) database** at the platform
+  state path `blit/instances/NAME/kv.redb` (`NAME` defaults to `default`;
+  `BLIT_KV_PATH` overrides), isolating browser settings and extension state
+  such as `@session` intent: a single table, key bytes →
   `[mtime_ns:8][value…]`. redb is the tree's first embedded-storage
   dependency, taken deliberately: pure Rust, actively maintained, a
   stable file format, and a copy-on-write B-tree whose atomic commits

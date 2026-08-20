@@ -915,7 +915,8 @@ the module object hash.
 ### Cache
 
 Raw modules are persisted under `$BLIT_WASM_CACHE`, otherwise the platform
-cache directory followed by `blit/wasm/objects`. A conceptual path is:
+cache directory followed by `blit/instances/NAME/wasm/objects` (`NAME`
+defaults to `default`). A conceptual path is:
 
 ```text
 objects/ab/cdef...<remaining 62 hex digits>.wasm
@@ -1581,8 +1582,9 @@ instance. The server transactionally stores:
   eligible start time.
 
 Definitions live in `$BLIT_EXTENSION_PATH`, otherwise the platform state
-directory followed by `blit/extensions.redb`. This is authoritative state,
-not an evictable cache. The raw Wasm object remains in the separate
+directory followed by `blit/instances/NAME/extensions.redb` (`NAME` defaults
+to `default`). This is authoritative state, not an evictable cache. The raw
+Wasm object remains in the separate
 content-addressed cache and is pinned by every persistent definition, including
 a disabled one.
 

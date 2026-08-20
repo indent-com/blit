@@ -34,7 +34,7 @@ pub enum Error {
 ///
 /// Wrapped in `sh -c` so the POSIX script runs correctly even when the
 /// remote user's login shell is fish or another non-POSIX shell.
-const SOCK_SEARCH: &str = r#"sh -c 'if [ -n "$BLIT_SOCK" ]; then S="$BLIT_SOCK"; elif [ -n "$TMPDIR" ] && [ -S "$TMPDIR/blit.sock" ]; then S="$TMPDIR/blit.sock"; elif [ -S "/tmp/blit-$(id -un).sock" ]; then S="/tmp/blit-$(id -un).sock"; elif [ -S "/run/blit/$(id -un).sock" ]; then S="/run/blit/$(id -un).sock"; elif [ -n "$XDG_RUNTIME_DIR" ] && [ -S "$XDG_RUNTIME_DIR/blit.sock" ]; then S="$XDG_RUNTIME_DIR/blit.sock"; elif [ -n "$TMPDIR" ]; then S="$TMPDIR/blit.sock"; elif [ -n "$XDG_RUNTIME_DIR" ]; then S="$XDG_RUNTIME_DIR/blit.sock"; else U="$(id -un 2>/dev/null || true)"; if [ -n "$U" ]; then S="/tmp/blit-$U.sock"; else S=/tmp/blit.sock; fi; fi; echo "$S"'"#;
+const SOCK_SEARCH: &str = r#"sh -c 'N="${BLIT_SERVER_NAME:-default}"; U="$(id -un 2>/dev/null || true)"; R="/run/user/$(id -u 2>/dev/null || true)/blit-$N.sock"; if [ -n "$BLIT_SOCK" ]; then S="$BLIT_SOCK"; elif [ -n "$TMPDIR" ] && [ -S "$TMPDIR/blit-$N.sock" ]; then S="$TMPDIR/blit-$N.sock"; elif [ -n "$XDG_RUNTIME_DIR" ] && [ -S "$XDG_RUNTIME_DIR/blit-$N.sock" ]; then S="$XDG_RUNTIME_DIR/blit-$N.sock"; elif [ -n "$U" ] && [ -S "/tmp/blit-$U-$N.sock" ]; then S="/tmp/blit-$U-$N.sock"; elif [ -n "$U" ] && [ -S "/run/blit/$U-$N.sock" ]; then S="/run/blit/$U-$N.sock"; elif [ -S "$R" ]; then S="$R"; elif [ -n "$TMPDIR" ]; then S="$TMPDIR/blit-$N.sock"; elif [ -n "$XDG_RUNTIME_DIR" ]; then S="$XDG_RUNTIME_DIR/blit-$N.sock"; elif [ -n "$U" ]; then S="/tmp/blit-$U-$N.sock"; else S="/tmp/blit-$N.sock"; fi; echo "$S"'"#;
 
 /// Escape a string for use inside double quotes in a POSIX shell.
 /// Handles `\`, `$`, `` ` ``, and `"`.

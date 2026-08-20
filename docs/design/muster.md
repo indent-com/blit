@@ -11,11 +11,12 @@
 
 ## Summary
 
-`muster` reads `~/.config/blit/muster/` and supervises what it finds: starts by
+`muster` reads `~/.config/blit/instances/NAME/muster/` and supervises what it finds: starts by
 declared dependency, restarts on crash or edit, journals every transition. Units
 run as ordinary blit PTYs, so _supervised_ and _attachable_ are the same thing.
-A subdirectory is a **stack** of templates; a top-level file naming one is an
-**instance**, so a stack runs once per worktree with its own ports and sockets.
+A subdirectory is a **stack** of templates; a top-level file can instantiate
+one directly or derive an instance for each Git worktree, with distinct ports
+and sockets.
 
 No protocol changes. `FEATURE_CREATE_EXEC` (argv + env on `CREATE2`) is what
 makes it short.
@@ -39,9 +40,9 @@ ordering, no terminal. A nested `systemd --user` works
 ([../systemd-user-units.md](../systemd-user-units.md)) but wants a wrapper, a
 private runtime dir and a delegated scope, its children are not terminals, and
 its journal is unreadable where the server's user is in neither
-`systemd-journal` nor `adm`. [`process-compose.yml`](../../process-compose.yml)
-is already this shape — it just cannot hand you the terminal a process runs in,
-from a browser, on another machine, after the supervisor is replaced.
+`systemd-journal` nor `adm`. A separate local process supervisor cannot hand
+you the terminal a process runs in from a browser, on another machine, after
+the supervisor is replaced.
 
 **Name.** To muster: to bring into service. A muster roll: the register of a
 unit's members and the record of who answered. Collides with nothing in tree.
@@ -66,7 +67,7 @@ journal that answers "why is this not running"; survive `blit ext update`.
 ## Directory
 
 ```
-~/.config/blit/muster/
+~/.config/blit/instances/default/muster/
   postgres.json          a unit
   path.env               not JSON: a file some units read
   blit/                  a stack
@@ -78,7 +79,10 @@ journal that answers "why is this not running"; survive `blit ext update`.
 ```
 
 Resolved like `blit_config_dir()` (`$XDG_CONFIG_HOME`, else `$HOME/.config`),
-overridable with `BLIT_MUSTER_DIR`.
+then `blit/instances/NAME/muster/`; `NAME` defaults to `default` and
+`BLIT_MUSTER_DIR` overrides the whole path. Two server instances therefore do
+not supervise the same units unless the operator explicitly points them at one
+directory.
 
 - **An entry's name is its basename without `.json`**, unique because the
   filesystem says so. One rule for units, stacks and instances.
@@ -122,7 +126,7 @@ jq` composes both ways.
 | `envFile`          | string \| [entry]   | `[]`         | Read in order. Entry is a path or `{path, optional}`.                        |
 | `type`             | `simple`\|`oneshot` | `simple`     | A `oneshot` is ready when it exits 0.                                        |
 | `readyWhen`        | below               | `"spawn"`    | `simple` only.                                                               |
-| `restartOnFailure` | bool                | `true`       | Retry a nonzero exit.                                                        |
+| `restartOnFailure` | bool                | `true`       | Retry a nonzero exit from a `simple` unit.                                   |
 | `restartOnSuccess` | bool                | `false`      | Retry a clean exit too. Both false = never retry.                            |
 | `restartOnChange`  | bool                | `true`       | Re-run on a change to this file, its template, or a watched `envFile`.       |
 | `restartDelay`     | duration            | —            | Fixed delay, replacing the jittered backoff.                                 |
@@ -130,7 +134,7 @@ jq` composes both ways.
 | `timeoutStart`     | duration            | `30s`        | Budget for `readyWhen`.                                                      |
 | `stopSignal`       | string              | `SIGTERM`    | Sent to the process group.                                                   |
 | `timeoutStop`      | duration            | `10s`        | Grace before SIGKILL.                                                        |
-| `startLimit`       | number              | `0`          | Consecutive failures before `failed`. `0` = no limit.                        |
+| `startLimit`       | number              | `5`          | Consecutive failures before `failed`. `0` = no limit.                        |
 
 Duration: `"250ms"`, `"30s"`, `"5m"`, or a bare number of milliseconds. Exactly
 one of `command`/`shell`; `CREATE2` refuses both as `INVALID`, and so does
@@ -141,6 +145,13 @@ an edit. Two default on — a supervisor that watches a directory and ignores wh
 it sees is worse than none, and the alternative to restarting a crash is a
 stopped unit nobody noticed. `restartOnSuccess` is off because a process that
 exits 0 usually meant it, and disagreeing produces a loop rather than an outage.
+A failed `oneshot` is the exception: it stays failed regardless of restart
+flags, and an explicit start runs the task again after it has been fixed.
+Once a `oneshot` has succeeded, re-running it is a staged replacement: existing
+dependents keep using the prior result through an in-progress or failed run and
+restart only after a replacement exits 0. This avoids turning a failed build or
+migration into an outage. An initial run still gates dependents, and `stop`
+still cascades immediately.
 
 ### `readyWhen`
 
@@ -154,10 +165,10 @@ exits 0 usually meant it, and disagreeing produces a loop rather than an outage.
 | `{"http": "http://127.0.0.1:10001/"}` | `GET` answers below 500 — connect + status line, no TLS, no redirects, no body |
 | `"manual"`                            | `blit @muster ready <unit>`, possibly from the unit itself                     |
 
-`path` and `http` are v1 because four of the five probes in
-`process-compose.yml` are `test -S`, `test -f`, or an HTTP GET; `tcp` is a worse
-approximation of two of them, since a port binds before the thing behind it
-serves. `log` takes its cursor with `SINCE_PROBE` at create — so the match is
+`path` and `http` cover the development stack's socket, generated-file, and
+HTTP readiness checks; `tcp` is a worse approximation for HTTP services, since
+a port binds before the thing behind it serves. `log` takes its cursor with
+`SINCE_PROBE` at create — so the match is
 text that arrives _after_ the unit started, not whatever was already on screen —
 and then arms one `TERM_WAIT`, which the server holds until the needle appears
 or `timeoutStart` runs out. Nothing about `log` polls, so there is no window in
@@ -184,11 +195,11 @@ the server's user is.
 {
   "description": "The blit dev stack",
   "vars": {
-    "ROOT": { "description": "checkout or worktree path", "required": true },
     "PORTS": {
       "description": "base of a 4-port block",
       "kind": "ports",
-      "span": 4
+      "span": 4,
+      "start": 10000
     }
   }
 }
@@ -199,7 +210,7 @@ An instance binds them:
 ```json
 {
   "stack": "blit",
-  "vars": { "ROOT": "/src/blit/.claude/worktrees/epic", "PORTS": 10010 },
+  "vars": { "PORTS": 10010 },
   "omit": ["website"],
   "autostart": false
 }
@@ -227,7 +238,7 @@ configuration directory holds a six-line pointer:
 
 ```json
 // epic.json — instantiates a stack from a worktree
-{ "stack": "/src/blit/.claude/worktrees/epic/.blit/muster", "vars": { "PORTS": 10010 } }
+{ "stack": "/mnt/work/epic/.blit/muster", "vars": { "PORTS": 10010 } }
 
 // work.json — adopts a directory of ordinary units
 { "include": "~/work/units" }
@@ -248,7 +259,8 @@ is what the other pointer is for.
 
 `${STACK_DIR}` is the stack's own directory, and a relative `cwd` or `envFile`
 in a template resolves against it. A stack at `<repo>/.blit/muster/` therefore
-reaches its checkout with `"cwd": "../.."` and needs no `ROOT` parameter.
+reaches its checkout with `"cwd": "../.."`; the stack location is the checkout
+identity.
 
 **Discovery never leaves the configuration directory.** Muster does not look for
 `.blit/muster` in a repository, a cwd, or any ancestor: cloning a repository and
@@ -262,6 +274,40 @@ Each distinct external directory costs one `FS_SYNC`, shared between pointers
 naming the same one and stopped when the last pointer goes away. A root added
 mid-load is empty until its own updates arrive, which triggers another load — so
 a new pointer costs one extra pass, not a missing stack.
+
+### Worktree sources
+
+One pointer can derive the repository-resident stack for the main checkout and
+every linked Git worktree:
+
+```json
+{
+  "worktrees": "/home/alice/code/blit",
+  "stack": ".blit/muster",
+  "vars": { "PORTS": "auto" }
+}
+```
+
+`worktrees` is the explicit main checkout path — still a deliberate grant, not
+cwd discovery. `stack` is relative to each worktree and may not escape it. The
+source file's stem names the main instance; linked instances append Git's
+administrative id. Thus `blit.json` produces `blit/server` for the main
+checkout and `blit-epic/server` for `worktrees/epic/gitdir`.
+
+Muster recursively watches `.git` through an exclusion filter that admits only
+`worktrees/*/gitdir`; object storage, refs, indexes, and logs never enter the
+mirror. The main checkout is explicit because Git does not list it under
+`.git/worktrees`. Each `gitdir` file supplies that linked worktree's actual
+path; it may be anywhere accessible to the server and need not be beneath or
+beside the main checkout. Each discovered stack directory then uses the same
+external stack watch as a manual instance.
+
+An automatic port declaration adds `start` to `kind` and `span`. The main
+worktree owns that exact block. Concrete linked-worktree leases are stored in
+the durable kv record `ext/muster/worktree-ports/v1`; active leases survive set
+reordering, and absent worktrees keep their reservations so returning does not
+change their URLs. A source without kv support or without `start` fails rather
+than deriving unstable ports.
 
 Rejected: a `BLIT_MUSTER_PATH` of search roots, and auto-discovery from a cwd.
 The first needs a cross-root naming scheme and a server restart to change; the
@@ -287,18 +333,20 @@ parameter you forgot to bind should not silently produce `http://127.0.0.1:/`.
 `${` is the only trigger, so a bare `$` is literal and a `shell` template can
 still write `$BLIT_DEV_SOCK` and mean the shell's variable.
 
-Arithmetic exists because a port block is what actually varies, and `bin/dev`
-proves the shape: one integer, four ports at `BASE+0..3`, paths stamped with the
-instance name.
+Arithmetic exists because a port block is what actually varies in the blit
+development stack: one integer, four ports at `BASE+0..3`, paths stamped with
+the instance name.
 
 ### Port blocks
 
-`kind: "ports"` + `span` buys two things:
+`kind: "ports"` + `span` buys two things; `start` supplies the stack's first
+automatic block:
 
 - `PORTS=auto` at `instantiate` scans every instance's block, takes the next free
   base, and **writes the number into the file**. `auto` is never stored or
   re-resolved — an instance always says which ports it took, and says the same
-  tomorrow.
+  tomorrow. The first instance uses `start`; without it the first block must be
+  explicit.
 - `doctor` reports overlapping blocks, which is the failure mode of several dev
   stacks and presents as `EADDRINUSE` in whichever one lost.
 
@@ -344,32 +392,28 @@ in order:
 
 ## Example: the blit dev stack, once per worktree
 
-`process-compose.yml` as a stack. Same graph, probes and restart policies, and
-`bin/dev`'s `DEV_INSTANCE` mechanism falls out rather than being reimplemented.
+The checked-in `.blit/muster` directory is the development stack installed by
+`bin/install-in-muster`. Its graph, probes, and restart policies live beside
+the code they supervise.
 
-`blit/server.json` — every hazard in one file:
+`blit/server.json` — the Muster instance name is also the local server name.
+`bin/dev-server` removes the supervising server's exported socket and selects
+the login user's runtime directory before normal named-socket resolution runs:
 
 ```json
 {
   "//": [
-    "rm -f before the socket check: the old server's UnixListener::drop does not",
-    "unlink, so readyWhen would pass on a stale socket while the new server is",
-    "still bringing up its compositor, and dependents would connect to a dead one.",
+    "blit --on local:${INSTANCE} reaches this exact development server.",
+    "The server's socket lock replaces an older attempt and removes stale sockets.",
     "restartOnSuccess stays false: the flock-based replacement exits 0 on purpose",
-    "and retrying that loops forever. That is why one default is off.",
-    "timeoutStop 15s so AudioPipeline::drop can kill dbus/pipewire/pw-cat in order.",
-    "shell, not command, for the &&. $BLIT_DEV_SOCK is the shell's variable:",
-    "only ${...} is ours."
+    "and retrying that loops forever.",
+    "timeoutStop 15s so AudioPipeline::drop can stop media processes in order."
   ],
   "description": "blit server (${INSTANCE})",
   "requires": ["build"],
-  "cwd": "${ROOT}",
-  "shell": "rm -f $BLIT_DEV_SOCK && exec ./target/profiling/blit server --verbose --socket $BLIT_DEV_SOCK --allow-persistent-extensions",
-  "env": {
-    "BLIT_DEV_SOCK": "/tmp/blit-dev-${INSTANCE}.sock",
-    "BLIT_EXTENSION_PATH": "/tmp/blit-dev-${INSTANCE}-ext/extensions.redb"
-  },
-  "readyWhen": { "path": "/tmp/blit-dev-${INSTANCE}.sock" },
+  "command": ["direnv", "exec", "${STACK_DIR}", "dev-server"],
+  "env": { "BLIT_SERVER_NAME": "${INSTANCE}" },
+  "readyWhen": { "delay": "1s" },
   "restartDelay": "2s",
   "startLimit": 5,
   "keep": 3,
@@ -383,14 +427,10 @@ delivery:
 ```json
 {
   "description": "Gateway on :${PORTS+1} (${INSTANCE})",
-  "requires": ["build", "server"],
-  "cwd": "${ROOT}",
-  "command": ["./target/profiling/blit", "gateway"],
-  "envFile": [{ "path": "${ROOT}/.env.local", "optional": true }],
+  "requires": ["build"],
+  "command": ["direnv", "exec", "${STACK_DIR}", "dev-gateway", "${PORTS+1}"],
   "env": {
-    "BLIT_ADDR": "127.0.0.1:${PORTS+1}",
-    "BLIT_QUIC_PUBLIC_ADDR": ":${PORTS+1}",
-    "BLIT_SOCK": "/tmp/blit-dev-${INSTANCE}.sock",
+    "BLIT_SERVER_NAME": "${INSTANCE}",
     "BLIT_CORS": "*",
     "BLIT_PROXY": "0",
     "BLIT_QUIC": "1",
@@ -401,30 +441,41 @@ delivery:
 }
 ```
 
-Eight templates in all. `ui.json` is `cwd: "${ROOT}/js/ui"`,
-`["pnpm","exec","vite","--host","--port","${PORTS}"]`,
-`readyWhen: {"log": "ready in"}`; `website.json` is the same shape on
-`${PORTS+2}` and `extensions.json` on `${PORTS+3}`. `build.json` and
-`js-deps.json` are `oneshot`s — which is how one keyword covers what
-process-compose spells `process_completed_successfully` and `process_healthy`.
-`browser-wasm.json` watches with
-`readyWhen: {"path": "${ROOT}/crates/browser/pkg/blit_browser.js"}`. With
-`server` and `gateway` above: `main` runs all eight, `epic` omits `website` and
-runs seven. process-compose's ninth process, `share`, is conditional on an
-environment variable being set at all — the shape `omit` replaces.
+Eight templates in all. Every command points direnv at `${STACK_DIR}`. Direnv
+finds the checkout's ancestor `.envrc`, changes to that checkout, and exposes
+its `bin/` on `PATH`; neither Muster nor the templates infer a worktree root
+from the stack's depth or from the main checkout. The JSON retains only graph,
+variables, probes, and restart policy. `build.json` and `js-deps.json` are
+`oneshot`s, so exit status is their readiness signal. With `server` and
+`gateway` above, an installed checkout runs all eight units.
 
-A new worktree is one command:
+A repository is registered with one command after muster is running:
 
 ```bash
-cd /src/blit/.claude/worktrees/epic
-blit @muster instantiate blit "$(basename $PWD)" ROOT="$PWD" PORTS=auto
-blit @muster start epic
+./bin/install-in-muster
+blit @muster list
 ```
 
-`auto` took 10010 because 10000–10003 were spoken for, and wrote `10010` into
-`epic.json`. Its gateway is `:10011`, its socket
-`/tmp/blit-dev-epic.sock`, its terminals `epic/server` and so on in every
-client's catalog.
+The installer writes into the selected server instance's muster directory and
+checks that the running extension understands worktree sources before changing
+its configuration. It uses `BLIT_SERVER_NAME` or `default`; `--name NAME`
+selects one explicitly:
+
+```bash
+./bin/install-in-muster --name work
+```
+
+Extension queries use blit's effective target. When that is not the server
+whose directory is being installed, select it with `--on TARGET`:
+
+```bash
+./bin/install-in-muster --on prod --force
+```
+
+The main worktree's UI is exactly `:10000` and its gateway is `:10001`.
+Linked worktrees receive durable blocks beginning at `10004`, their socket
+includes the derived instance name, and their terminals appear as
+`<instance>/server` and so on in every client's catalog.
 
 Not everything wants a stack: a `postgres`/`migrate`/`api`/`stripe` set at top
 level is four units, and nothing about them differs per instance.
@@ -437,7 +488,7 @@ level is four units, and nothing about them differs per instance.
 | `waiting`    | wanted; a `requires` is not ready                                             |
 | `activating` | PTY created, `readyWhen` unsatisfied                                          |
 | `running`    | ready; dependents may proceed                                                 |
-| `exited`     | `oneshot` finished 0; counts as ready until the file changes                  |
+| `exited`     | `oneshot` finished 0; counts as ready                                         |
 | `backoff`    | failed, retry armed                                                           |
 | `failed`     | gave up: no `restartOn*` applied, `startLimit` exhausted, invalid file, cycle |
 | `held`       | stopped by hand; ignores `autostart` until started or the supervisor restarts |
@@ -515,10 +566,10 @@ no archaeology. Per unit, because the units that want history are not the ones
 that churn: a server crashing twice a day wants several, a watcher that exits on
 every save wants none.
 
-**Backoff.** `BACKOFF_BASE = 250ms`, doubling, `BACKOFF_MAX = 30s`, full jitter,
-`HEALTHY_AFTER = 60s` resets the failure count — the same constants as the
-server's extension supervisor and `session`, because a third set drifts.
-`restartDelay` replaces the schedule with a fixed delay.
+**Backoff.** `BACKOFF_BASE = 1s`, doubling, `BACKOFF_MAX = 30s`, full jitter,
+and `HEALTHY_AFTER = 60s` resets the failure count. The base is longer than the
+server extension supervisor's because every muster retry creates a retained
+terminal. `restartDelay` replaces the schedule with a fixed delay.
 
 ## Dependencies
 
@@ -548,10 +599,10 @@ journal <pty>` already reads it with exit codes and sequence cursors.
 { "seq": 42, "ts": 1755600000180, "unit": "epic/gateway", "instance": "epic",
   "event": "spawn", "phase": "activating", "pty": 7,
   "detail": "./target/profiling/blit gateway",
-  "envFiles": ["/src/blit/.claude/worktrees/epic/.env.local"], "envKeys": 9 }
+  "envFiles": ["/mnt/work/epic/.env.local"], "envKeys": 9 }
 { "seq": 44, "ts": 1755600310114, "unit": "epic/gateway", "event": "exit",
   "phase": "backoff", "pty": 7, "exitCode": 101, "reason": "normal",
-  "detail": "retry 1 in 250ms" }
+  "detail": "retry 1 in 750ms" }
 ```
 
 | event                             | when                                                                          |
@@ -585,7 +636,7 @@ is down after a server restart.
 The ring is sized so it is never the answer to "why is that not in the log":
 bringing up a hundred units emits some hundreds of records, so it holds many
 cold starts. It is bounded at all only because a unit crash-looping at the
-250 ms floor emits records for as long as the supervisor lives.
+one-second base emits records for as long as the supervisor lives.
 
 ## Channel
 
@@ -593,7 +644,7 @@ cold starts. It is bounded at all only because a unit crash-looping at the
 which draws the tree the CLI cannot: instance ▸ unit ▸ (terminal, windows).
 
 ```json
-{ "type": "hello", "version": 1, "dir": "/home/…/.config/blit/muster" }
+{ "type": "hello", "version": 1, "dir": "/home/…/.config/blit/instances/default/muster" }
 { "type": "state", "units": [ … ], "gone": ["epic/old"] }
 { "type": "state", "full": true, "dir": "…",
   "instances": [ { "name": "epic", "stack": "blit", "members": [ … ] } ],
@@ -807,7 +858,7 @@ fallback is a hand-rolled parser and a worse `doctor`, not a worse format.
 
 ## Security
 
-- Writing `~/.config/blit/muster/` is arbitrary execution as the server's user —
+- Writing `~/.config/blit/instances/NAME/muster/` is arbitrary execution as the server's user —
   same as `~/.config/systemd/user`, same as opening a terminal. New: the blit
   protocol reaches that directory (`FS_WRITE`, `FS_UPLOAD`), which is also how
   `instantiate` works — and only there, at the top level: a stack directory
@@ -884,15 +935,6 @@ fallback is a hand-rolled parser and a worse `doctor`, not a worse format.
 - Dependencies across stack boundaries. Omitted because a self-contained stack
   has no ambiguity, and a shared database between per-worktree stacks wants a
   decision about migrations first.
-- Deriving instances from git worktrees. `.git/worktrees/<name>/gitdir` holds
-  each path and is watchable with the machinery already here, and
-  `${ROOT}`/`${INSTANCE}` are exactly a worktree's path and name. Three things
-  bite: the main worktree is not in that directory and must be added by hand; a
-  pruned-but-not-removed worktree still has an entry; and `PORTS: "auto"` has to
-  be **stable**, which derived from sort order it is not — removing an early
-  worktree would shift every block after it onto ports its neighbours just
-  vacated. It wants a kv-backed ledger, which is also what the durable journal
-  wants.
 - Placing a unit's terminal in a pane. Frontend-only: the pty is already in the
   client's session list, and what is missing is a way for a BSP tile to hand the
   workspace something to place — `ide/activeEditor.ts`'s registry pointed the

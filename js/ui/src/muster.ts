@@ -77,6 +77,29 @@ export interface MusterUnit {
   readonly runs: readonly MusterRun[];
 }
 
+/**
+ * The panel's primary action for a unit.
+ *
+ * A successful oneshot stays `exited` and ready, so `start` intentionally does
+ * nothing to it. Re-running it is a restart, just like replacing a live unit.
+ */
+export function unitStartVerb(
+  unit: Pick<MusterUnit, "phase">,
+): "start" | "restart" {
+  return unit.phase === "running" ||
+    unit.phase === "activating" ||
+    unit.phase === "exited"
+    ? "restart"
+    : "start";
+}
+
+/** A completed oneshot has no process left for Stop to act on. */
+export function unitCanStop(
+  unit: Pick<MusterUnit, "phase" | "type">,
+): boolean {
+  return unit.type !== "oneshot" || unit.phase !== "exited";
+}
+
 /** A stack instantiated under a name, and the units it expanded to. */
 export interface MusterInstance {
   readonly name: string;
@@ -102,6 +125,13 @@ export interface MusterEvent {
 export interface MusterOptions {
   onEvents?(events: readonly MusterEvent[]): void;
   onClosed?(reason: number, detail: string): void;
+}
+
+export interface FollowMusterOptions {
+  /** A fresh handle, or null while the channel is being reopened. */
+  onHandle(handle: MusterHandle | null): void;
+  onRetry?(): void;
+  retryDelayMs?: number;
 }
 
 export interface MusterHandle extends ReactiveStore {
@@ -439,5 +469,73 @@ export async function openMuster(
       handle.close();
       channel = null;
     },
+  };
+}
+
+/**
+ * Keep a Muster handle open across extension updates and connection flaps.
+ *
+ * Each reopen gets a fresh mirror. Reusing the old one would append the
+ * supervisor's journal backfill a second time, and an extension replacement
+ * may restart journal sequence numbers from one.
+ */
+export function followMuster(
+  connection: () => ChannelOpener | null,
+  options: FollowMusterOptions,
+): () => void {
+  let live = true;
+  let serial = 0;
+  let handle: MusterHandle | null = null;
+  let retry: ReturnType<typeof setTimeout> | null = null;
+  const retryDelayMs = options.retryDelayMs ?? 250;
+
+  const schedule = () => {
+    if (!live || retry !== null) return;
+    options.onRetry?.();
+    retry = setTimeout(() => {
+      retry = null;
+      void connect();
+    }, retryDelayMs);
+  };
+
+  const connect = async () => {
+    if (!live) return;
+    const opener = connection();
+    if (!opener) {
+      schedule();
+      return;
+    }
+    const mine = ++serial;
+    try {
+      const next = await openMuster(opener, {
+        onClosed: () => {
+          if (!live || mine !== serial) return;
+          // Invalidate the in-flight/open handle before scheduling another;
+          // a late resolution from this generation must not win the race.
+          serial += 1;
+          handle = null;
+          options.onHandle(null);
+          schedule();
+        },
+      });
+      if (!live || mine !== serial) {
+        next.close();
+        return;
+      }
+      handle = next;
+      options.onHandle(next);
+    } catch {
+      if (live && mine === serial) schedule();
+    }
+  };
+
+  void connect();
+  return () => {
+    live = false;
+    serial += 1;
+    if (retry !== null) clearTimeout(retry);
+    retry = null;
+    handle?.close();
+    handle = null;
   };
 }

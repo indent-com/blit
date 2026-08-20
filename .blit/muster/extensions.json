@@ -1,0 +1,8 @@
+{
+  "description": "Extension registry on :${PORTS+3} (${INSTANCE})",
+  "command": ["direnv", "exec", "${STACK_DIR}", "dev-extensions", "${PORTS+3}"],
+  "readyWhen": { "http": "http://127.0.0.1:${PORTS+3}/manifest.json" },
+  "timeoutStart": "10m",
+  "restartDelay": "5s",
+  "startLimit": 3
+}

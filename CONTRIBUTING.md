@@ -34,7 +34,7 @@ When making changes, update the relevant docs in the same PR.
 
 ### Install Nix and direnv
 
-The project uses Nix for all tooling — the Rust toolchain, wasm-pack, pnpm, Node, process-compose, cargo-watch, and everything else. There is no `Makefile` that installs things piecemeal and no list of system dependencies to chase down. One `flake.nix` pins every tool to an exact revision, so every contributor builds with identical versions regardless of OS or distro. If it works in the dev shell, it works in CI.
+The project uses Nix for all tooling — the Rust toolchain, wasm-pack, pnpm, Node, cargo-watch, and everything else. There is no `Makefile` that installs things piecemeal and no list of system dependencies to chase down. One `flake.nix` pins every tool to an exact revision, so every contributor builds with identical versions regardless of OS or distro. If it works in the dev shell, it works in CI.
 
 direnv makes this invisible. Instead of remembering to run `nix develop` every time you `cd` into the repo, direnv evaluates `.envrc`, enters the Nix dev shell, and adds `bin/` to your PATH automatically. Leave the directory and it restores your previous environment. The result: you open a terminal, `cd blit`, and every tool is just there.
 
@@ -69,13 +69,20 @@ You'll need to re-run this every time you open a new terminal in the repo.
 
 ## Quick start
 
-Once you're in the dev shell, start the full stack with hot-reloading:
+Once you're in the dev shell, build and persist the muster extension, then
+install the repository's worktree source:
 
 ```bash
-./bin/dev
+./bin/extensions
+blit ext run --persist --restart always muster extensions/dist/muster.wasm
+./bin/install-in-muster
+blit @muster list
 ```
 
-This launches the build, server, gateway, WASM watcher, and Vite dev servers via `process-compose`. See [Dev environment](#dev-environment) for details on what each process does.
+The extension and worktree registration are one-time setup. Muster watches Git
+and the checked-in `.blit/muster` definitions, adding or removing one stack as
+worktrees appear or disappear. See
+[Dev environment](#dev-environment) for details.
 
 ## Building and testing
 
@@ -110,7 +117,7 @@ E2E (Playwright, requires built binaries):
 ./bin/e2e
 ```
 
-CI (`ci.yml`) runs `./bin/lint`, `./bin/tests`, `./bin/e2e`, `./bin/coverage`, and `./bin/dev-check`. These delegate to `nix run .#<task>`, etc.
+CI (`ci.yml`) runs `./bin/lint`, `./bin/tests`, `./bin/e2e`, and `./bin/coverage`. These delegate to `nix run .#<task>`, etc.
 
 ## Packaging
 
@@ -137,31 +144,60 @@ There is no `rustfmt.toml` or `.clippy.toml` — default rustfmt, prettier, and 
 
 ## Dev environment
 
-`./bin/dev` starts the full stack with hot-reloading via `process-compose`:
+`./bin/install-in-muster` writes one source for the repository into the
+selected server instance's muster configuration directory. The source derives
+an instance for the main checkout and every linked worktree containing
+`.blit/muster`. Pass `--force` to replace an older installer-owned entry and
+`--on TARGET` when blit's effective target is not that server. The installer
+checks the running extension before writing. Each unit points direnv at its own
+`${STACK_DIR}`; direnv finds that checkout's `.envrc`, enters its environment,
+and resolves its `bin/dev-*` entrypoint without deriving the worktree root from
+the stack's path. Muster supervises these units in each instance:
 
-| Process        | What it does                                                               | Default port / socket |
-| -------------- | -------------------------------------------------------------------------- | --------------------- |
-| `build`        | One-shot `cargo build -p blit-cli --profile profiling`; restart to rebuild | n/a                   |
-| `browser-wasm` | Watches `crates/browser/src` + `crates/remote/src`, rebuilds WASM          | n/a                   |
-| `server`       | Runs `blit server`, auto-restarts when the binary changes                  | `/tmp/blit-dev.sock`  |
-| `gateway`      | Runs `blit gateway` with WebSocket + WebTransport (pass=`dev`)             | `127.0.0.1:10001`     |
-| `ui`           | Vite dev server for `js/ui/`                                               | `127.0.0.1:10000`     |
-| `website`      | Astro dev server for `js/website/`                                         | `127.0.0.1:10002`     |
-| `extensions`   | Builds `extensions/dist`, then serves it as a CORS extension registry      | `127.0.0.1:10003`     |
+| Unit           | What it does                                                          | Default port / socket |
+| -------------- | --------------------------------------------------------------------- | --------------------- |
+| `build`        | One-shot `cargo build -p blit-cli --profile profiling`                | n/a                   |
+| `browser-wasm` | Watches `crates/browser/src` + `crates/remote/src`, rebuilding WASM   | n/a                   |
+| `js-deps`      | One-shot `pnpm install --frozen-lockfile`                             | n/a                   |
+| `server`       | Runs the profiling `blit server` build                                | `local:<instance>`    |
+| `gateway`      | Runs `blit gateway` with WebSocket + WebTransport (pass=`dev`)        | `127.0.0.1:10001`     |
+| `ui`           | Vite dev server for `js/ui/`                                          | `127.0.0.1:10000`     |
+| `website`      | Astro dev server for `js/website/`                                    | `127.0.0.1:10002`     |
+| `extensions`   | Builds `extensions/dist`, then serves it as a CORS extension registry | `127.0.0.1:10003`     |
+
+Inspect and control the stack through muster:
+
+```bash
+blit @muster status <instance>/server
+blit @muster restart <instance>/build
+blit @muster log -u <instance>/server -f
+```
 
 ### Running multiple dev stacks
 
-Every port and socket path is derived from `DEV_INSTANCE` (default `0`). Each instance gets a block of ports at `10000 + (N * 10)`:
+The main worktree always receives the four-port block beginning at `10000`.
+Muster allocates a durable block to each linked worktree, so adding or removing
+another worktree never moves an existing stack. Socket and state paths include
+the derived instance name.
+
+Each instance is a standard named local server. Address the main checkout
+directly as `local:blit`, or save it under a shorter target name:
+
+```bash
+blit remote add dev local:blit
+blit --on dev terminal list
+```
+
+The gateway retains the former `.env.local` overrides:
+`BLIT_DEV_GW_HOST` selects its TCP/UDP bind address, `BLIT_DEV_WT_ADDR`
+selects the browser-facing WebTransport authority, and `BLIT_PASSPHRASE`
+replaces the development-only `dev` fallback.
 
 | Instance | UI    | Gateway | Website | Extensions |
 | -------- | ----- | ------- | ------- | ---------- |
-| 0        | 10000 | 10001   | 10002   | 10003      |
-| 1        | 10010 | 10011   | 10012   | 10013      |
-| 2        | 10020 | 10021   | 10022   | 10023      |
-
-```bash
-DEV_INSTANCE=1 ./bin/dev   # second stack on 10010-10013
-```
+| main     | 10000 | 10001   | 10002   | 10003      |
+| second   | 10004 | 10005   | 10006   | 10007      |
+| third    | 10008 | 10009   | 10010   | 10011      |
 
 The UI dev server proxies `/ext` to its own instance's registry, so the
 Extensions tab of a remote offers the modules _this_ stack built rather than
@@ -170,17 +206,10 @@ the published ones. It goes through the page's origin rather than straight to
 tunnel or reverse proxy, where there is no port to derive from and the registry
 port is not published.
 
-`bin/dev` prints the concrete addresses on startup. `DEV_INSTANCE` is intentionally unprefixed: blit strips most `BLIT_*` variables from child terminals, but passes everything else through. This means `DEV_INSTANCE` propagates into nested shells so you always know which instance you're inside and can pick a different one. You can also override individual values:
-
-| Variable             | Default (instance 0) | Description                                            |
-| -------------------- | -------------------- | ------------------------------------------------------ |
-| `DEV_INSTANCE`       | `0`                  | Instance number (0, 1, 2, …)                           |
-| `BLIT_DEV_SOCK`      | `/tmp/blit-dev.sock` | blit server Unix socket                                |
-| `BLIT_DEV_UI_PORT`   | `10000`              | Vite UI dev-server port                                |
-| `BLIT_DEV_GW_PORT`   | `10001`              | Gateway TCP + WebTransport UDP port                    |
-| `BLIT_DEV_WT_ADDR`   | `:10001`             | Browser-facing WebTransport `hostname:port` or `:port` |
-| `BLIT_DEV_SITE_PORT` | `10002`              | Astro website dev-server port                          |
-| `BLIT_DEV_EXT_PORT`  | `10003`              | Extension registry (`extensions/dist`) port            |
+Use `blit @muster stacks`, `list`, `status`, and `doctor` to inspect allocated
+instances, unit state, and configuration errors. See
+[`extensions/muster/README.md`](extensions/muster/README.md) for the complete
+command and configuration reference.
 
 ## Project structure
 
@@ -314,13 +343,13 @@ Hardware AV1 (NVENC, VA-API) goes to 8192x4352; everything else stops at 3840x21
 ### Testing surfaces without a browser
 
 ```bash
-blit -s /tmp/blit-dev.sock start bash
-blit -s /tmp/blit-dev.sock send 1 'foot &\n'
-blit -s /tmp/blit-dev.sock surfaces          # list surfaces (TSV)
-blit -s /tmp/blit-dev.sock capture 1         # screenshot → surface-1.png
-blit -s /tmp/blit-dev.sock click 1 100 50    # click at (x, y)
-blit -s /tmp/blit-dev.sock key 1 Return      # press a key
-blit -s /tmp/blit-dev.sock type 1 'hello'    # type text
+blit --on local:blit terminal start bash
+blit --on local:blit terminal send 1 'foot &\n'
+blit --on local:blit surface list             # list surfaces (TSV)
+blit --on local:blit surface capture 1        # screenshot → surface-1.png
+blit --on local:blit surface click 1 100 50   # click at (x, y)
+blit --on local:blit surface key 1 Return     # press a key
+blit --on local:blit surface type 1 'hello'   # type text
 ```
 
 ### Wire protocol surface messages

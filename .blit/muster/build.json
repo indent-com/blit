@@ -1,0 +1,6 @@
+{
+  "description": "Build blit CLI and stub embedded UI assets (${INSTANCE})",
+  "type": "oneshot",
+  "command": ["direnv", "exec", "${STACK_DIR}", "dev-build"],
+  "timeoutStart": "10m"
+}

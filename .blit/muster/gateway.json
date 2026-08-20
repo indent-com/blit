@@ -1,0 +1,17 @@
+{
+  "description": "Gateway on :${PORTS+1} (${INSTANCE})",
+  "requires": ["build"],
+  "command": ["direnv", "exec", "${STACK_DIR}", "dev-gateway", "${PORTS+1}"],
+  "env": {
+    "BLIT_SERVER_NAME": "${INSTANCE}",
+    "BLIT_CORS": "*",
+    "BLIT_PROXY": "0",
+    "BLIT_QUIC": "1",
+    "BLIT_STORE_CONFIG": "1"
+  },
+  "readyWhen": { "http": "http://127.0.0.1:${PORTS+1}/" },
+  "timeoutStart": "10m",
+  "restartOnFailure": true,
+  "restartOnAbnormal": true,
+  "restartOnSuccess": true
+}

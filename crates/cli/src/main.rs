@@ -1062,6 +1062,7 @@ async fn async_main() {
             }
         }
         Command::Server {
+            name,
             socket,
             shell_flags,
             scrollback,
@@ -1120,7 +1121,7 @@ async fn async_main() {
             };
             let ipc_path = socket
                 .or_else(|| std::env::var("BLIT_SOCK").ok())
-                .unwrap_or_else(blit_server::default_ipc_path);
+                .unwrap_or_else(|| blit_server::default_ipc_path_for(&name));
 
             #[cfg(unix)]
             let shell_default = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
@@ -1133,6 +1134,7 @@ async fn async_main() {
             let flags_default = "";
 
             let config = blit_server::Config {
+                name,
                 shell: shell_default,
                 shell_flags: shell_flags
                     .or_else(|| std::env::var("BLIT_SHELL_FLAGS").ok())

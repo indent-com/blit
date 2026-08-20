@@ -96,6 +96,7 @@ mod nvenc_encode;
 #[cfg(any(unix, windows))]
 mod process;
 mod pty;
+mod server_name;
 #[cfg(target_os = "linux")]
 mod software_decode;
 mod surface_encoder;
@@ -111,9 +112,10 @@ mod video_decode_vulkan;
 #[cfg(target_os = "linux")]
 mod xwayland;
 
-pub use ipc::{IpcListener, default_ipc_path};
+pub use ipc::{IpcListener, default_ipc_path, default_ipc_path_for};
 pub use media_policy::MediaCodecPolicy;
 use pty::{PtyHandle, PtyWriteTarget};
+pub use server_name::ServerName;
 pub use surface_encoder::ChromaSubsampling;
 use surface_encoder::SurfaceEncoder;
 pub use surface_encoder::SurfaceEncoderPreference;
@@ -399,6 +401,9 @@ fn exited_linger() -> Duration {
 }
 
 pub struct Config {
+    /// Identity used to isolate this server's socket and persistent state from
+    /// other blit servers owned by the same user.
+    pub name: ServerName,
     pub shell: String,
     pub shell_flags: String,
     pub scrollback: usize,
@@ -9799,6 +9804,7 @@ pub async fn run(config: Config) {
     // Embedders may not call `configure_deployment`; in that case freeze the
     // environment now, before any feature mask or service is constructed.
     let _ = ensure_deployment_settings();
+    kv::configure_server_name(&config.name);
     #[cfg(any(unix, windows))]
     let process_server = process::Server::new(config.verbose, config.processes);
     let boot_generation = new_boot_generation();
@@ -9817,7 +9823,8 @@ pub async fn run(config: Config) {
             deployment_u64,
         )
     );
-    let extensions = extension::ExtensionService::from_env(config.allow_persistent_extensions);
+    let extensions =
+        extension::ExtensionService::from_env(config.allow_persistent_extensions, &config.name);
     let state: AppState = Arc::new(AppStateInner {
         config,
         #[cfg(any(unix, windows))]
@@ -9964,7 +9971,7 @@ pub async fn run(config: Config) {
         }
     };
     #[cfg(not(unix))]
-    let mut listener = IpcListener::bind(&state.config.ipc_path, state.config.verbose);
+    let mut listener = IpcListener::bind(&state.config.ipc_path, state.config.verbose).await;
 
     blit_sd_notify::notify_ready(state.config.verbose);
 
@@ -18997,13 +19004,14 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
             continue;
         }
 
-        // The server's own environment (docs/design/env.md). One request, one
-        // reply, no state — but it hands over every credential the server was
-        // started with, so BLIT_ENV=0 refuses it with PERMISSION.
+        // The server's effective environment (docs/design/env.md). One
+        // request, one reply, no state; the configured server name is the only
+        // derived entry. It hands over every credential the server was started
+        // with, so BLIT_ENV=0 refuses it with PERMISSION.
         if blit_remote::env::is_c2s_env(data[0]) {
             if let Ok(nonce) = blit_remote::env::parse_env_get(&data) {
                 let reply = if env_enabled {
-                    let entries = std::env::vars_os()
+                    let mut entries = std::env::vars_os()
                         .map(|(key, value)| {
                             #[cfg(unix)]
                             {
@@ -19018,7 +19026,11 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                                 )
                             }
                         })
-                        .collect();
+                        .collect::<std::collections::BTreeMap<_, _>>();
+                    entries.insert(
+                        b"BLIT_SERVER_NAME".to_vec(),
+                        config.name.as_str().as_bytes().to_vec(),
+                    );
                     blit_remote::env::msg_env(nonce, STATUS_OK, &entries)
                 } else {
                     blit_remote::env::msg_env(
@@ -19446,7 +19458,7 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
 
         let mut sess = state.session.lock().await;
         let mut need_nudge = false;
-        // Verbose output is a blocking pipe under process-compose.  Defer
+        // Verbose output may be a blocking pipe under a supervisor. Defer
         // potentially hot diagnostics until after the session mutex is
         // released so a full log pipe can stall only this client's reader,
         // never compositor delivery for every client.
@@ -21945,6 +21957,7 @@ mod tests {
         pub(super) fn test_state(process_server: process::Server) -> AppState {
             Arc::new(AppStateInner {
                 config: Config {
+                    name: ServerName::default(),
                     shell: "/bin/sh".into(),
                     shell_flags: String::new(),
                     scrollback: 100,
@@ -21976,7 +21989,7 @@ mod tests {
                 connections: Arc::new(ConnectionRegistry::default()),
                 supervisor_notify: Arc::new(Notify::new()),
                 active_connections: std::sync::atomic::AtomicUsize::new(0),
-                extensions: extension::ExtensionService::from_env(false),
+                extensions: extension::ExtensionService::from_env(false, &ServerName::default()),
                 extension_jobs: extension_jobs::GlobalTracker::from_env(),
             })
         }

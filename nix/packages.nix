@@ -699,7 +699,6 @@
           pkgs.pkg-config
           pkgs.pkgsStatic.stdenv.cc
           pkgs.pnpm
-          pkgs.process-compose
           pkgs.samply
           pkgs.socat
           pkgs.wasm-bindgen-cli

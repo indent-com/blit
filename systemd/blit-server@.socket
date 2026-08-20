@@ -2,7 +2,7 @@
 Description=blit terminal multiplexer socket for %i
 
 [Socket]
-ListenStream=/run/blit/%i.sock
+ListenStream=/run/blit/%i-default.sock
 SocketUser=%i
 SocketMode=0700
 RuntimeDirectory=blit

@@ -42,6 +42,11 @@ const WEB_SW_JS_BR: &[u8] = include_bytes!("../../../js/ui/dist/sw.js.br");
 enum BrowserConnector {
     /// Local Unix socket / named pipe.
     Ipc(String),
+    /// A default or named local server, auto-started when absent.
+    Local {
+        path: String,
+        name: Option<blit_server::ServerName>,
+    },
     /// Route every connection through blit-proxy with the given upstream URI.
     #[cfg(unix)]
     Proxied(String),
@@ -102,9 +107,17 @@ fn uri_to_browser_connector(
         });
     }
     if uri == "local" {
-        return Some(BrowserConnector::Ipc(
-            crate::transport::default_local_socket(),
-        ));
+        return Some(BrowserConnector::Local {
+            path: crate::transport::default_local_socket(),
+            name: None,
+        });
+    }
+    if let Some(raw_name) = uri.strip_prefix("local:") {
+        let name: blit_server::ServerName = raw_name.parse().ok()?;
+        return Some(BrowserConnector::Local {
+            path: blit_webserver::config::local_socket_for_name(name.as_str()),
+            name: Some(name),
+        });
     }
     None
 }
@@ -113,6 +126,10 @@ impl BrowserConnector {
     async fn connect(&self) -> Result<Transport, String> {
         match self {
             Self::Ipc(p) => transport::connect_ipc(p).await,
+            Self::Local { path, name } => {
+                transport::ensure_local_server_with_name(path, name.as_ref()).await?;
+                transport::connect_ipc(path).await
+            }
             #[cfg(unix)]
             Self::Proxied(uri) => transport::connect_via_proxy(uri).await,
             Self::Tcp(addr) => {
