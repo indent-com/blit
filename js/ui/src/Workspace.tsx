@@ -315,7 +315,9 @@ function getHmrWorkspace(
   leaseOwner: object,
 ): HmrWorkspaceData {
   const raw = import.meta.hot?.data?.workspace as
-    HmrWorkspaceData | BlitWorkspace | undefined;
+    | HmrWorkspaceData
+    | BlitWorkspace
+    | undefined;
   // Accept the raw BlitWorkspace stored by versions before HmrWorkspaceData.
   const prev = raw && "workspace" in raw ? raw.workspace : raw;
   const previousOwner = raw && "workspace" in raw ? raw.owner : null;
@@ -3667,7 +3669,8 @@ function WorkspaceScreen(props: {
 
   let focusBySessionFn: ((sessionId: SessionId) => void) | null = null;
   let moveSessionToPaneFn:
-    ((sessionId: SessionId, targetPaneId: string) => void) | null = null;
+    | ((sessionId: SessionId, targetPaneId: string) => void)
+    | null = null;
   let moveToPaneFn:
     | ((value: string, targetPaneId: string, fromPaneId?: string) => void)
     | null = null;
