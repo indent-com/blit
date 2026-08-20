@@ -27,7 +27,7 @@ dependencies = [
 
 [[package]]
 name = "blit-guest"
-version = "0.53.2"
+version = "0.54.0"
 dependencies = [
  "blit-remote",
  "getrandom",
@@ -37,7 +37,7 @@ dependencies = [
 
 [[package]]
 name = "blit-remote"
-version = "0.53.2"
+version = "0.54.0"
 dependencies = [
  "lz4_flex",
  "unicode-width",

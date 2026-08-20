@@ -179,7 +179,6 @@ impl Definition {
 
 struct ServiceState {
     store: Option<ObjectStore>,
-    catalog: Option<ExtensionCatalog>,
     diagnostic: Option<String>,
     definitions: HashMap<u64, Definition>,
     endpoints: HashMap<u64, super::TrackedOutboxSender>,
@@ -375,6 +374,9 @@ impl Drop for ArgumentReservation {
     }
 }
 
+#[cfg(test)]
+type CatalogHook = Arc<std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>;
+
 /// Process-global extension storage, lifecycle registry, and fair admission.
 pub(crate) struct ExtensionService {
     enabled: bool,
@@ -398,12 +400,18 @@ pub(crate) struct ExtensionService {
     /// victim out of the object-store owner while filesystem work is detached.
     /// Control/status paths never acquire this mutex.
     store_io: Mutex<()>,
+    /// Orders durable catalog operations while their redb I/O runs on the
+    /// blocking pool. The service-state mutex is never held across this lane.
+    catalog_io: Mutex<()>,
+    catalog: Arc<std::sync::Mutex<Option<ExtensionCatalog>>>,
     upload_tails: std::sync::Mutex<HashMap<u64, Arc<SupervisorCompletion>>>,
     maintenance_started: AtomicBool,
     #[cfg(test)]
     validation_hook: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     storage_hook: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    catalog_hook: CatalogHook,
     inner: Mutex<ServiceState>,
 }
 
@@ -553,15 +561,18 @@ impl ExtensionService {
             running: Arc::new(Semaphore::new(max_running)),
             validating: Arc::new(Semaphore::new(max_validating)),
             store_io: Mutex::new(()),
+            catalog_io: Mutex::new(()),
+            catalog: Arc::new(std::sync::Mutex::new(catalog)),
             upload_tails: std::sync::Mutex::new(HashMap::new()),
             maintenance_started: AtomicBool::new(false),
             #[cfg(test)]
             validation_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
             storage_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            catalog_hook: Arc::new(std::sync::Mutex::new(None)),
             inner: Mutex::new(ServiceState {
                 store,
-                catalog,
                 diagnostic,
                 definitions,
                 endpoints: HashMap::new(),
@@ -580,6 +591,223 @@ impl ExtensionService {
 
     pub(crate) fn advertised(&self) -> bool {
         self.enabled && self.available
+    }
+
+    async fn catalog_call<R, F>(&self, operation: F) -> Result<R, CatalogError>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut ExtensionCatalog) -> Result<R, CatalogError> + Send + 'static,
+    {
+        let catalog = Arc::clone(&self.catalog);
+        #[cfg(test)]
+        let catalog_hook = Arc::clone(&self.catalog_hook);
+        tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some(hook) = catalog_hook.lock().expect("catalog hook lock").clone() {
+                hook();
+            }
+            let mut catalog = catalog
+                .lock()
+                .map_err(|_| CatalogError::Storage("extension catalog lock poisoned".into()))?;
+            operation(catalog.as_mut().ok_or(CatalogError::Unavailable)?)
+        })
+        .await
+        .map_err(|error| {
+            CatalogError::Storage(format!("extension catalog worker failed: {error}"))
+        })?
+    }
+
+    async fn definition_arguments(
+        &self,
+        definition: &Definition,
+    ) -> Result<Vec<Vec<u8>>, CatalogError> {
+        if let Some(arguments) = &definition.args {
+            return Ok(arguments.clone());
+        }
+        let extension_id = definition.extension_id;
+        let definition_revision = definition.definition_revision;
+        let expected_bytes = definition.argument_bytes;
+        let arguments = self
+            .catalog_call(move |catalog| catalog.load_arguments(extension_id, definition_revision))
+            .await?
+            .into_iter()
+            .map(String::into_bytes)
+            .collect::<Vec<_>>();
+        if encoded_argument_bytes(&arguments) != expected_bytes {
+            return Err(CatalogError::Storage(
+                "persistent extension argument metadata changed".into(),
+            ));
+        }
+        Ok(arguments)
+    }
+
+    async fn commit_catalog_create(
+        &self,
+        definition: &Definition,
+    ) -> Result<PersistentDefinition, (u8, String)> {
+        let arguments = definition
+            .args
+            .as_ref()
+            .ok_or((
+                EXT_STATUS_OTHER,
+                "pending extension arguments are unavailable".into(),
+            ))?
+            .iter()
+            .map(|argument| {
+                std::str::from_utf8(argument)
+                    .map(str::to_owned)
+                    .map_err(|_| {
+                        (
+                            EXT_STATUS_INVALID,
+                            "persistent arguments must be UTF-8".into(),
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let extension_id = definition.extension_id;
+        let hash = definition.hash;
+        let name = definition.name.clone();
+        let restart = definition.restart;
+        {
+            let mut inner = self.inner.lock().await;
+            inner
+                .store
+                .as_mut()
+                .ok_or((EXT_STATUS_OTHER, "object store is unavailable".into()))?
+                .pin(&hash)
+                .map_err(|error| (object_status(&error), error.to_string()))?;
+        }
+        let committed = self
+            .catalog_call(move |catalog| {
+                catalog.create_with_id(extension_id, hash, name, arguments, restart)
+            })
+            .await;
+        if let Err(error) = committed {
+            let mut inner = self.inner.lock().await;
+            if let Some(store) = inner.store.as_mut() {
+                store.unpin(&hash);
+            }
+            return Err((catalog_status(&error), error.to_string()));
+        }
+        Ok(committed.expect("checked catalog create result"))
+    }
+
+    async fn commit_catalog_update(
+        &self,
+        current: &Definition,
+        hash: ObjectHash,
+        args: Vec<Vec<u8>>,
+        restart: u8,
+    ) -> Result<PersistentDefinition, CatalogError> {
+        let changed_hash = hash != current.hash;
+        let acquired_pin = changed_hash || !current.object_pinned;
+        let arguments = args
+            .into_iter()
+            .map(|argument| {
+                String::from_utf8(argument)
+                    .map_err(|_| CatalogError::Invalid("persistent arguments must be UTF-8"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if acquired_pin {
+            let mut inner = self.inner.lock().await;
+            inner
+                .store
+                .as_mut()
+                .ok_or(CatalogError::Unavailable)?
+                .pin(&hash)
+                .map_err(|error| CatalogError::Storage(error.to_string()))?;
+        }
+        let extension_id = current.extension_id;
+        let definition_revision = current.definition_revision;
+        let name = current.name.clone();
+        let updated = self
+            .catalog_call(move |catalog| {
+                catalog.update(
+                    extension_id,
+                    definition_revision,
+                    &name,
+                    hash,
+                    arguments,
+                    restart,
+                )
+            })
+            .await;
+        let mut inner = self.inner.lock().await;
+        match updated {
+            Ok(updated) => {
+                inner
+                    .commands
+                    .invalidate_definition(current.extension_id, current.definition_revision);
+                if changed_hash
+                    && current.object_pinned
+                    && let Some(store) = inner.store.as_mut()
+                {
+                    store.unpin(&current.hash);
+                }
+                Ok(updated)
+            }
+            Err(error) => {
+                if acquired_pin && let Some(store) = inner.store.as_mut() {
+                    store.unpin(&hash);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn persist_attempt_counters_catalog(
+        &self,
+        extension_id: u64,
+        attempt: u64,
+        last_running: u64,
+        persistent: bool,
+    ) -> Result<(), CatalogError> {
+        if !persistent {
+            return Ok(());
+        }
+        self.catalog_call(move |catalog| {
+            catalog
+                .set_lifecycle(
+                    extension_id,
+                    None,
+                    None,
+                    Some(attempt),
+                    Some(last_running),
+                    None,
+                    None,
+                    None,
+                )
+                .map(|_| ())
+        })
+        .await
+    }
+
+    async fn persist_terminal_catalog(&self, definition: &Definition) -> Result<(), CatalogError> {
+        if !definition.persistent() {
+            return Ok(());
+        }
+        let extension_id = definition.extension_id;
+        let enabled = definition.enabled();
+        let desired = definition.desired();
+        let attempt = definition.attempt;
+        let last_running_attempt = definition.last_running_attempt;
+        let failure_count = definition.failure_count;
+        let next_start_unix_ms = definition.next_start_unix_ms;
+        self.catalog_call(move |catalog| {
+            catalog
+                .set_lifecycle(
+                    extension_id,
+                    Some(enabled),
+                    Some(desired),
+                    Some(attempt),
+                    Some(last_running_attempt),
+                    Some(failure_count),
+                    Some(next_start_unix_ms),
+                    Some(BlockedState::Clear),
+                )
+                .map(|_| ())
+        })
+        .await
     }
 
     fn validate_module(&self, module: &[u8]) -> Result<(), String> {
@@ -886,7 +1114,7 @@ impl ExtensionService {
         }
         let definitions = {
             let inner = self.inner.lock().await;
-            if !self.persist_allowed || inner.store.is_none() || inner.catalog.is_none() {
+            if !self.persist_allowed || !self.available || inner.store.is_none() {
                 Vec::new()
             } else {
                 inner
@@ -1424,6 +1652,11 @@ impl ExtensionService {
             return;
         }
         let object_hit = object_read.is_some();
+        let _catalog_io = if persistent || update {
+            Some(self.catalog_io.lock().await)
+        } else {
+            None
+        };
 
         let mut start = None;
         let mut cancel = None;
@@ -1479,7 +1712,14 @@ impl ExtensionService {
                         "module upload required",
                     );
                 } else {
-                    let current_arguments = definition_arguments(&inner, &current);
+                    let current_arguments = if current.args.is_some() {
+                        current.args.clone().ok_or(CatalogError::Unavailable)
+                    } else {
+                        drop(inner);
+                        let loaded = self.definition_arguments(&current).await;
+                        inner = self.inner.lock().await;
+                        loaded
+                    };
                     if let Err(error) = &current_arguments {
                         response = status_packet(
                             &current,
@@ -1496,13 +1736,12 @@ impl ExtensionService {
                     {
                         match repair_persistent_pin(&mut inner, &current) {
                             Ok(()) => {
-                                let cleared = inner
-                                    .catalog
-                                    .as_mut()
-                                    .ok_or(CatalogError::Unavailable)
-                                    .and_then(|catalog| {
+                                let current_id = current.extension_id;
+                                drop(inner);
+                                let cleared = self
+                                    .catalog_call(move |catalog| {
                                         catalog.set_lifecycle(
-                                            current.extension_id,
+                                            current_id,
                                             None,
                                             None,
                                             None,
@@ -1511,9 +1750,12 @@ impl ExtensionService {
                                             Some(0),
                                             Some(BlockedState::Clear),
                                         )
-                                    });
+                                    })
+                                    .await;
+                                inner = self.inner.lock().await;
                                 match cleared {
                                     Ok(_) => {
+                                        let shutting_down = inner.shutting_down;
                                         if let Some(definition) =
                                             inner.definitions.get_mut(&current.extension_id)
                                         {
@@ -1522,7 +1764,11 @@ impl ExtensionService {
                                                 definition.generation =
                                                     definition.generation.saturating_add(1);
                                                 definition.wake.notify_waiters();
-                                                if definition.enabled() && definition.desired() {
+                                                if shutting_down {
+                                                    definition.phase = EXT_PHASE_STOPPED;
+                                                } else if definition.enabled()
+                                                    && definition.desired()
+                                                {
                                                     definition.phase = EXT_PHASE_QUEUED;
                                                     start = Some(definition.extension_id);
                                                 } else {
@@ -1570,8 +1816,14 @@ impl ExtensionService {
                             }
                         }
                     } else {
-                        match commit_update(&mut inner, &current, hash, args, restart) {
+                        drop(inner);
+                        let updated = self
+                            .commit_catalog_update(&current, hash, args, restart)
+                            .await;
+                        inner = self.inner.lock().await;
+                        match updated {
                             Ok(updated) => {
+                                let shutting_down = inner.shutting_down;
                                 if let Some(definition) = inner.definitions.get_mut(&expected_id) {
                                     definition.definition_revision = updated.definition_revision;
                                     definition.hash = hash;
@@ -1590,6 +1842,8 @@ impl ExtensionService {
                                     if cancel.is_some() {
                                         definition.phase = EXT_PHASE_STOPPING;
                                         definition.task_id = 0;
+                                    } else if shutting_down {
+                                        definition.phase = EXT_PHASE_STOPPED;
                                     } else if definition.enabled() && definition.desired() {
                                         definition.phase = EXT_PHASE_QUEUED;
                                         start = Some(expected_id);
@@ -1741,17 +1995,32 @@ impl ExtensionService {
                             replay_through: Some(0),
                         },
                     );
-                    let admitted = if hit {
-                        commit_create(&mut inner, &mut definition)
+                    let admitted = if hit && persistent {
+                        drop(inner);
+                        let committed = self.commit_catalog_create(&definition).await;
+                        inner = self.inner.lock().await;
+                        committed.map(|persistent| {
+                            definition.definition_revision = persistent.definition_revision;
+                            definition.flags = persistent.flags;
+                            definition.argument_bytes = persistent.argument_bytes;
+                            definition.catalog_committed = true;
+                            definition.object_pinned = true;
+                            release_definition_arguments(&mut definition);
+                        })
+                    } else if hit {
+                        commit_transient_create(&mut inner, &mut definition)
                     } else {
                         Ok(())
                     };
                     match admitted {
                         Ok(()) => {
+                            if hit && inner.shutting_down {
+                                definition.phase = EXT_PHASE_STOPPED;
+                            }
                             response = creation_status(&definition, nonce, &definition.detail);
                             created = Some(extension_id);
                             inner.definitions.insert(extension_id, definition);
-                            if hit {
+                            if hit && !inner.shutting_down {
                                 start = Some(extension_id);
                             }
                         }
@@ -1772,6 +2041,7 @@ impl ExtensionService {
                 emit_lifecycle_locked(&mut inner, extension_id, self.output_retain_max);
             }
         }
+        drop(_catalog_io);
         if let Some(control) = cancel {
             control.connection.cancel();
             control.host.cancel();
@@ -2006,21 +2276,191 @@ impl ExtensionService {
             }
             result => result,
         };
-        let start = {
-            let mut inner = self.inner.lock().await;
-            apply_put_result_locked(
-                &mut inner,
-                endpoint,
-                nonce,
-                hash,
-                result,
-                self.output_retain_max,
-                self.terminal_retain,
-            )
-        };
+        let start = self.apply_put_result(endpoint, nonce, hash, result).await;
         for extension_id in start {
             self.ensure_supervisor(state.clone(), extension_id).await;
         }
+    }
+
+    async fn apply_put_result(
+        &self,
+        endpoint: u64,
+        nonce: u16,
+        hash: ObjectHash,
+        result: Result<PutChunk, ObjectStoreError>,
+    ) -> Vec<u64> {
+        let (status, received, detail, start, transitioned, notify_need_object) = match result {
+            Ok(PutChunk::Accepted { received }) => (
+                EXT_STATUS_OK,
+                received,
+                String::new(),
+                Vec::new(),
+                Vec::new(),
+                false,
+            ),
+            Ok(PutChunk::Committed { size }) => {
+                let (start, transitioned) = self.complete_pending(hash).await;
+                (
+                    EXT_STATUS_OK,
+                    size,
+                    String::new(),
+                    start,
+                    transitioned,
+                    false,
+                )
+            }
+            Ok(PutChunk::AlreadyHave { size }) => {
+                let (start, transitioned) = self.complete_pending(hash).await;
+                (
+                    wire::EXT_PUT_ALREADY_HAVE,
+                    size,
+                    "module already exists".into(),
+                    start,
+                    transitioned,
+                    false,
+                )
+            }
+            Err(error) => {
+                let status = object_status(&error);
+                let detail = error.to_string();
+                let mut inner = self.inner.lock().await;
+                let transitioned = if matches!(error, ObjectStoreError::InvalidModule(_)) {
+                    stop_invalid_pending_locked(&mut inner, hash, &detail, self.terminal_retain)
+                } else {
+                    Vec::new()
+                };
+                (
+                    status,
+                    0,
+                    detail,
+                    Vec::new(),
+                    transitioned,
+                    !matches!(
+                        error,
+                        ObjectStoreError::Conflict | ObjectStoreError::InvalidModule(_)
+                    ),
+                )
+            }
+        };
+        let mut inner = self.inner.lock().await;
+        if let Some(sender) = inner.endpoints.get(&endpoint) {
+            let _ = sender.send(put_status(nonce, status, hash, received, &detail));
+        }
+        for extension_id in transitioned {
+            emit_lifecycle_locked(&mut inner, extension_id, self.output_retain_max);
+        }
+        if notify_need_object {
+            notify_need_object_locked(&mut inner, &[hash], self.output_retain_max);
+        }
+        start
+    }
+
+    async fn complete_pending(&self, hash: ObjectHash) -> (Vec<u64>, Vec<u64>) {
+        let ids = {
+            let inner = self.inner.lock().await;
+            inner
+                .definitions
+                .values()
+                .filter(|definition| {
+                    definition.hash == hash && definition.phase == EXT_PHASE_NEED_OBJECT
+                })
+                .map(|definition| definition.extension_id)
+                .collect::<Vec<_>>()
+        };
+        let has_persistent = {
+            let inner = self.inner.lock().await;
+            ids.iter().any(|extension_id| {
+                inner
+                    .definitions
+                    .get(extension_id)
+                    .is_some_and(Definition::persistent)
+            })
+        };
+        let _catalog_io = if has_persistent {
+            Some(self.catalog_io.lock().await)
+        } else {
+            None
+        };
+        let mut start = Vec::new();
+        let mut changed = Vec::new();
+        for extension_id in ids {
+            let snapshot = {
+                let inner = self.inner.lock().await;
+                inner.definitions.get(&extension_id).cloned()
+            };
+            let Some(snapshot) = snapshot else {
+                continue;
+            };
+            if snapshot.phase != EXT_PHASE_NEED_OBJECT || snapshot.hash != hash {
+                continue;
+            }
+            if snapshot
+                .pending_deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                let mut inner = self.inner.lock().await;
+                if let Some(definition) = inner.definitions.get_mut(&extension_id) {
+                    definition.phase = EXT_PHASE_STOPPED;
+                    definition.set_flag(EXT_FLAG_DESIRED_RUNNING, false);
+                    definition.detail = "pending extension creation expired".into();
+                    definition.pending_deadline = None;
+                    definition.release_deadline = Some(Instant::now() + self.terminal_retain);
+                    release_definition_arguments(definition);
+                    changed.push(extension_id);
+                }
+                continue;
+            }
+
+            let admitted = if snapshot.persistent() {
+                self.commit_catalog_create(&snapshot).await.map(Some)
+            } else {
+                let mut inner = self.inner.lock().await;
+                let Some(mut definition) = inner.definitions.remove(&extension_id) else {
+                    continue;
+                };
+                let admitted = commit_transient_create(&mut inner, &mut definition).map(|()| None);
+                inner.definitions.insert(extension_id, definition);
+                admitted
+            };
+            let mut inner = self.inner.lock().await;
+            let shutting_down = inner.shutting_down;
+            let Some(definition) = inner.definitions.get_mut(&extension_id) else {
+                continue;
+            };
+            match admitted {
+                Ok(persistent) => {
+                    if let Some(persistent) = persistent {
+                        definition.definition_revision = persistent.definition_revision;
+                        definition.flags = persistent.flags;
+                        definition.argument_bytes = persistent.argument_bytes;
+                        definition.catalog_committed = true;
+                        definition.object_pinned = true;
+                        release_definition_arguments(definition);
+                    }
+                    definition.phase = if shutting_down {
+                        EXT_PHASE_STOPPED
+                    } else {
+                        EXT_PHASE_QUEUED
+                    };
+                    definition.pending_deadline = None;
+                    definition.release_deadline = None;
+                    definition.detail.clear();
+                    if !shutting_down {
+                        start.push(extension_id);
+                    }
+                }
+                Err((_, detail)) => {
+                    definition.phase = EXT_PHASE_STOPPED;
+                    definition.pending_deadline = None;
+                    definition.release_deadline = Some(Instant::now() + self.terminal_retain);
+                    definition.set_flag(EXT_FLAG_DESIRED_RUNNING, false);
+                    definition.detail = bounded_detail(&detail);
+                    release_definition_arguments(definition);
+                }
+            }
+            changed.push(extension_id);
+        }
+        (start, changed)
     }
 
     /// Persist the latest complete LRU image without holding service state.
@@ -2067,10 +2507,19 @@ impl ExtensionService {
         extension_id: u64,
         action: u8,
     ) {
+        if matches!(
+            action,
+            EXT_CONTROL_CANCEL
+                | EXT_CONTROL_RESTART
+                | EXT_CONTROL_ENABLE
+                | EXT_CONTROL_DISABLE
+                | EXT_CONTROL_REMOVE
+        ) {
+            self.handle_mutating_control(state, endpoint, nonce, extension_id, action)
+                .await;
+            return;
+        }
         let mut packets = Vec::new();
-        let mut cancel = None;
-        let mut start = None;
-        let mut emit_after_reply = false;
         {
             let mut inner = self.inner.lock().await;
             if action == EXT_CONTROL_LIST {
@@ -2170,257 +2619,6 @@ impl ExtensionService {
                         }
                         packets.push(status_packet(&current, nonce, EXT_STATUS_OK, None, ""));
                     }
-                    EXT_CONTROL_CANCEL => {
-                        let mutated = mutate_lifecycle(
-                            &mut inner,
-                            extension_id,
-                            None,
-                            Some(false),
-                            Interrupt::Cancelled,
-                            self.terminal_retain,
-                        );
-                        match mutated {
-                            Ok(()) => {
-                                if let Some(definition) = inner.definitions.get(&extension_id) {
-                                    cancel = definition.control.clone();
-                                    emit_after_reply = true;
-                                    packets.push(status_packet(
-                                        definition,
-                                        nonce,
-                                        EXT_STATUS_OK,
-                                        None,
-                                        "",
-                                    ));
-                                }
-                            }
-                            Err(error) => packets.push(status_packet(
-                                &current,
-                                nonce,
-                                catalog_status(&error),
-                                None,
-                                &error.to_string(),
-                            )),
-                        }
-                    }
-                    EXT_CONTROL_RESTART => {
-                        if current.persistent() && !self.persist_allowed {
-                            packets.push(status_packet(
-                                &current,
-                                nonce,
-                                EXT_STATUS_PERMISSION,
-                                None,
-                                "persistent extensions are disabled on this server",
-                            ));
-                        } else if current
-                            .owner_endpoint
-                            .is_some_and(|owner| !inner.endpoints.contains_key(&owner))
-                        {
-                            packets.push(status_packet(
-                                &current,
-                                nonce,
-                                EXT_STATUS_CONFLICT,
-                                None,
-                                "attached extension owner is no longer connected",
-                            ));
-                        } else if !current.enabled() {
-                            packets.push(status_packet(
-                                &current,
-                                nonce,
-                                EXT_STATUS_CONFLICT,
-                                None,
-                                "extension is disabled",
-                            ));
-                        } else if current.persistent()
-                            && let Err(error) = repair_persistent_pin(&mut inner, &current)
-                        {
-                            packets.push(status_packet(
-                                &current,
-                                nonce,
-                                catalog_status(&error),
-                                None,
-                                &error.to_string(),
-                            ));
-                        } else {
-                            let mutated = mutate_lifecycle(
-                                &mut inner,
-                                extension_id,
-                                None,
-                                Some(true),
-                                Interrupt::Restarted,
-                                self.terminal_retain,
-                            );
-                            match mutated {
-                                Ok(()) => {
-                                    if let Some(definition) = inner.definitions.get(&extension_id) {
-                                        cancel = definition.control.clone();
-                                        if cancel.is_none() {
-                                            start = Some(extension_id);
-                                        }
-                                        emit_after_reply = true;
-                                        packets.push(status_packet(
-                                            definition,
-                                            nonce,
-                                            EXT_STATUS_OK,
-                                            None,
-                                            "",
-                                        ));
-                                    }
-                                }
-                                Err(error) => packets.push(status_packet(
-                                    &current,
-                                    nonce,
-                                    catalog_status(&error),
-                                    None,
-                                    &error.to_string(),
-                                )),
-                            }
-                        }
-                    }
-                    EXT_CONTROL_ENABLE => {
-                        if !current.persistent() || !self.persist_allowed {
-                            packets.push(status_packet(
-                                &current,
-                                nonce,
-                                EXT_STATUS_PERMISSION,
-                                None,
-                                "enable requires persistent-extension permission",
-                            ));
-                        } else if let Err(error) = repair_persistent_pin(&mut inner, &current) {
-                            packets.push(status_packet(
-                                &current,
-                                nonce,
-                                catalog_status(&error),
-                                None,
-                                &error.to_string(),
-                            ));
-                        } else {
-                            let mutated = mutate_lifecycle(
-                                &mut inner,
-                                extension_id,
-                                Some(true),
-                                None,
-                                Interrupt::Restarted,
-                                self.terminal_retain,
-                            );
-                            match mutated {
-                                Ok(()) => {
-                                    if let Some(definition) = inner.definitions.get(&extension_id) {
-                                        cancel = definition.control.clone();
-                                        if definition.desired() && cancel.is_none() {
-                                            start = Some(extension_id);
-                                        }
-                                        emit_after_reply = true;
-                                        packets.push(status_packet(
-                                            definition,
-                                            nonce,
-                                            EXT_STATUS_OK,
-                                            None,
-                                            "",
-                                        ));
-                                    }
-                                }
-                                Err(error) => packets.push(status_packet(
-                                    &current,
-                                    nonce,
-                                    catalog_status(&error),
-                                    None,
-                                    &error.to_string(),
-                                )),
-                            }
-                        }
-                    }
-                    EXT_CONTROL_DISABLE => {
-                        if !current.persistent() {
-                            packets.push(status_packet(
-                                &current,
-                                nonce,
-                                EXT_STATUS_PERMISSION,
-                                None,
-                                "disable requires a persistent extension",
-                            ));
-                        } else {
-                            let mutated = mutate_lifecycle(
-                                &mut inner,
-                                extension_id,
-                                Some(false),
-                                None,
-                                Interrupt::Disabled,
-                                self.terminal_retain,
-                            );
-                            match mutated {
-                                Ok(()) => {
-                                    if let Some(definition) = inner.definitions.get(&extension_id) {
-                                        cancel = definition.control.clone();
-                                        emit_after_reply = true;
-                                        packets.push(status_packet(
-                                            definition,
-                                            nonce,
-                                            EXT_STATUS_OK,
-                                            None,
-                                            "",
-                                        ));
-                                    }
-                                }
-                                Err(error) => packets.push(status_packet(
-                                    &current,
-                                    nonce,
-                                    catalog_status(&error),
-                                    None,
-                                    &error.to_string(),
-                                )),
-                            }
-                        }
-                    }
-                    EXT_CONTROL_REMOVE => {
-                        if !current.persistent() {
-                            packets.push(status_packet(
-                                &current,
-                                nonce,
-                                EXT_STATUS_PERMISSION,
-                                None,
-                                "remove requires a persistent extension",
-                            ));
-                        } else if current.enabled()
-                            || current.control.is_some()
-                            || !matches!(current.phase, EXT_PHASE_STOPPED | EXT_PHASE_BLOCKED)
-                        {
-                            packets.push(status_packet(
-                                &current,
-                                nonce,
-                                EXT_STATUS_CONFLICT,
-                                None,
-                                "extension must be disabled and quiescent before removal",
-                            ));
-                        } else {
-                            let removed = inner
-                                .catalog
-                                .as_mut()
-                                .ok_or(CatalogError::Unavailable)
-                                .and_then(|catalog| catalog.remove(extension_id));
-                            match removed {
-                                Ok(_) => {
-                                    remove_definition_locked(&mut inner, extension_id);
-                                    packets.push(fixed_status(
-                                        nonce,
-                                        EXT_STATUS_OK,
-                                        0,
-                                        0,
-                                        extension_id,
-                                        0,
-                                        [0; 32],
-                                        "removed",
-                                    ));
-                                }
-                                Err(error) => packets.push(status_packet(
-                                    &current,
-                                    nonce,
-                                    catalog_status(&error),
-                                    None,
-                                    &error.to_string(),
-                                )),
-                            }
-                        }
-                    }
                     _ => packets.push(status_packet(
                         &current,
                         nonce,
@@ -2440,12 +2638,252 @@ impl ExtensionService {
             if action == EXT_CONTROL_ATTACH {
                 wake_endpoint_locked(&inner, endpoint);
             }
-            if emit_after_reply {
+        }
+    }
+
+    async fn handle_mutating_control(
+        self: &Arc<Self>,
+        state: super::AppState,
+        endpoint: u64,
+        nonce: u16,
+        extension_id: u64,
+        action: u8,
+    ) {
+        let initial = {
+            let inner = self.inner.lock().await;
+            inner.definitions.get(&extension_id).cloned()
+        };
+        let Some(initial) = initial else {
+            self.send(
+                endpoint,
+                fixed_status(
+                    nonce,
+                    EXT_STATUS_UNKNOWN_ID,
+                    0,
+                    0,
+                    extension_id,
+                    0,
+                    [0; 32],
+                    "extension ID does not exist",
+                ),
+            )
+            .await;
+            return;
+        };
+        let serialize_catalog = initial.persistent();
+        let _catalog_io = if serialize_catalog {
+            Some(self.catalog_io.lock().await)
+        } else {
+            None
+        };
+
+        let current = {
+            let mut inner = self.inner.lock().await;
+            let Some(current) = inner.definitions.get(&extension_id).cloned() else {
+                drop(inner);
+                self.send(
+                    endpoint,
+                    fixed_status(
+                        nonce,
+                        EXT_STATUS_UNKNOWN_ID,
+                        0,
+                        0,
+                        extension_id,
+                        0,
+                        [0; 32],
+                        "extension ID does not exist",
+                    ),
+                )
+                .await;
+                return;
+            };
+            let invalid = match action {
+                EXT_CONTROL_RESTART if current.persistent() && !self.persist_allowed => Some((
+                    EXT_STATUS_PERMISSION,
+                    "persistent extensions are disabled on this server",
+                )),
+                EXT_CONTROL_RESTART
+                    if current
+                        .owner_endpoint
+                        .is_some_and(|owner| !inner.endpoints.contains_key(&owner)) =>
+                {
+                    Some((
+                        EXT_STATUS_CONFLICT,
+                        "attached extension owner is no longer connected",
+                    ))
+                }
+                EXT_CONTROL_RESTART if !current.enabled() => {
+                    Some((EXT_STATUS_CONFLICT, "extension is disabled"))
+                }
+                EXT_CONTROL_ENABLE if !current.persistent() || !self.persist_allowed => Some((
+                    EXT_STATUS_PERMISSION,
+                    "enable requires persistent-extension permission",
+                )),
+                EXT_CONTROL_DISABLE if !current.persistent() => Some((
+                    EXT_STATUS_PERMISSION,
+                    "disable requires a persistent extension",
+                )),
+                EXT_CONTROL_REMOVE if !current.persistent() => Some((
+                    EXT_STATUS_PERMISSION,
+                    "remove requires a persistent extension",
+                )),
+                EXT_CONTROL_REMOVE
+                    if current.enabled()
+                        || current.control.is_some()
+                        || !matches!(current.phase, EXT_PHASE_STOPPED | EXT_PHASE_BLOCKED) =>
+                {
+                    Some((
+                        EXT_STATUS_CONFLICT,
+                        "extension must be disabled and quiescent before removal",
+                    ))
+                }
+                _ => None,
+            };
+            if let Some((status, detail)) = invalid {
+                let packet = status_packet(&current, nonce, status, None, detail);
+                if let Some(sender) = inner.endpoints.get(&endpoint) {
+                    let _ = sender.send(packet);
+                }
+                return;
+            }
+            if matches!(action, EXT_CONTROL_RESTART | EXT_CONTROL_ENABLE)
+                && current.persistent()
+                && let Err(error) = repair_persistent_pin(&mut inner, &current)
+            {
+                let packet = status_packet(
+                    &current,
+                    nonce,
+                    catalog_status(&error),
+                    None,
+                    &error.to_string(),
+                );
+                if let Some(sender) = inner.endpoints.get(&endpoint) {
+                    let _ = sender.send(packet);
+                }
+                return;
+            }
+            current
+        };
+        let write_catalog = current.catalog_committed;
+
+        let persisted = if write_catalog {
+            if action == EXT_CONTROL_REMOVE {
+                self.catalog_call(move |catalog| catalog.remove(extension_id).map(|_| ()))
+                    .await
+            } else {
+                let (enabled, desired) = match action {
+                    EXT_CONTROL_CANCEL => (None, Some(false)),
+                    EXT_CONTROL_RESTART => (None, Some(true)),
+                    EXT_CONTROL_ENABLE => (Some(true), None),
+                    EXT_CONTROL_DISABLE => (Some(false), None),
+                    _ => unreachable!(),
+                };
+                self.catalog_call(move |catalog| {
+                    catalog
+                        .set_lifecycle(
+                            extension_id,
+                            enabled,
+                            desired,
+                            None,
+                            None,
+                            None,
+                            Some(0),
+                            Some(BlockedState::Clear),
+                        )
+                        .map(|_| ())
+                })
+                .await
+            }
+        } else {
+            Ok(())
+        };
+
+        let mut cancel = None;
+        let mut start = None;
+        {
+            let mut inner = self.inner.lock().await;
+            let persisted_ok = persisted.is_ok();
+            let packet = match persisted {
+                Err(error) => status_packet(
+                    &current,
+                    nonce,
+                    catalog_status(&error),
+                    None,
+                    &error.to_string(),
+                ),
+                Ok(()) if action == EXT_CONTROL_REMOVE => {
+                    remove_definition_locked(&mut inner, extension_id);
+                    fixed_status(
+                        nonce,
+                        EXT_STATUS_OK,
+                        0,
+                        0,
+                        extension_id,
+                        0,
+                        [0; 32],
+                        "removed",
+                    )
+                }
+                Ok(()) => {
+                    let (enabled, desired, interrupt) = match action {
+                        EXT_CONTROL_CANCEL => (None, Some(false), Interrupt::Cancelled),
+                        EXT_CONTROL_RESTART => (None, Some(true), Interrupt::Restarted),
+                        EXT_CONTROL_ENABLE => (Some(true), None, Interrupt::Restarted),
+                        EXT_CONTROL_DISABLE => (Some(false), None, Interrupt::Disabled),
+                        _ => unreachable!(),
+                    };
+                    if mutate_lifecycle_locked(
+                        &mut inner,
+                        extension_id,
+                        enabled,
+                        desired,
+                        interrupt,
+                        self.terminal_retain,
+                    )
+                    .is_err()
+                    {
+                        fixed_status(
+                            nonce,
+                            EXT_STATUS_UNKNOWN_ID,
+                            0,
+                            0,
+                            extension_id,
+                            0,
+                            [0; 32],
+                            "extension ID does not exist",
+                        )
+                    } else if let Some(definition) = inner.definitions.get(&extension_id) {
+                        cancel = definition.control.clone();
+                        if matches!(action, EXT_CONTROL_RESTART | EXT_CONTROL_ENABLE)
+                            && definition.enabled()
+                            && definition.desired()
+                            && cancel.is_none()
+                        {
+                            start = Some(extension_id);
+                        }
+                        status_packet(definition, nonce, EXT_STATUS_OK, None, "")
+                    } else {
+                        fixed_status(
+                            nonce,
+                            EXT_STATUS_UNKNOWN_ID,
+                            0,
+                            0,
+                            extension_id,
+                            0,
+                            [0; 32],
+                            "extension ID does not exist",
+                        )
+                    }
+                }
+            };
+            if let Some(sender) = inner.endpoints.get(&endpoint) {
+                let _ = sender.send(packet);
+            }
+            if persisted_ok && action != EXT_CONTROL_REMOVE {
                 emit_lifecycle_locked(&mut inner, extension_id, self.output_retain_max);
             }
         }
-        // Correlated replies and replay records were enqueued under the
-        // lifecycle lock, before any output caused by teardown can be stamped.
+        drop(_catalog_io);
         if let Some(control) = cancel {
             control.connection.cancel();
             control.host.cancel();
@@ -3132,7 +3570,7 @@ impl ExtensionService {
         &self,
         extension_id: u64,
     ) -> Result<PreparedAttempt, PrepareAttemptError> {
-        let (snapshot, loaded_argument_reservation, args, attempt_number, object_read) = {
+        let (snapshot, loaded_argument_reservation, attempt_number, object_read) = {
             let mut inner = self.inner.lock().await;
             let snapshot = inner
                 .definitions
@@ -3165,10 +3603,6 @@ impl ExtensionService {
             } else {
                 None
             };
-            let args = definition_arguments(&inner, &snapshot).map_err(|error| AttemptFailure {
-                kind: FailureKind::HostFailure,
-                detail: error.to_string(),
-            })?;
             let attempt_number = snapshot
                 .attempt
                 .checked_add(1)
@@ -3188,10 +3622,22 @@ impl ExtensionService {
             (
                 snapshot,
                 loaded_argument_reservation,
-                args,
                 attempt_number,
                 object_read,
             )
+        };
+        let args = {
+            let _catalog_io = if snapshot.args.is_none() {
+                Some(self.catalog_io.lock().await)
+            } else {
+                None
+            };
+            self.definition_arguments(&snapshot)
+                .await
+                .map_err(|error| AttemptFailure {
+                    kind: FailureKind::HostFailure,
+                    detail: error.to_string(),
+                })?
         };
         let module = match tokio::task::block_in_place(|| object_read.read_verified()) {
             Ok(module) => module,
@@ -3222,6 +3668,40 @@ impl ExtensionService {
                 kind: FailureKind::Validation,
                 detail: error.to_string(),
             })?;
+        let _catalog_io = if snapshot.persistent() {
+            Some(self.catalog_io.lock().await)
+        } else {
+            None
+        };
+        let still_current = {
+            let inner = self.inner.lock().await;
+            !inner.shutting_down
+                && inner
+                    .definitions
+                    .get(&extension_id)
+                    .is_some_and(|definition| {
+                        definition.generation == snapshot.generation
+                            && definition.definition_revision == snapshot.definition_revision
+                            && definition.hash == snapshot.hash
+                            && definition.attempt == snapshot.attempt
+                            && definition.enabled()
+                            && definition.desired()
+                    })
+        };
+        if !still_current {
+            return Err(PrepareAttemptError::Superseded);
+        }
+        self.persist_attempt_counters_catalog(
+            extension_id,
+            attempt_number,
+            snapshot.last_running_attempt,
+            snapshot.persistent(),
+        )
+        .await
+        .map_err(|error| AttemptFailure {
+            kind: FailureKind::HostFailure,
+            detail: error.to_string(),
+        })?;
         let mut inner = self.inner.lock().await;
         let still_current = !inner.shutting_down
             && inner
@@ -3238,16 +3718,6 @@ impl ExtensionService {
         if !still_current {
             return Err(PrepareAttemptError::Superseded);
         }
-        persist_attempt_counters(
-            &mut inner,
-            extension_id,
-            attempt_number,
-            snapshot.last_running_attempt,
-        )
-        .map_err(|error| AttemptFailure {
-            kind: FailureKind::HostFailure,
-            detail: error.to_string(),
-        })?;
         if let Some(definition) = inner.definitions.get_mut(&extension_id) {
             definition.phase = EXT_PHASE_VALIDATING;
             definition.attempt = attempt_number;
@@ -3256,6 +3726,7 @@ impl ExtensionService {
         }
         emit_lifecycle_locked(&mut inner, extension_id, self.output_retain_max);
         drop(inner);
+        drop(_catalog_io);
 
         let spec = AttemptSpec {
             module: Arc::<[u8]>::from(module),
@@ -3289,26 +3760,39 @@ impl ExtensionService {
     }
 
     async fn block_definition(&self, extension_id: u64, error: AttemptFailure) {
-        let mut inner = self.inner.lock().await;
-        let shutting_down = inner.shutting_down;
-        let should_block = inner
-            .definitions
-            .get(&extension_id)
-            .is_some_and(|definition| {
-                !shutting_down && definition.enabled() && definition.desired()
-            });
-        let mut detail = bounded_detail(&error.detail);
-        if should_block
-            && inner
+        let persistent = {
+            let inner = self.inner.lock().await;
+            inner
                 .definitions
                 .get(&extension_id)
                 .is_some_and(Definition::persistent)
-        {
-            let persisted = inner
-                .catalog
-                .as_mut()
-                .ok_or(CatalogError::Unavailable)
-                .and_then(|catalog| {
+        };
+        let _catalog_io = if persistent {
+            Some(self.catalog_io.lock().await)
+        } else {
+            None
+        };
+        let (should_block, persistent) = {
+            let inner = self.inner.lock().await;
+            let shutting_down = inner.shutting_down;
+            (
+                inner
+                    .definitions
+                    .get(&extension_id)
+                    .is_some_and(|definition| {
+                        !shutting_down && definition.enabled() && definition.desired()
+                    }),
+                inner
+                    .definitions
+                    .get(&extension_id)
+                    .is_some_and(Definition::persistent),
+            )
+        };
+        let mut detail = bounded_detail(&error.detail);
+        if should_block && persistent {
+            let durable_detail = detail.clone();
+            let persisted = self
+                .catalog_call(move |catalog| {
                     catalog.set_lifecycle(
                         extension_id,
                         None,
@@ -3317,15 +3801,17 @@ impl ExtensionService {
                         None,
                         None,
                         Some(0),
-                        Some(BlockedState::Set(&detail)),
+                        Some(BlockedState::Set(&durable_detail)),
                     )
-                });
+                })
+                .await;
             if let Err(persist_error) = persisted {
                 detail = bounded_detail(&format!(
                     "{detail}; could not persist blocked state: {persist_error}"
                 ));
             }
         }
+        let mut inner = self.inner.lock().await;
         if let Some(definition) = inner.definitions.get_mut(&extension_id) {
             definition.phase = if should_block {
                 EXT_PHASE_BLOCKED
@@ -3432,11 +3918,24 @@ impl ExtensionService {
         driven: DrivenAttempt,
         running_for: Duration,
     ) -> NextAttempt {
+        let persistent = {
+            let inner = self.inner.lock().await;
+            inner
+                .definitions
+                .get(&extension_id)
+                .is_some_and(Definition::persistent)
+        };
+        let _catalog_io = if persistent {
+            Some(self.catalog_io.lock().await)
+        } else {
+            None
+        };
         let mut inner = self.inner.lock().await;
         inner.task_ids.remove(&task_id);
         let Some(mut definition) = inner.definitions.remove(&extension_id) else {
             return NextAttempt::Stop;
         };
+        let visible_definition = definition.clone();
         inner
             .commands
             .invalidate_attempt(extension_id, attempt_revision, attempt_number);
@@ -3493,7 +3992,17 @@ impl ExtensionService {
         if definition.generation == generation && explicit_replace {
             definition.generation = definition.generation.saturating_add(1);
         }
-        if let Err(error) = persist_terminal_state(&mut inner, &definition) {
+        let persisted = if persistent {
+            inner.definitions.insert(extension_id, visible_definition);
+            drop(inner);
+            let persisted = self.persist_terminal_catalog(&definition).await;
+            inner = self.inner.lock().await;
+            let _ = inner.definitions.remove(&extension_id);
+            persisted
+        } else {
+            Ok(())
+        };
+        if let Err(error) = persisted {
             restart = false;
             backoff = false;
             duration = Duration::ZERO;
@@ -3627,60 +4136,68 @@ struct AttemptPublication {
 
 impl AttemptPublication {
     async fn publish_running(&self) -> Result<(), AttemptFailure> {
-        let mut inner = self.service.inner.lock().await;
-        let valid = !inner.shutting_down
-            && inner
+        let persistent = {
+            let inner = self.service.inner.lock().await;
+            inner
                 .definitions
                 .get(&self.extension_id)
-                .is_some_and(|definition| {
-                    definition.generation == self.generation
-                        && definition.definition_revision == self.definition_revision
-                        && definition.enabled()
-                        && definition.desired()
-                        && definition.control.as_ref().is_some_and(|control| {
-                            control.definition_revision == self.definition_revision
-                                && control.attempt == self.attempt
-                                && control.task_id == self.task_id
-                        })
+                .is_some_and(Definition::persistent)
+        };
+        let _catalog_io = if persistent {
+            Some(self.service.catalog_io.lock().await)
+        } else {
+            None
+        };
+        let is_valid = |inner: &ServiceState| {
+            !inner.shutting_down
+                && inner
+                    .definitions
+                    .get(&self.extension_id)
+                    .is_some_and(|definition| {
+                        definition.generation == self.generation
+                            && definition.definition_revision == self.definition_revision
+                            && definition.enabled()
+                            && definition.desired()
+                            && definition.control.as_ref().is_some_and(|control| {
+                                control.definition_revision == self.definition_revision
+                                    && control.attempt == self.attempt
+                                    && control.task_id == self.task_id
+                            })
+                    })
+        };
+        {
+            let inner = self.service.inner.lock().await;
+            if !is_valid(&inner) {
+                return Err(AttemptFailure {
+                    kind: FailureKind::HostFailure,
+                    detail: "extension attempt was superseded during bootstrap".into(),
                 });
-        if !valid {
+            }
+        }
+        self.service
+            .persist_attempt_counters_catalog(
+                self.extension_id,
+                self.attempt,
+                self.attempt,
+                persistent,
+            )
+            .await
+            .map_err(|error| AttemptFailure {
+                kind: FailureKind::HostFailure,
+                detail: error.to_string(),
+            })?;
+        let mut inner = self.service.inner.lock().await;
+        if !is_valid(&inner) {
             return Err(AttemptFailure {
                 kind: FailureKind::HostFailure,
                 detail: "extension attempt was superseded during bootstrap".into(),
             });
         }
-        let previous = inner
-            .definitions
-            .get_mut(&self.extension_id)
-            .map(|definition| {
-                let previous = (
-                    definition.phase,
-                    definition.task_id,
-                    definition.last_running_attempt,
-                    std::mem::take(&mut definition.detail),
-                );
-                definition.phase = EXT_PHASE_RUNNING;
-                definition.task_id = self.task_id;
-                definition.last_running_attempt = self.attempt;
-                previous
-            });
-        if let Err(error) =
-            persist_attempt_counters(&mut inner, self.extension_id, self.attempt, self.attempt)
-        {
-            if let (Some(previous), Some(definition)) =
-                (previous, inner.definitions.get_mut(&self.extension_id))
-            {
-                (
-                    definition.phase,
-                    definition.task_id,
-                    definition.last_running_attempt,
-                    definition.detail,
-                ) = previous;
-            }
-            return Err(AttemptFailure {
-                kind: FailureKind::HostFailure,
-                detail: error.to_string(),
-            });
+        if let Some(definition) = inner.definitions.get_mut(&self.extension_id) {
+            definition.phase = EXT_PHASE_RUNNING;
+            definition.task_id = self.task_id;
+            definition.last_running_attempt = self.attempt;
+            definition.detail.clear();
         }
         emit_lifecycle_locked(
             &mut inner,
@@ -4046,59 +4563,6 @@ fn allocate_task_id(inner: &ServiceState) -> Option<u32> {
     None
 }
 
-fn persist_attempt_counters(
-    inner: &mut ServiceState,
-    extension_id: u64,
-    attempt: u64,
-    last_running: u64,
-) -> Result<(), CatalogError> {
-    if inner
-        .definitions
-        .get(&extension_id)
-        .is_some_and(Definition::persistent)
-    {
-        inner
-            .catalog
-            .as_mut()
-            .ok_or(CatalogError::Unavailable)?
-            .set_lifecycle(
-                extension_id,
-                None,
-                None,
-                Some(attempt),
-                Some(last_running),
-                None,
-                None,
-                None,
-            )?;
-    }
-    Ok(())
-}
-
-fn persist_terminal_state(
-    inner: &mut ServiceState,
-    definition: &Definition,
-) -> Result<(), CatalogError> {
-    if !definition.persistent() {
-        return Ok(());
-    }
-    inner
-        .catalog
-        .as_mut()
-        .ok_or(CatalogError::Unavailable)?
-        .set_lifecycle(
-            definition.extension_id,
-            Some(definition.enabled()),
-            Some(definition.desired()),
-            Some(definition.attempt),
-            Some(definition.last_running_attempt),
-            Some(definition.failure_count),
-            Some(definition.next_start_unix_ms),
-            Some(BlockedState::Clear),
-        )?;
-    Ok(())
-}
-
 fn backoff_duration(failure_count: u32) -> Duration {
     let exponent = failure_count.saturating_sub(1).min(16);
     let cap = BACKOFF_BASE
@@ -4174,29 +4638,6 @@ fn definition_from_persistent(value: PersistentDefinition) -> Definition {
     }
 }
 
-fn definition_arguments(
-    inner: &ServiceState,
-    definition: &Definition,
-) -> Result<Vec<Vec<u8>>, CatalogError> {
-    if let Some(arguments) = &definition.args {
-        return Ok(arguments.clone());
-    }
-    let arguments = inner
-        .catalog
-        .as_ref()
-        .ok_or(CatalogError::Unavailable)?
-        .load_arguments(definition.extension_id, definition.definition_revision)?
-        .into_iter()
-        .map(String::into_bytes)
-        .collect::<Vec<_>>();
-    if encoded_argument_bytes(&arguments) != definition.argument_bytes {
-        return Err(CatalogError::Storage(
-            "persistent extension argument metadata changed".into(),
-        ));
-    }
-    Ok(arguments)
-}
-
 fn release_definition_arguments(definition: &mut Definition) {
     definition.args = None;
     definition.argument_reservation = None;
@@ -4214,7 +4655,7 @@ fn allocate_extension_id(inner: &ServiceState) -> Option<u64> {
     None
 }
 
-fn commit_create(
+fn commit_transient_create(
     inner: &mut ServiceState,
     definition: &mut Definition,
 ) -> Result<(), (u8, String)> {
@@ -4226,112 +4667,15 @@ fn commit_create(
         .pin(&definition.hash)
         .map_err(|error| (object_status(&error), error.to_string()))?;
     definition.object_pinned = true;
-    if !definition.persistent() {
-        return Ok(());
-    }
-    let args = definition
-        .args
-        .as_ref()
-        .ok_or((
+    if definition.persistent() {
+        store.unpin(&definition.hash);
+        definition.object_pinned = false;
+        return Err((
             EXT_STATUS_OTHER,
-            "pending extension arguments are unavailable".into(),
-        ))?
-        .iter()
-        .map(|arg| {
-            std::str::from_utf8(arg).map(str::to_owned).map_err(|_| {
-                (
-                    EXT_STATUS_INVALID,
-                    "persistent arguments must be UTF-8".into(),
-                )
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let result = inner
-        .catalog
-        .as_mut()
-        .ok_or(CatalogError::Unavailable)
-        .and_then(|catalog| {
-            catalog.create_with_id(
-                definition.extension_id,
-                definition.hash,
-                definition.name.clone(),
-                args,
-                definition.restart,
-            )
-        });
-    match result {
-        Ok(persistent) => {
-            definition.definition_revision = persistent.definition_revision;
-            definition.flags = persistent.flags;
-            definition.argument_bytes = persistent.argument_bytes;
-            definition.catalog_committed = true;
-            release_definition_arguments(definition);
-            Ok(())
-        }
-        Err(error) => {
-            store.unpin(&definition.hash);
-            definition.object_pinned = false;
-            Err((catalog_status(&error), error.to_string()))
-        }
+            "persistent creation requires the catalog lane".into(),
+        ));
     }
-}
-
-fn commit_update(
-    inner: &mut ServiceState,
-    current: &Definition,
-    hash: ObjectHash,
-    args: Vec<Vec<u8>>,
-    restart: u8,
-) -> Result<PersistentDefinition, CatalogError> {
-    let changed_hash = hash != current.hash;
-    let acquired_pin = changed_hash || !current.object_pinned;
-    if acquired_pin {
-        let store = inner.store.as_mut().ok_or(CatalogError::Unavailable)?;
-        store
-            .pin(&hash)
-            .map_err(|error| CatalogError::Storage(error.to_string()))?;
-    }
-    let arguments = args
-        .into_iter()
-        .map(|arg| {
-            String::from_utf8(arg)
-                .map_err(|_| CatalogError::Invalid("persistent arguments must be UTF-8"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let result = inner
-        .catalog
-        .as_mut()
-        .ok_or(CatalogError::Unavailable)
-        .and_then(|catalog| {
-            catalog.update(
-                current.extension_id,
-                current.definition_revision,
-                &current.name,
-                hash,
-                arguments,
-                restart,
-            )
-        });
-    match result {
-        Ok(updated) => {
-            inner
-                .commands
-                .invalidate_definition(current.extension_id, current.definition_revision);
-            if changed_hash
-                && current.object_pinned
-                && let Some(store) = inner.store.as_mut()
-            {
-                store.unpin(&current.hash);
-            }
-            Ok(updated)
-        }
-        Err(error) => {
-            if acquired_pin && let Some(store) = inner.store.as_mut() {
-                store.unpin(&hash);
-            }
-            Err(error)
-        }
-    }
+    Ok(())
 }
 
 fn repair_persistent_pin(
@@ -4351,111 +4695,6 @@ fn repair_persistent_pin(
         .ok_or(CatalogError::NotFound)?;
     definition.object_pinned = true;
     Ok(())
-}
-
-fn apply_put_result_locked(
-    inner: &mut ServiceState,
-    endpoint: u64,
-    nonce: u16,
-    hash: ObjectHash,
-    result: Result<PutChunk, ObjectStoreError>,
-    output_retain_max: usize,
-    terminal_retain: Duration,
-) -> Vec<u64> {
-    let mut transitioned = Vec::new();
-    let mut start = Vec::new();
-    let mut notify_need_object = false;
-    let (status, received, detail) = match result {
-        Ok(PutChunk::Accepted { received }) => (EXT_STATUS_OK, received, String::new()),
-        Ok(PutChunk::Committed { size }) => {
-            let (pending_start, changed) = complete_pending(inner, hash, terminal_retain);
-            start = pending_start;
-            transitioned = changed;
-            (EXT_STATUS_OK, size, String::new())
-        }
-        Ok(PutChunk::AlreadyHave { size }) => {
-            let (pending_start, changed) = complete_pending(inner, hash, terminal_retain);
-            start = pending_start;
-            transitioned = changed;
-            (
-                wire::EXT_PUT_ALREADY_HAVE,
-                size,
-                "module already exists".into(),
-            )
-        }
-        Err(error) => {
-            let status = object_status(&error);
-            let detail = error.to_string();
-            if matches!(error, ObjectStoreError::InvalidModule(_)) {
-                transitioned = stop_invalid_pending_locked(inner, hash, &detail, terminal_retain);
-            } else if !matches!(error, ObjectStoreError::Conflict) {
-                notify_need_object = true;
-            }
-            (status, 0, detail)
-        }
-    };
-    // The correlated upload acknowledgement is admitted before every
-    // ID-keyed status caused by this chunk.
-    if let Some(sender) = inner.endpoints.get(&endpoint) {
-        let _ = sender.send(put_status(nonce, status, hash, received, &detail));
-    }
-    for extension_id in transitioned {
-        emit_lifecycle_locked(inner, extension_id, output_retain_max);
-    }
-    if notify_need_object {
-        notify_need_object_locked(inner, &[hash], output_retain_max);
-    }
-    start
-}
-
-fn complete_pending(
-    inner: &mut ServiceState,
-    hash: ObjectHash,
-    terminal_retain: Duration,
-) -> (Vec<u64>, Vec<u64>) {
-    let ids = inner
-        .definitions
-        .values()
-        .filter(|definition| definition.hash == hash && definition.phase == EXT_PHASE_NEED_OBJECT)
-        .map(|definition| definition.extension_id)
-        .collect::<Vec<_>>();
-    let mut start = Vec::new();
-    for &extension_id in &ids {
-        let Some(mut definition) = inner.definitions.remove(&extension_id) else {
-            continue;
-        };
-        if definition
-            .pending_deadline
-            .is_some_and(|deadline| Instant::now() >= deadline)
-        {
-            definition.phase = EXT_PHASE_STOPPED;
-            definition.set_flag(EXT_FLAG_DESIRED_RUNNING, false);
-            definition.detail = "pending extension creation expired".into();
-            definition.pending_deadline = None;
-            definition.release_deadline = Some(Instant::now() + terminal_retain);
-            release_definition_arguments(&mut definition);
-        } else {
-            match commit_create(inner, &mut definition) {
-                Ok(()) => {
-                    definition.phase = EXT_PHASE_QUEUED;
-                    definition.pending_deadline = None;
-                    definition.release_deadline = None;
-                    definition.detail.clear();
-                    start.push(extension_id);
-                }
-                Err((_, detail)) => {
-                    definition.phase = EXT_PHASE_STOPPED;
-                    definition.pending_deadline = None;
-                    definition.release_deadline = Some(Instant::now() + terminal_retain);
-                    definition.set_flag(EXT_FLAG_DESIRED_RUNNING, false);
-                    definition.detail = bounded_detail(&detail);
-                    release_definition_arguments(&mut definition);
-                }
-            }
-        }
-        inner.definitions.insert(extension_id, definition);
-    }
-    (start, ids)
 }
 
 fn stop_invalid_pending_locked(
@@ -4648,7 +4887,7 @@ fn follower_capacity_available(
     endpoint_count < per_endpoint_limit && global_count < global_limit
 }
 
-fn mutate_lifecycle(
+fn mutate_lifecycle_locked(
     inner: &mut ServiceState,
     extension_id: u64,
     enabled: Option<bool>,
@@ -4660,22 +4899,6 @@ fn mutate_lifecycle(
         return Err(CatalogError::NotFound);
     };
     let pending_creation = current.phase == EXT_PHASE_NEED_OBJECT && !current.catalog_committed;
-    if current.persistent() && current.catalog_committed {
-        inner
-            .catalog
-            .as_mut()
-            .ok_or(CatalogError::Unavailable)?
-            .set_lifecycle(
-                extension_id,
-                enabled,
-                desired,
-                None,
-                None,
-                None,
-                Some(0),
-                Some(BlockedState::Clear),
-            )?;
-    }
     if let Some(definition) = inner.definitions.get_mut(&extension_id) {
         if let Some(enabled) = enabled {
             definition.set_flag(EXT_FLAG_ENABLED, enabled);
@@ -5477,13 +5700,15 @@ mod tests {
             running: Arc::new(Semaphore::new(max_running)),
             validating: Arc::new(Semaphore::new(1)),
             store_io: Mutex::new(()),
+            catalog_io: Mutex::new(()),
+            catalog: Arc::new(std::sync::Mutex::new(Some(catalog))),
             upload_tails: std::sync::Mutex::new(HashMap::new()),
             maintenance_started: AtomicBool::new(false),
             validation_hook: std::sync::Mutex::new(None),
             storage_hook: std::sync::Mutex::new(None),
+            catalog_hook: Arc::new(std::sync::Mutex::new(None)),
             inner: Mutex::new(ServiceState {
                 store: Some(store),
-                catalog: Some(catalog),
                 diagnostic: None,
                 definitions: HashMap::new(),
                 endpoints: HashMap::new(),
@@ -6298,6 +6523,138 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn catalog_commit_keeps_control_transient_startup_and_shutdown_live() {
+        let root = temporary_root("catalog-unlocked-control");
+        let service = test_service(&root);
+        let state = test_state(Arc::clone(&service));
+        let module = returning_module(0);
+        let hash = tokio::task::block_in_place(|| insert_module(&service, &module));
+        let extension_id = 779;
+        let persistent = service
+            .catalog_call(move |catalog| {
+                catalog.create_with_id(
+                    extension_id,
+                    hash,
+                    "catalog-stall".into(),
+                    Vec::new(),
+                    wire::EXT_RESTART_NEVER,
+                )
+            })
+            .await
+            .unwrap();
+        {
+            let mut inner = service.inner.lock().await;
+            inner.store.as_mut().unwrap().pin(&hash).unwrap();
+            let mut definition = definition_from_persistent(persistent);
+            definition.object_pinned = true;
+            inner.definitions.insert(extension_id, definition);
+        }
+        let endpoint = 146;
+        let mut receiver = register_test_endpoint(&service, endpoint).await;
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        struct CatalogRelease(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+        impl CatalogRelease {
+            fn release(&self) {
+                let (released, wake) = &*self.0;
+                *released
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+                wake.notify_all();
+            }
+        }
+        impl Drop for CatalogRelease {
+            fn drop(&mut self) {
+                self.release();
+            }
+        }
+        let release_guard = CatalogRelease(Arc::clone(&release));
+        let hook_entered = Arc::clone(&entered);
+        let hook_release = Arc::clone(&release);
+        *service
+            .catalog_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(move || {
+            hook_entered.notify_one();
+            let (released, wake) = &*hook_release;
+            let mut released = released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while !*released {
+                released = wake
+                    .wait(released)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }));
+
+        let disabling = {
+            let service = Arc::clone(&service);
+            let state = state.clone();
+            tokio::spawn(async move {
+                service
+                    .handle_control(state, endpoint, 50, extension_id, EXT_CONTROL_DISABLE)
+                    .await;
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("durable control reached the catalog lane");
+
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            service.handle_control(
+                state.clone(),
+                endpoint,
+                51,
+                extension_id,
+                EXT_CONTROL_STATUS,
+            ),
+        )
+        .await
+        .expect("STATUS acquired service state while catalog I/O was stalled");
+        let status = tokio::time::timeout(Duration::from_millis(250), async {
+            loop {
+                let packet = receiver.recv().await.unwrap();
+                if let Some(ExtensionMessage::Status(status)) =
+                    wire::parse_extension_message(&packet).unwrap()
+                    && status.nonce == 51
+                {
+                    break status.status;
+                }
+            }
+        })
+        .await
+        .expect("STATUS response was not blocked by catalog I/O");
+        assert_eq!(status, EXT_STATUS_OK);
+
+        service
+            .dispatch(
+                state.clone(),
+                endpoint,
+                &super::super::ConnectionOrigin::Network,
+                &run_packet(52, hash),
+            )
+            .await;
+        let transient_exit =
+            tokio::time::timeout(Duration::from_millis(250), wait_for_exit(&mut receiver))
+                .await
+                .expect("transient startup was not blocked by catalog I/O");
+        assert_eq!(transient_exit.reason, EXT_EXIT_RETURNED);
+
+        tokio::time::timeout(Duration::from_millis(250), service.begin_shutdown())
+            .await
+            .expect("shutdown admission was not blocked by catalog I/O");
+
+        release_guard.release();
+        tokio::time::timeout(Duration::from_secs(2), disabling)
+            .await
+            .expect("durable control completed after catalog release")
+            .unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn network_final_validation_holds_exact_request_byte_charge() {
         let root = temporary_root("network-validation-charge");
         let service = test_service(&root);
@@ -6690,20 +7047,20 @@ mod tests {
         let persistent_hash =
             tokio::task::block_in_place(|| insert_module(&service, &persistent_module));
         let persistent_id = 777;
-        {
-            let mut inner = service.inner.lock().await;
-            let persistent = inner
-                .catalog
-                .as_mut()
-                .unwrap()
-                .create_with_id(
+        let persistent = service
+            .catalog_call(move |catalog| {
+                catalog.create_with_id(
                     persistent_id,
                     persistent_hash,
                     "persistent".into(),
                     Vec::new(),
                     wire::EXT_RESTART_NEVER,
                 )
-                .unwrap();
+            })
+            .await
+            .unwrap();
+        {
+            let mut inner = service.inner.lock().await;
             inner.store.as_mut().unwrap().pin(&persistent_hash).unwrap();
             let mut definition = definition_from_persistent(persistent);
             definition.object_pinned = true;
@@ -6778,20 +7135,20 @@ mod tests {
         let module = returning_module(3);
         let hash = tokio::task::block_in_place(|| insert_module(&service, &module));
         let extension_id = 778;
-        {
-            let mut inner = service.inner.lock().await;
-            let persistent = inner
-                .catalog
-                .as_mut()
-                .unwrap()
-                .create_with_id(
+        let persistent = service
+            .catalog_call(move |catalog| {
+                catalog.create_with_id(
                     extension_id,
                     hash,
                     "over-budget".into(),
                     Vec::new(),
                     wire::EXT_RESTART_NEVER,
                 )
-                .unwrap();
+            })
+            .await
+            .unwrap();
+        {
+            let mut inner = service.inner.lock().await;
             inner.store.as_mut().unwrap().pin(&hash).unwrap();
             let mut definition = definition_from_persistent(persistent);
             definition.object_pinned = true;
@@ -6816,12 +7173,15 @@ mod tests {
         .await
         .expect("oversized persistent arguments became blocked");
         let inner = service.inner.lock().await;
-        let definition = inner.definitions.get(&extension_id).unwrap();
-        assert_eq!(definition.attempt, 0);
+        assert_eq!(inner.definitions.get(&extension_id).unwrap().attempt, 0);
         assert_eq!(service.argument_budget.used(), 0);
-        let durable = inner.catalog.as_ref().unwrap().get(extension_id).unwrap();
-        assert!(durable.blocked);
         drop(inner);
+        let durable = service
+            .catalog_call(move |catalog| Ok(catalog.get(extension_id).cloned()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(durable.blocked);
         let _ = std::fs::remove_dir_all(root);
     }
 

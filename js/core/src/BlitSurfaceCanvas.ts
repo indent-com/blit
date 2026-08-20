@@ -1521,7 +1521,8 @@ export class BlitSurfaceCanvas {
     metaChord: boolean;
   } | null = null;
   private _pendingPasteFlush:
-    ((payload: ClipboardPayload | null) => void) | null = null;
+    | ((payload: ClipboardPayload | null) => void)
+    | null = null;
   /** Stand the in-flight chord down without pressing V, releasing anything
    *  the deferral held back.  Runs when the clipboard is known to hold
    *  nothing pastable, when an image we declined is all it held, or when
