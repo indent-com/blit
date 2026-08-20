@@ -3627,7 +3627,11 @@ impl ExtensionService {
             )
         };
         let args = {
-            let _catalog_io = self.catalog_io.lock().await;
+            let _catalog_io = if snapshot.args.is_none() {
+                Some(self.catalog_io.lock().await)
+            } else {
+                None
+            };
             self.definition_arguments(&snapshot)
                 .await
                 .map_err(|error| AttemptFailure {
@@ -6519,7 +6523,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn catalog_commit_does_not_hold_service_state_or_block_shutdown() {
+    async fn catalog_commit_keeps_control_transient_startup_and_shutdown_live() {
         let root = temporary_root("catalog-unlocked-control");
         let service = test_service(&root);
         let state = test_state(Arc::clone(&service));
@@ -6599,7 +6603,13 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_millis(250),
-            service.handle_control(state, endpoint, 51, extension_id, EXT_CONTROL_STATUS),
+            service.handle_control(
+                state.clone(),
+                endpoint,
+                51,
+                extension_id,
+                EXT_CONTROL_STATUS,
+            ),
         )
         .await
         .expect("STATUS acquired service state while catalog I/O was stalled");
@@ -6617,6 +6627,21 @@ mod tests {
         .await
         .expect("STATUS response was not blocked by catalog I/O");
         assert_eq!(status, EXT_STATUS_OK);
+
+        service
+            .dispatch(
+                state.clone(),
+                endpoint,
+                &super::super::ConnectionOrigin::Network,
+                &run_packet(52, hash),
+            )
+            .await;
+        let transient_exit =
+            tokio::time::timeout(Duration::from_millis(250), wait_for_exit(&mut receiver))
+                .await
+                .expect("transient startup was not blocked by catalog I/O");
+        assert_eq!(transient_exit.reason, EXT_EXIT_RETURNED);
+
         tokio::time::timeout(Duration::from_millis(250), service.begin_shutdown())
             .await
             .expect("shutdown admission was not blocked by catalog I/O");
