@@ -1,6 +1,6 @@
 [package]
 name = "blit-guest"
-version = "0.54.0"
+version = "0.55.0"
 edition.workspace = true
 description = "Guest SDK for Blit Wasmi extensions"
 license.workspace = true
