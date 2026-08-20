@@ -269,6 +269,14 @@ pub const CREATE2_HAS_ENV: u8 = 1 << 5;
 /// spelling for such a server is the legacy shape — see [`CREATE2_HAS_COMMAND`]
 /// and `docs/protocol.md`.
 pub const CREATE2_HAS_ARGV: u8 = 1 << 6;
+/// Create the terminal without automatically subscribing the requesting
+/// client to its frame stream. Adds no trailing field; lifecycle and control
+/// messages remain connection-wide.
+///
+/// Only set this against a server advertising
+/// [`FEATURE_CREATE_NO_SUBSCRIBE`]. An older server ignores the bit and still
+/// subscribes the creator.
+pub const CREATE2_NO_SUBSCRIBE: u8 = 1 << 7;
 
 /// Most arguments one `CREATE2` may carry.  The whole exec block deliberately
 /// reuses the process family's caps: it is the same `execve` at the other end,
@@ -691,6 +699,9 @@ pub const CLIENT_LIST_ENTRY_HEADER: usize = 38;
 /// convention. Sent only in answer to a request that set
 /// [`CLIENT_LIST_WANT_ORIGIN`].
 pub const S2C_CLIENT_LIST2: u8 = 0x15;
+/// Correlated `C2S_COPY_RANGE` refusal: [0x16][nonce:2][status:1][detail:N].
+/// A missing PTY is `STATUS_NOT_FOUND`; `detail` is diagnostic UTF-8.
+pub const S2C_COPY_FAILED: u8 = 0x16;
 /// The connection is an ordinary client of the server: a browser, a CLI, a
 /// forwarder. `origin_len` is zero — nothing further is known about it, and
 /// nothing further is claimed.
@@ -1054,6 +1065,9 @@ pub const FEATURE_CLIENT_ORIGIN: u32 = 1 << 27;
 /// has to be advertised rather than discovered. Not advertised on Windows,
 /// where the pseudoconsole path can honor neither.
 pub const FEATURE_CREATE_EXEC: u32 = 1 << 29;
+/// `C2S_CREATE2` accepts [`CREATE2_NO_SUBSCRIBE`], allowing supervisors and
+/// other control clients to create terminals without receiving frame updates.
+pub const FEATURE_CREATE_NO_SUBSCRIBE: u32 = 1 << 30;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Color {
@@ -2431,6 +2445,11 @@ pub enum ServerMsg<'a> {
         offset: u32,
         text: &'a str,
     },
+    CopyFailed {
+        nonce: u16,
+        status: u8,
+        detail: &'a str,
+    },
     SurfaceCreated {
         surface_id: u16,
         parent_id: u16,
@@ -2863,6 +2882,16 @@ pub fn parse_server_msg(data: &[u8]) -> Option<ServerMsg<'_>> {
                 total_lines,
                 offset,
                 text,
+            })
+        }
+        S2C_COPY_FAILED => {
+            if data.len() < 4 {
+                return None;
+            }
+            Some(ServerMsg::CopyFailed {
+                nonce: u16::from_le_bytes([data[1], data[2]]),
+                status: data[3],
+                detail: std::str::from_utf8(&data[4..]).unwrap_or_default(),
             })
         }
         S2C_SURFACE_CREATED => {
@@ -3409,6 +3438,10 @@ pub struct Create2Request<'a> {
     /// Ask for one correlated outcome ([`CREATE2_WANT_STATUS`]). Only set this
     /// against a server advertising [`FEATURE_CREATE_STATUS`].
     pub want_status: bool,
+    /// Do not automatically subscribe this client to terminal frame updates.
+    /// Only set against a server advertising
+    /// [`FEATURE_CREATE_NO_SUBSCRIBE`].
+    pub no_subscribe: bool,
     pub tag: &'a str,
     /// Inherit the working directory of this terminal, when `cwd` is absent.
     pub src_pty_id: Option<u16>,
@@ -3502,6 +3535,9 @@ pub fn msg_create2_request(req: &Create2Request<'_>) -> Result<Vec<u8>, Create2E
     }
     if req.want_status {
         features |= CREATE2_WANT_STATUS;
+    }
+    if req.no_subscribe {
+        features |= CREATE2_NO_SUBSCRIBE;
     }
     if req.deadline_ms.is_some() {
         features |= CREATE2_HAS_DEADLINE;
@@ -3613,6 +3649,7 @@ pub fn parse_create2(data: &[u8]) -> Result<Create2Request<'_>, Create2Error> {
     let cols = u16::from_le_bytes([data[5], data[6]]);
     let features = data[7];
     let want_status = features & CREATE2_WANT_STATUS != 0;
+    let no_subscribe = features & CREATE2_NO_SUBSCRIBE != 0;
     let bad = |status, detail| Err(Create2Error::at(nonce, want_status, status, detail));
 
     if data.len() < 10 {
@@ -3801,6 +3838,7 @@ pub fn parse_create2(data: &[u8]) -> Result<Create2Request<'_>, Create2Error> {
         rows,
         cols,
         want_status,
+        no_subscribe,
         tag,
         src_pty_id,
         cwd,
@@ -4047,6 +4085,22 @@ pub fn msg_copy_range(
     msg.extend_from_slice(&end_tail.to_le_bytes());
     msg.extend_from_slice(&end_col.to_le_bytes());
     msg.push(flags);
+    msg
+}
+
+/// Build an `S2C_COPY_FAILED`. The detail shares the creation-refusal cap:
+/// both are short diagnostics attached to a correlated terminal request.
+pub fn msg_copy_failed(nonce: u16, status: u8, detail: &str) -> Vec<u8> {
+    let mut end = detail.len().min(CREATE_FAILED_DETAIL_MAX);
+    while end > 0 && !detail.is_char_boundary(end) {
+        end -= 1;
+    }
+    let detail = &detail.as_bytes()[..end];
+    let mut msg = Vec::with_capacity(4 + detail.len());
+    msg.push(S2C_COPY_FAILED);
+    msg.extend_from_slice(&nonce.to_le_bytes());
+    msg.push(status);
+    msg.extend_from_slice(detail);
     msg
 }
 
@@ -7125,6 +7179,24 @@ mod tests {
     }
 
     #[test]
+    fn copy_failed_roundtrip() {
+        let wire = msg_copy_failed(17, STATUS_NOT_FOUND, "terminal not found");
+        assert_eq!(wire[0], S2C_COPY_FAILED);
+        match parse_server_msg(&wire).unwrap() {
+            ServerMsg::CopyFailed {
+                nonce,
+                status,
+                detail,
+            } => {
+                assert_eq!(nonce, 17);
+                assert_eq!(status, STATUS_NOT_FOUND);
+                assert_eq!(detail, "terminal not found");
+            }
+            _ => panic!("expected CopyFailed"),
+        }
+    }
+
+    #[test]
     fn create_failed_accepts_empty_detail() {
         let wire = msg_create_failed(7, STATUS_OTHER, "");
         assert_eq!(wire.len(), 4);
@@ -7164,6 +7236,34 @@ mod tests {
         assert_eq!(plain.len(), flagged.len());
         assert_eq!(flagged[7], plain[7] | CREATE2_WANT_STATUS);
         assert_eq!(plain[8..], flagged[8..]);
+    }
+
+    #[test]
+    fn create2_no_subscribe_roundtrips_without_a_trailing_field() {
+        let plain = msg_create2_request(&Create2Request {
+            nonce: 3,
+            rows: 24,
+            cols: 80,
+            tag: "tag",
+            command: Some("echo hi"),
+            ..Default::default()
+        })
+        .unwrap();
+        let flagged = msg_create2_request(&Create2Request {
+            nonce: 3,
+            rows: 24,
+            cols: 80,
+            no_subscribe: true,
+            tag: "tag",
+            command: Some("echo hi"),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(plain.len(), flagged.len());
+        assert_eq!(flagged[7], plain[7] | CREATE2_NO_SUBSCRIBE);
+        assert_eq!(plain[8..], flagged[8..]);
+        assert!(parse_create2(&flagged).unwrap().no_subscribe);
+        assert!(!parse_create2(&plain).unwrap().no_subscribe);
     }
 
     #[test]

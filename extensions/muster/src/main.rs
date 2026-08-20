@@ -2036,6 +2036,7 @@ impl Muster {
             cwd: Some(&cwd),
             env: &env_refs,
             deadline_ms: None,
+            subscribe: subscribe_creator(self.features),
         };
         let detail = if shell.is_empty() {
             argv.join(" ")
@@ -2358,6 +2359,7 @@ impl Muster {
             cwd: Some(&cwd),
             env: &env_refs,
             deadline_ms: None,
+            subscribe: subscribe_creator(self.features),
         };
         let phase = self
             .units
@@ -2862,6 +2864,14 @@ fn same_spec(a: &UnitFile, b: &UnitFile) -> bool {
         && a.ready_when == b.ready_when
 }
 
+/// Old servers always subscribe the creator. Preserve that behavior when the
+/// opt-out feature is absent so upgrading Muster does not require an atomic
+/// server upgrade; the subscription is harmless and terminal exit tracking is
+/// unchanged.
+fn subscribe_creator(features: u32) -> bool {
+    features & remote::FEATURE_CREATE_NO_SUBSCRIBE == 0
+}
+
 fn expand_tilde(path: &str, home: &str) -> String {
     match path.strip_prefix('~') {
         Some(rest) => format!("{home}{rest}"),
@@ -3047,5 +3057,11 @@ mod spec_tests {
         let changed =
             file(r#"{"command":["api"],"description":"new","restartOnFailure":false,"keep":4}"#);
         assert!(same_spec(&base, &changed));
+    }
+
+    #[test]
+    fn terminal_creation_only_opts_out_when_the_server_supports_it() {
+        assert!(subscribe_creator(0));
+        assert!(!subscribe_creator(remote::FEATURE_CREATE_NO_SUBSCRIBE));
     }
 }

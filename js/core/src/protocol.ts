@@ -60,6 +60,7 @@ import {
   CREATE2_HAS_DEADLINE,
   CREATE2_HAS_ENV,
   CREATE2_HAS_ARGV,
+  CREATE2_NO_SUBSCRIBE,
 } from "./types";
 
 const textEncoder = new TextEncoder();
@@ -323,6 +324,10 @@ export type Create2Options = {
   deadlineMs?: number;
   /** Only pass this when the server advertised `FEATURE_CREATE_STATUS`. */
   wantStatus?: boolean;
+  /** Set false to skip the creating client's automatic terminal-frame
+   *  subscription. Only pass this when the server advertised
+   *  `FEATURE_CREATE_NO_SUBSCRIBE`. */
+  subscribe?: boolean;
 };
 
 /** Encode a `C2S_CREATE2`.
@@ -376,6 +381,7 @@ export function buildCreate2Message(
   if (argvBytes) features |= CREATE2_HAS_ARGV;
   if (hasCmd) features |= CREATE2_HAS_COMMAND;
   if (options?.wantStatus) features |= CREATE2_WANT_STATUS;
+  if (options?.subscribe === false) features |= CREATE2_NO_SUBSCRIBE;
   const cmdBytes = hasCmd ? textEncoder.encode(cmdText) : new Uint8Array(0);
   const msg = new Uint8Array(
     10 +

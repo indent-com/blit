@@ -1,5 +1,6 @@
 import {
   BlitConnection,
+  type AwaitSessionExitOptions,
   type CreateBlitConnectionOptions,
 } from "./BlitConnection";
 import type {
@@ -88,6 +89,9 @@ export interface CreateWorkspaceSessionOptions {
   /** Server-enforced lifetime, armed at creation. Needs
    *  `FEATURE_PTY_DEADLINE`. */
   deadlineMs?: number;
+  /** Whether the creating connection should immediately receive terminal
+   *  frame updates. Defaults to true. */
+  subscribe?: boolean;
 }
 
 export interface ResizeWorkspaceSessionOptions {
@@ -239,6 +243,7 @@ export class BlitWorkspace {
       cwd: options.cwd,
       env: options.env,
       deadlineMs: options.deadlineMs,
+      subscribe: options.subscribe,
     });
     return session;
   }
@@ -247,6 +252,18 @@ export class BlitWorkspace {
     const session = this.requireSession(sessionId);
     const connection = this.requireConnection(session.connectionId);
     await connection.closeSession(sessionId);
+  }
+
+  /** Wait for a session to exit or close, preserving its final exit status. */
+  async awaitSessionExit(
+    sessionId: SessionId,
+    options?: AwaitSessionExitOptions,
+  ): Promise<BlitSession> {
+    const session = this.requireSession(sessionId);
+    return this.requireConnection(session.connectionId).awaitSessionExit(
+      sessionId,
+      options,
+    );
   }
 
   closeSurface(connectionId: ConnectionId, surfaceId: number): void {

@@ -246,6 +246,9 @@ export interface BlitConnectionSnapshot {
    *  before asking — an older server ignores those fields rather than
    *  refusing them, and quietly starts something else. */
   supportsCreateExec: boolean;
+  /** Server can create a terminal without automatically subscribing the
+   *  requesting client to its frame stream. */
+  supportsCreateNoSubscribe: boolean;
   retryCount: number;
   /** Opaque 64-bit identifier for the current server process, or `null` for
    *  servers predating the extended HELLO. */
@@ -395,6 +398,12 @@ export const CREATE2_HAS_ENV = 1 << 5;
  *  Needs {@link FEATURE_CREATE_EXEC}: an older server ignores the bit, finds
  *  no command, and spawns a plain interactive shell instead. */
 export const CREATE2_HAS_ARGV = 1 << 6;
+/** Do not automatically subscribe the creating client to terminal frame
+ *  updates. Adds no trailing field and does not suppress lifecycle/control
+ *  messages. Only set when HELLO advertised
+ *  {@link FEATURE_CREATE_NO_SUBSCRIBE}; an older server ignores the bit and
+ *  subscribes the creator anyway. */
+export const CREATE2_NO_SUBSCRIBE = 1 << 7;
 
 /** Wire protocol constants: server-to-client message types. */
 export const S2C_UPDATE = 0x00;
@@ -437,6 +446,8 @@ export const S2C_CLIENT_LIST = 0x12;
  *  {@link CLIENT_LIST_WANT_ORIGIN}. A distinct opcode because the shipped
  *  parsers on both sides reject a catalog with bytes left over. */
 export const S2C_CLIENT_LIST2 = 0x15;
+/** Correlated COPY_RANGE refusal: [nonce:2][status:1][detail:N]. */
+export const S2C_COPY_FAILED = 0x16;
 /** Bit 0 of the optional flags byte on `C2S_CLIENT_LIST` / `C2S_CLIENT_WATCH`:
  *  answer with {@link S2C_CLIENT_LIST2}. */
 export const CLIENT_LIST_WANT_ORIGIN = 1 << 0;
@@ -659,6 +670,8 @@ export const FEATURE_CLIENT_ORIGIN = 1 << 27;
  *  this has to be negotiated rather than discovered.  Not advertised on
  *  Windows servers, where the pseudoconsole path can honor neither. */
 export const FEATURE_CREATE_EXEC = 1 << 29;
+/** `C2S_CREATE2` accepts {@link CREATE2_NO_SUBSCRIBE}. */
+export const FEATURE_CREATE_NO_SUBSCRIBE = 1 << 30;
 
 // -- Common status registry (docs/protocol.md) ------------------------------
 //

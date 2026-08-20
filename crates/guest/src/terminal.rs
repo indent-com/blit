@@ -10,9 +10,9 @@ use alloc::{string::String, vec::Vec};
 use core::fmt;
 
 use blit_remote::{
-    Create2Request, FEATURE_CREATE_EXEC, FEATURE_CREATE_STATUS, FEATURE_PTY_DEADLINE, S2C_UPDATE,
-    ServerMsg, TerminalState, msg_ack, msg_create2_request, msg_subscribe, msg_unsubscribe,
-    parse_server_msg,
+    Create2Request, FEATURE_CREATE_EXEC, FEATURE_CREATE_NO_SUBSCRIBE, FEATURE_CREATE_STATUS,
+    FEATURE_PTY_DEADLINE, S2C_UPDATE, ServerMsg, TerminalState, msg_ack, msg_create2_request,
+    msg_subscribe, msg_unsubscribe, parse_server_msg,
 };
 
 use crate::{Client, Error as ClientError};
@@ -34,6 +34,9 @@ pub struct CreateRequest<'a> {
     /// Needs [`FEATURE_CREATE_EXEC`](blit_remote::FEATURE_CREATE_EXEC).
     pub env: &'a [(&'a str, &'a str)],
     pub deadline_ms: Option<u32>,
+    /// Whether the server should automatically subscribe this client to the
+    /// new terminal's frame stream. Defaults to `true` in the constructors.
+    pub subscribe: bool,
 }
 
 impl<'a> CreateRequest<'a> {
@@ -48,6 +51,7 @@ impl<'a> CreateRequest<'a> {
             cwd: None,
             env: &[],
             deadline_ms: None,
+            subscribe: true,
         }
     }
 
@@ -233,6 +237,9 @@ impl TerminalSubscriptions {
         if request.deadline_ms.is_some() && features & FEATURE_PTY_DEADLINE == 0 {
             return Err(Error::FeatureMissing("FEATURE_PTY_DEADLINE"));
         }
+        if !request.subscribe && features & FEATURE_CREATE_NO_SUBSCRIBE == 0 {
+            return Err(Error::FeatureMissing("FEATURE_CREATE_NO_SUBSCRIBE"));
+        }
         // Neither exec field is probeable: an older server ignores the flag and
         // reads the block as command bytes, or spawns a plain shell. Refuse
         // here rather than let it run something else.
@@ -248,6 +255,7 @@ impl TerminalSubscriptions {
             rows: request.rows,
             cols: request.cols,
             want_status: true,
+            no_subscribe: !request.subscribe,
             tag: request.tag,
             cwd: request.cwd,
             deadline_ms: request.deadline_ms,
@@ -565,7 +573,8 @@ mod tests {
     const ALL_FEATURES: u32 = bootstrap::FEATURE_EXTENSION
         | FEATURE_CREATE_STATUS
         | FEATURE_PTY_DEADLINE
-        | FEATURE_CREATE_EXEC;
+        | FEATURE_CREATE_EXEC
+        | FEATURE_CREATE_NO_SUBSCRIBE;
 
     fn hello_with(features: u32) -> Vec<u8> {
         let mut packet = vec![bootstrap::S2C_HELLO];
@@ -754,6 +763,42 @@ mod tests {
         assert_ne!(sent[0][7] & blit_remote::CREATE2_WANT_STATUS, 0);
         assert_eq!(sent[1], vec![C2S_SUBSCRIBE, 33, 0]);
         assert_eq!(ack_count(&state.borrow()), 0);
+    }
+
+    #[test]
+    fn correlated_create_can_skip_the_automatic_subscription() {
+        let (_guard, state, mut client) = boot();
+        state
+            .borrow_mut()
+            .incoming
+            .push_back(vec![S2C_CREATED_N, 1, 0, 33, 0]);
+        let mut terminals = TerminalSubscriptions::new();
+        let request = CreateRequest {
+            subscribe: false,
+            ..CreateRequest::shell(24, 80)
+        };
+
+        assert_eq!(terminals.create(&mut client, request).unwrap(), 33);
+        let sent = &state.borrow().sent;
+        let parsed = blit_remote::parse_create2(&sent[0]).unwrap();
+        assert!(parsed.no_subscribe);
+        assert_eq!(sent.len(), 1);
+    }
+
+    #[test]
+    fn no_subscribe_create_needs_the_feature_bit() {
+        let (_guard, state, mut client) = boot_without(FEATURE_CREATE_NO_SUBSCRIBE);
+        let mut terminals = TerminalSubscriptions::new();
+        let request = CreateRequest {
+            subscribe: false,
+            ..CreateRequest::shell(24, 80)
+        };
+
+        assert!(matches!(
+            terminals.create(&mut client, request),
+            Err(Error::FeatureMissing("FEATURE_CREATE_NO_SUBSCRIBE"))
+        ));
+        assert!(state.borrow().sent.is_empty());
     }
 
     #[test]

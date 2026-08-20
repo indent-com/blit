@@ -46,6 +46,11 @@ const MUX_S2C_OPENED = 0x81;
 const MUX_S2C_CLOSED = 0x82;
 const MUX_S2C_ERROR = 0x83;
 const MAX_MUX_FRAME_LENGTH = 16 * 1024 * 1024;
+// A virtual channel retry is one cheap OPEN frame on an already-live mux.
+// Keep it much tighter than reconnecting the mux itself: development servers
+// routinely disappear for several seconds during a rebuild, and a 10s channel
+// backoff can otherwise leave the UI disconnected long after they are ready.
+const MAX_CHANNEL_RECONNECT_DELAY_MS = 1_000;
 // Bound the amount of transport work one fulfilled read can dump into the
 // main thread. At 6–8 MB/s a 256 KiB read spans 30–40 ms and Chromium may
 // deliver several complete video frames synchronously; 32 KiB keeps the
@@ -811,7 +816,11 @@ export class MuxTransport {
     if (ch._internalStatus === "closed" || ch._suspended) return;
     if (this.channelReconnectTimers.has(ch.channelId)) return;
     const delay = ch._reconnectDelay;
-    ch._reconnectDelay = Math.min(delay * this.backoff, this.maxDelay);
+    ch._reconnectDelay = Math.min(
+      delay * this.backoff,
+      this.maxDelay,
+      MAX_CHANNEL_RECONNECT_DELAY_MS,
+    );
     this.channelReconnectTimers.set(
       ch.channelId,
       setTimeout(() => {

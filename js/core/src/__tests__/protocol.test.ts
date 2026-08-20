@@ -52,6 +52,7 @@ import {
   CREATE2_HAS_DEADLINE,
   CREATE2_HAS_ENV,
   CREATE2_HAS_ARGV,
+  CREATE2_NO_SUBSCRIBE,
   C2S_SURFACE_POINTER_AXIS2,
   C2S_SURFACE_ACK,
   C2S_SURFACE_SUBSCRIBE,
@@ -351,6 +352,17 @@ describe("protocol message builders", () => {
       const msg = buildCreate2Message(0, 24, 80, { wantStatus: true });
       expect(msg[7]).toBe(CREATE2_WANT_STATUS);
       expect(msg.length).toBe(10);
+    });
+
+    it("subscribe false sets the flag without a trailing field", () => {
+      const defaultCreate = buildCreate2Message(0, 24, 80);
+      const noSubscribe = buildCreate2Message(0, 24, 80, {
+        subscribe: false,
+      });
+      expect(defaultCreate[7]).toBe(0);
+      expect(noSubscribe[7]).toBe(CREATE2_NO_SUBSCRIBE);
+      expect(noSubscribe.length).toBe(defaultCreate.length);
+      expect(noSubscribe.slice(8)).toEqual(defaultCreate.slice(8));
     });
 
     it("wantStatus combines with the other feature bits", () => {

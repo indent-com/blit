@@ -36,23 +36,23 @@ use blit_remote::{
     C2S_SURFACE_UNSUBSCRIBE, C2S_TERM_CWD, C2S_UNSUBSCRIBE, CAPTURE_FORMAT_AVIF,
     CAPTURE_FORMAT_PNG, CLIENT_FEATURE_SURFACE_TIMESTAMP_SUB_US, CLIENT_LIST_WANT_ORIGIN,
     FEATURE_CLIENT_CONTROL, FEATURE_CLIENT_ORIGIN, FEATURE_COPY_RANGE, FEATURE_CREATE_EXEC,
-    FEATURE_CREATE_NONCE, FEATURE_CREATE_STATUS, FEATURE_KILL_MODE, FEATURE_PTY_DEADLINE,
-    FEATURE_RESIZE_BATCH, FEATURE_RESTART, FEATURE_SCROLL_BY, FrameState, KICK_REASON_MAX,
-    KILL_LEADER_ONLY, READ_ANSI, READ_TAIL, REMOTE_INPUT_POINTER, REMOTE_INPUT_TOUCH, S2C_CLOSED,
-    S2C_CREATED, S2C_CREATED_N, S2C_LIST, S2C_PING, S2C_QUIT, S2C_READY, S2C_SEARCH_RESULTS,
-    S2C_SURFACE_CAPTURE, S2C_SURFACE_LIST, S2C_TEXT, S2C_TITLE, STATUS_BUDGET, STATUS_INVALID,
-    STATUS_NOT_FOUND, STATUS_OK, STATUS_OTHER, STATUS_TOO_LARGE, SURFACE_FRAME_CODEC_H264,
-    SURFACE_FRAME_FLAG_KEYFRAME, SURFACE_POINTER_AXIS2_LEN, SURFACE_POINTER_DOWN,
-    SURFACE_POINTER_LEAVE, SURFACE_POINTER_MOVE, SURFACE_POINTER_UP, SURFACE_TOUCH_CANCEL,
-    SURFACE_TOUCH_DISABLE, SURFACE_TOUCH_DOWN, SURFACE_TOUCH_ENABLE, SURFACE_TOUCH_MOTION,
-    SURFACE_TOUCH_UP, build_update_msg, clamp_cursor_rect, msg_hello, msg_kick_result, msg_kicked,
-    msg_s2c_client_list, msg_s2c_client_list2, msg_s2c_clipboard_content, msg_s2c_clipboard_list,
-    msg_s2c_clipboard_owner, msg_s2c_scroll_offset, msg_s2c_surface_remote_input,
-    msg_s2c_used_rows, msg_surface_activated, msg_surface_app_id, msg_surface_created,
-    msg_surface_destroyed, msg_surface_encoder, msg_surface_frame, msg_surface_frame_precise,
-    msg_surface_origin, msg_surface_resized, msg_surface_text_input, msg_surface_title,
-    msg_term_cwd_reply, parse_surface_drag_drop, parse_surface_drag_enter,
-    parse_surface_pointer_axis2, parse_surface_touch,
+    FEATURE_CREATE_NO_SUBSCRIBE, FEATURE_CREATE_NONCE, FEATURE_CREATE_STATUS, FEATURE_KILL_MODE,
+    FEATURE_PTY_DEADLINE, FEATURE_RESIZE_BATCH, FEATURE_RESTART, FEATURE_SCROLL_BY, FrameState,
+    KICK_REASON_MAX, KILL_LEADER_ONLY, READ_ANSI, READ_TAIL, REMOTE_INPUT_POINTER,
+    REMOTE_INPUT_TOUCH, S2C_CLOSED, S2C_CREATED, S2C_CREATED_N, S2C_LIST, S2C_PING, S2C_QUIT,
+    S2C_READY, S2C_SEARCH_RESULTS, S2C_SURFACE_CAPTURE, S2C_SURFACE_LIST, S2C_TEXT, S2C_TITLE,
+    STATUS_BUDGET, STATUS_INVALID, STATUS_NOT_FOUND, STATUS_OK, STATUS_OTHER, STATUS_TOO_LARGE,
+    SURFACE_FRAME_CODEC_H264, SURFACE_FRAME_FLAG_KEYFRAME, SURFACE_POINTER_AXIS2_LEN,
+    SURFACE_POINTER_DOWN, SURFACE_POINTER_LEAVE, SURFACE_POINTER_MOVE, SURFACE_POINTER_UP,
+    SURFACE_TOUCH_CANCEL, SURFACE_TOUCH_DISABLE, SURFACE_TOUCH_DOWN, SURFACE_TOUCH_ENABLE,
+    SURFACE_TOUCH_MOTION, SURFACE_TOUCH_UP, build_update_msg, clamp_cursor_rect, msg_copy_failed,
+    msg_hello, msg_kick_result, msg_kicked, msg_s2c_client_list, msg_s2c_client_list2,
+    msg_s2c_clipboard_content, msg_s2c_clipboard_list, msg_s2c_clipboard_owner,
+    msg_s2c_scroll_offset, msg_s2c_surface_remote_input, msg_s2c_used_rows, msg_surface_activated,
+    msg_surface_app_id, msg_surface_created, msg_surface_destroyed, msg_surface_encoder,
+    msg_surface_frame, msg_surface_frame_precise, msg_surface_origin, msg_surface_resized,
+    msg_surface_text_input, msg_surface_title, msg_term_cwd_reply, parse_surface_drag_drop,
+    parse_surface_drag_enter, parse_surface_pointer_axis2, parse_surface_touch,
 };
 #[cfg(target_os = "linux")]
 use blit_remote::{
@@ -18217,6 +18217,7 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
             | FEATURE_RESIZE_BATCH
             | FEATURE_COPY_RANGE
             | FEATURE_CREATE_STATUS
+            | FEATURE_CREATE_NO_SUBSCRIBE
             | FEATURE_KILL_MODE
             | FEATURE_PTY_DEADLINE
             | FEATURE_SCROLL_BY
@@ -20322,6 +20323,7 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                 };
                 let nonce = req.nonce;
                 let want_status = req.want_status;
+                let subscribe_creator = !req.no_subscribe;
                 let tag = req.tag;
                 // Straight off the wire and straight into the grid allocation.
                 let (rows, cols) = clamp_view_size(req.rows, req.cols);
@@ -20437,10 +20439,12 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     broadcast_msg.extend_from_slice(tag_bytes);
                     sess.ptys.insert(id, pty);
                     if let Some(c) = sess.clients.get_mut(&client_id) {
-                        c.lead = Some(id);
-                        c.view_sizes.insert(id, (rows, cols));
-                        subscribe_client_to(c, id);
-                        reset_inflight(c);
+                        if subscribe_creator {
+                            c.lead = Some(id);
+                            c.view_sizes.insert(id, (rows, cols));
+                            subscribe_client_to(c, id);
+                            reset_inflight(c);
+                        }
                         let _ = send_outbox(c, nonce_msg);
                     }
                     for (&cid, c) in sess.clients.iter() {
@@ -21631,7 +21635,7 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                 let end_tail = u32::from_le_bytes([data[11], data[12], data[13], data[14]]);
                 let end_col = u16::from_le_bytes([data[15], data[16]]);
 
-                if let Some(pty) = sess.ptys.get(&pid) {
+                let msg = if let Some(pty) = sess.ptys.get(&pid) {
                     let text = pty
                         .driver
                         .get_text_range(start_tail, start_col, end_tail, end_col);
@@ -21644,9 +21648,12 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     msg.extend_from_slice(&total_lines.to_le_bytes());
                     msg.extend_from_slice(&start_tail.to_le_bytes());
                     msg.extend_from_slice(text.as_bytes());
-                    if let Some(client) = sess.clients.get(&client_id) {
-                        let _ = send_outbox(client, msg);
-                    }
+                    msg
+                } else {
+                    msg_copy_failed(nonce, STATUS_NOT_FOUND, "terminal not found")
+                };
+                if let Some(client) = sess.clients.get(&client_id) {
+                    let _ = send_outbox(client, msg);
                 }
             }
             C2S_DEADLINE if data.len() >= 7 => {
@@ -21951,8 +21958,11 @@ mod tests {
             FEATURE_PROCESS, PROCESS_EXIT_RETURNED, ProcessCommand, ProcessEvent, S2C_PROCESS_EXIT,
             S2C_PROCESS_STARTED,
         };
-        use blit_remote::{S2C_HELLO, S2C_READY, STATUS_OK};
-        use tokio::time::timeout;
+        use blit_remote::{
+            Create2Request, FEATURE_CREATE_NO_SUBSCRIBE, S2C_COPY_FAILED, S2C_EXITED, S2C_HELLO,
+            S2C_READY, S2C_UPDATE, STATUS_NOT_FOUND, STATUS_OK, ServerMsg,
+        };
+        use tokio::time::{sleep, timeout};
 
         pub(super) fn test_state(process_server: process::Server) -> AppState {
             Arc::new(AppStateInner {
@@ -22075,6 +22085,198 @@ mod tests {
             assert_eq!(stdout, b"out\x01");
             assert_eq!(stderr, b"err\x02");
             assert_eq!((exit.reason, exit.code), (PROCESS_EXIT_RETURNED, 7));
+
+            drop(client);
+            timeout(Duration::from_secs(5), connection)
+                .await
+                .expect("connection cleanup timed out")
+                .unwrap();
+            process_server.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn copy_range_for_a_missing_pty_returns_a_correlated_failure() {
+            let process_server = process::Server::new(false, false);
+            let state = test_state(process_server.clone());
+            let (mut client, server_stream) = tokio::io::duplex(1024 * 1024);
+            let connection = tokio::spawn(handle_client_with_options(
+                server_stream,
+                state,
+                ConnectionOptions::network(),
+            ));
+
+            while next_frame(&mut client).await.first().copied() != Some(S2C_READY) {}
+
+            let request = blit_remote::msg_copy_range(73, 404, 100, 0, 0, 0, 0);
+            assert!(write_frame(&mut client, &request).await);
+            let reply = next_frame(&mut client).await;
+            assert_eq!(reply.first().copied(), Some(S2C_COPY_FAILED));
+            match blit_remote::parse_server_msg(&reply) {
+                Some(ServerMsg::CopyFailed {
+                    nonce,
+                    status,
+                    detail,
+                }) => {
+                    assert_eq!(nonce, 73);
+                    assert_eq!(status, STATUS_NOT_FOUND);
+                    assert_eq!(detail, "terminal not found");
+                }
+                _ => panic!("expected correlated copy failure"),
+            }
+
+            drop(client);
+            timeout(Duration::from_secs(5), connection)
+                .await
+                .expect("connection cleanup timed out")
+                .unwrap();
+            process_server.shutdown().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn create2_subscribes_the_creator_by_default() {
+            let process_server = process::Server::new(false, false);
+            let state = test_state(process_server.clone());
+            let inspect = state.clone();
+            let (mut client, server_stream) = tokio::io::duplex(1024 * 1024);
+            let connection = tokio::spawn(handle_client_with_options(
+                server_stream,
+                state,
+                ConnectionOptions::network(),
+            ));
+
+            while next_frame(&mut client).await.first().copied() != Some(S2C_READY) {}
+            let request = blit_remote::msg_create2_request(&Create2Request {
+                nonce: 91,
+                rows: 24,
+                cols: 80,
+                argv: Some(vec!["/bin/sh", "-c", "exit 0"]),
+                ..Default::default()
+            })
+            .unwrap();
+            assert!(write_frame(&mut client, &request).await);
+
+            let pty_id = loop {
+                let frame = next_frame(&mut client).await;
+                if let Some(ServerMsg::CreatedN {
+                    nonce: 91, pty_id, ..
+                }) = blit_remote::parse_server_msg(&frame)
+                {
+                    break pty_id;
+                }
+            };
+            let session = inspect.session.lock().await;
+            let creator = session.clients.values().next().expect("creating client");
+            assert!(creator.subscriptions.contains(&pty_id));
+            drop(session);
+
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    supervise(&inspect).await;
+                    if inspect
+                        .session
+                        .lock()
+                        .await
+                        .ptys
+                        .get(&pty_id)
+                        .is_some_and(|pty| pty.exited)
+                    {
+                        break;
+                    }
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("PTY did not exit");
+
+            drop(client);
+            timeout(Duration::from_secs(5), connection)
+                .await
+                .expect("connection cleanup timed out")
+                .unwrap();
+            process_server.shutdown().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn create2_can_skip_updates_but_still_receives_exit_lifecycle() {
+            let process_server = process::Server::new(false, false);
+            let state = test_state(process_server.clone());
+            let inspect = state.clone();
+            let (mut client, server_stream) = tokio::io::duplex(1024 * 1024);
+            let connection = tokio::spawn(handle_client_with_options(
+                server_stream,
+                state,
+                ConnectionOptions::network(),
+            ));
+
+            let mut advertised = false;
+            loop {
+                let frame = next_frame(&mut client).await;
+                match frame.first().copied() {
+                    Some(S2C_HELLO) => {
+                        let features = u32::from_le_bytes(frame[3..7].try_into().unwrap());
+                        advertised = features & FEATURE_CREATE_NO_SUBSCRIBE != 0;
+                    }
+                    Some(S2C_READY) => break,
+                    _ => {}
+                }
+            }
+            assert!(advertised);
+
+            let request = blit_remote::msg_create2_request(&Create2Request {
+                nonce: 92,
+                rows: 24,
+                cols: 80,
+                no_subscribe: true,
+                argv: Some(vec!["/bin/sh", "-c", "printf done; exit 7"]),
+                ..Default::default()
+            })
+            .unwrap();
+            assert!(write_frame(&mut client, &request).await);
+
+            let pty_id = loop {
+                let frame = next_frame(&mut client).await;
+                assert_ne!(frame.first().copied(), Some(S2C_UPDATE));
+                if let Some(ServerMsg::CreatedN {
+                    nonce: 92, pty_id, ..
+                }) = blit_remote::parse_server_msg(&frame)
+                {
+                    break pty_id;
+                }
+            };
+            {
+                let session = inspect.session.lock().await;
+                let creator = session.clients.values().next().expect("creating client");
+                assert!(!creator.subscriptions.contains(&pty_id));
+                assert!(!creator.view_sizes.contains_key(&pty_id));
+                assert_ne!(creator.lead, Some(pty_id));
+            }
+
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    supervise(&inspect).await;
+                    if inspect
+                        .session
+                        .lock()
+                        .await
+                        .ptys
+                        .get(&pty_id)
+                        .is_some_and(|pty| pty.exited)
+                    {
+                        break;
+                    }
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("PTY did not exit");
+
+            loop {
+                let frame = next_frame(&mut client).await;
+                assert_ne!(frame.first().copied(), Some(S2C_UPDATE));
+                if frame.first().copied() == Some(S2C_EXITED) {
+                    break;
+                }
+            }
 
             drop(client);
             timeout(Duration::from_secs(5), connection)

@@ -131,10 +131,15 @@ viewer receives a downscaled stream at its requested physical size.
 - Bit 4 (`HAS_DEADLINE`): followed by `[ms:4]`, after any cwd and before any command bytes — arm a deadline at creation. Valid only when `HELLO` advertises `PTY_DEADLINE`.
 - Bit 5 (`HAS_ENV`): followed by `[count:2]` then `count` records of `[key_len:2][key:N][value_len:4][value:N]` — environment overrides for the child. Valid only when `HELLO` advertises `CREATE_EXEC`.
 - Bit 6 (`HAS_ARGV`): followed by `[argc:2]` then `argc` records of `[len:4][arg:N]` — exec this argv directly, no shell. Mutually exclusive with `HAS_COMMAND`; a message setting both is `INVALID`. Valid only when `HELLO` advertises `CREATE_EXEC`.
+- Bit 7 (`NO_SUBSCRIBE`): do not automatically subscribe the creating client to terminal frame updates. It adds no trailing field and leaves lifecycle/control messages unchanged. Valid only when `HELLO` advertises `CREATE_NO_SUBSCRIBE`.
 
 Optional fields appear in flag-bit order — `src_pty_id`, cwd, deadline, env, argv — and the command, which has no length prefix, is always last.
 
 Every field-bearing bit past `HAS_CWD` is unsafe against a server that does not advertise it. An older server does not refuse an unknown `features` bit; it ignores the bit, does not skip the field, and reads those bytes as the start of the command. `HAS_ARGV` fails differently and just as quietly: with no `HAS_COMMAND` set, the server spawns the default interactive shell. Negotiate, do not probe.
+
+By default every create subscribes its requesting client, preserving the legacy
+behavior. `NO_SUBSCRIBE` is also negotiation-only: an older server ignores the
+bit and subscribes the creator.
 
 Environment entries are applied last, after everything the server derives for a terminal — the inherited environment, `TERM`, an exported `BLIT_SOCK`, and the session variables — so a client entry always wins. Keys may not be empty, hold a NUL or an `=`, or repeat; values may not hold a NUL. Limits match the process family: 1024 arguments and 1 MiB of argument bytes, 256 variables and 1 MiB of key and value bytes, 64 KiB for any single argument or value, 255 bytes for a key.
 
@@ -148,6 +153,9 @@ The COMMAND column of `S2C_LIST` shows an argv terminal a shell-quoted rendering
 - `limit`: max lines to return (0 = all).
 - `flags`: bit 0 (`READ_ANSI`) includes ANSI escape sequences; bit 1 (`READ_TAIL`) counts from the end.
 - Server responds with `S2C_TEXT` echoing the same nonce.
+
+`COPY_RANGE` returns `S2C_COPY_FAILED` with the request nonce and common
+`NOT_FOUND` status if the PTY disappeared before the server handled it.
 
 `RESIZE` is batched: after the opcode, the payload contains one or more `[pty_id:2][rows:2][cols:2]` triplets. Requires the `RESIZE_BATCH` feature bit in `S2C_HELLO`.
 
@@ -326,6 +334,7 @@ shared sizing input without a `SURFACE_RESIZE` entry.
 | `0x13` | `KICK_RESULT`          | `[nonce:2][status:1][detail:N]` — correlated result of `C2S_KICK`                                                                                                                                                                                                                                                                           |
 | `0x14` | `KICKED`               | `[reason:N]` — another client kicked this connection; the server closes it after delivery                                                                                                                                                                                                                                                   |
 | `0x15` | `CLIENT_LIST2`         | `CLIENT_LIST` with `[origin_kind:1][origin_len:2][origin:N]` on every record — answer to a request carrying `WANT_ORIGIN`                                                                                                                                                                                                                   |
+| `0x16` | `COPY_FAILED`          | `[nonce:2][status:1][detail:N]` — correlated `COPY_RANGE` refusal; a missing PTY is `NOT_FOUND`                                                                                                                                                                                                                                             |
 | `0x20` | `SURFACE_CREATED`      | `[surface_id:2][parent_id:2][w:2][h:2][title_len:2][title:N][app_id_len:2][app_id:M]`                                                                                                                                                                                                                                                       |
 | `0x21` | `SURFACE_DESTROYED`    | `[surface_id:2]`                                                                                                                                                                                                                                                                                                                            |
 | `0x22` | `SURFACE_FRAME`        | `[surface_id:2][timestamp:4][flags:1][w:2][h:2][data:N]`                                                                                                                                                                                                                                                                                    |
@@ -399,6 +408,7 @@ shared sizing input without a `SURFACE_RESIZE` entry.
 | 27  | `CLIENT_ORIGIN`       | The client catalog can say which connections are extensions     |
 | 28  | `TERM_JOURNAL`        | Per-command journal and sequence-addressed output               |
 | 29  | `CREATE_EXEC`         | `CREATE2(HAS_ARGV)` and `CREATE2(HAS_ENV)`; Unix hosts only     |
+| 30  | `CREATE_NO_SUBSCRIBE` | `CREATE2(NO_SUBSCRIBE)` skips creator frame subscription        |
 
 Bit 26 is advertised with bit 12 and never alone; it is separate because a
 `WATCH` an older server does not know is dropped by the channel family's
@@ -1011,7 +1021,13 @@ S2C_EXITED      (one per exited-but-retained PTY)
 S2C_READY       (end of initial burst)
 ```
 
-After `S2C_READY`, the client can start sending commands. `S2C_UPDATE` frames are not sent until the client subscribes to a PTY with `C2S_SUBSCRIBE`. Each `C2S_SUBSCRIBE`, including one repeated for an already subscribed PTY, starts a fresh diff stream: the next update is a full-state keyframe. Clients use that repeat to recover after discarding or failing to apply a delta.
+After `S2C_READY`, the client can start sending commands. A successful create
+subscribes its creator by default; `CREATE2(NO_SUBSCRIBE)` opts out. Otherwise,
+`S2C_UPDATE` frames are not sent until the client subscribes to a PTY with
+`C2S_SUBSCRIBE`. Each `C2S_SUBSCRIBE`, including one repeated for an already
+subscribed PTY, starts a fresh diff stream: the next update is a full-state
+keyframe. Clients use that repeat to recover after discarding or failing to
+apply a delta.
 
 `S2C_EXITED` is an ingestion barrier: the server applies every PTY byte drained
 for that process generation to its terminal model before sending the exit. It

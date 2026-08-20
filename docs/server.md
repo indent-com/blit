@@ -144,6 +144,10 @@ PTYs are created by `C2S_CREATE` or `C2S_CREATE2`. The server:
 6. `S2C_CREATED` (or `S2C_CREATED_N` with nonce) is sent to the creating client.
 7. All connected clients receive `S2C_LIST` reflecting the new PTY.
 
+Creation automatically subscribes the requesting client to terminal frame
+updates. A negotiated `CREATE2(NO_SUBSCRIBE)` request skips that subscription,
+which is useful for supervisors that only need lifecycle and control messages.
+
 The terminal remembers what it was created with — command or `argv`, working
 directory, and environment overrides — so `C2S_RESTART` re-runs the same child
 rather than falling back to a bare login shell.
@@ -156,7 +160,9 @@ When the PTY subprocess exits, `waitpid` captures the exit status:
 - Signal death: negative signal number (-9 = SIGKILL, -15 = SIGTERM).
 - Unknown: `i32::MIN`.
 
-`S2C_EXITED` is broadcast to all subscribed clients. The terminal state is retained — clients can still scroll and read. The PTY slot is marked exited but not freed.
+`S2C_EXITED` is broadcast to all connected clients, including clients that are
+not subscribed to terminal frame updates. The terminal state is retained —
+clients can still scroll and read. The PTY slot is marked exited but not freed.
 
 `C2S_RESTART` respawns the shell in the same slot. `C2S_CLOSE` removes the PTY entirely and frees the slot.
 

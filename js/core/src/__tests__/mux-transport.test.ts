@@ -149,6 +149,16 @@ function controlFrame(opcode: number, ch: number): ArrayBuffer {
   return buf.buffer;
 }
 
+function controlErrorFrame(ch: number): ArrayBuffer {
+  const buf = new Uint8Array(7);
+  const view = new DataView(buf.buffer);
+  view.setUint16(0, 0xffff, true);
+  buf[2] = 0x83;
+  view.setUint16(3, ch, true);
+  view.setUint16(5, 0, true);
+  return buf.buffer;
+}
+
 function decodeControl(data: string | Uint8Array | ArrayBuffer) {
   expect(typeof data).not.toBe("string");
   const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
@@ -393,6 +403,45 @@ describe("MuxTransport", () => {
       { opcode: 0x02, channelId: 0 },
       { opcode: 0x01, channelId: 0 },
     ]);
+
+    mux.close();
+  });
+
+  it("caps virtual channel reconnect backoff at one second", async () => {
+    const mux = new MuxTransport("ws://host/mux", "secret", {
+      reconnectDelay: 500,
+      reconnectBackoff: 4,
+      maxReconnectDelay: 10_000,
+    });
+    const ch = mux.createChannel("remote");
+
+    mux.connect();
+    latestSocket().simulateOpen();
+    latestSocket().simulateMessage("mux");
+    ch.connect();
+    latestSocket().simulateMessage(controlFrame(0x81, 0));
+
+    // The first failed OPEN keeps the ordinary 500ms initial delay.
+    latestSocket().simulateMessage(controlErrorFrame(0));
+    const firstAttempt = sentControlFrames().length;
+    await vi.advanceTimersByTimeAsync(499);
+    expect(sentControlFrames()).toHaveLength(firstAttempt);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(sentControlFrames()).toHaveLength(firstAttempt + 1);
+
+    // Further failures retry once per second even though the mux's own
+    // transport-level backoff may continue growing toward ten seconds.
+    latestSocket().simulateMessage(controlErrorFrame(0));
+    const secondAttempt = sentControlFrames().length;
+    await vi.advanceTimersByTimeAsync(999);
+    expect(sentControlFrames()).toHaveLength(secondAttempt);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(sentControlFrames()).toHaveLength(secondAttempt + 1);
+
+    latestSocket().simulateMessage(controlErrorFrame(0));
+    const thirdAttempt = sentControlFrames().length;
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(sentControlFrames()).toHaveLength(thirdAttempt + 1);
 
     mux.close();
   });

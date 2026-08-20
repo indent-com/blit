@@ -39,8 +39,10 @@ import {
   FEATURE_CREATE_NONCE,
   FEATURE_CREATE_STATUS,
   FEATURE_CREATE_EXEC,
+  FEATURE_CREATE_NO_SUBSCRIBE,
   CREATE2_HAS_ARGV,
   CREATE2_HAS_ENV,
+  CREATE2_NO_SUBSCRIBE,
   CLIENT_LIST_WANT_ORIGIN,
   FEATURE_CLIENT_CONTROL,
   FEATURE_CLIENT_ORIGIN,
@@ -882,6 +884,22 @@ describe("BlitConnection", () => {
     await expect(promise).rejects.toThrow(/disconnected/);
   });
 
+  it("createSession rejects when a connected transport never replies", async () => {
+    vi.useFakeTimers();
+    try {
+      const promise = conn.createSession({ rows: 24, cols: 80 });
+      const rejected = expect(promise).rejects.toThrow(
+        "PTY creation request timed out",
+      );
+      await vi.advanceTimersByTimeAsync(60_000);
+      await rejected;
+      expect(transport.status).toBe("connected");
+    } finally {
+      conn.dispose();
+      vi.useRealTimers();
+    }
+  });
+
   it("createSession omits WANT_STATUS when the server does not advertise it", () => {
     transport.pushHello(1, FEATURE_CREATE_NONCE);
     conn.createSession({ rows: 24, cols: 80 });
@@ -894,6 +912,29 @@ describe("BlitConnection", () => {
     conn.createSession({ rows: 24, cols: 80 });
     const msg = transport.sent.find((m) => m[0] === C2S_CREATE2)!;
     expect(msg[7] & CREATE2_WANT_STATUS).toBe(CREATE2_WANT_STATUS);
+  });
+
+  it("createSession subscribes the creator by default", () => {
+    transport.pushHello(1, FEATURE_CREATE_NONCE | FEATURE_CREATE_NO_SUBSCRIBE);
+    conn.createSession({ rows: 24, cols: 80 });
+    const msg = transport.sent.find((m) => m[0] === C2S_CREATE2)!;
+    expect(msg[7] & CREATE2_NO_SUBSCRIBE).toBe(0);
+    expect(conn.getSnapshot().supportsCreateNoSubscribe).toBe(true);
+  });
+
+  it("createSession can skip the creator subscription when negotiated", () => {
+    transport.pushHello(1, FEATURE_CREATE_NONCE | FEATURE_CREATE_NO_SUBSCRIBE);
+    conn.createSession({ rows: 24, cols: 80, subscribe: false });
+    const msg = transport.sent.find((m) => m[0] === C2S_CREATE2)!;
+    expect(msg[7] & CREATE2_NO_SUBSCRIBE).toBe(CREATE2_NO_SUBSCRIBE);
+  });
+
+  it("createSession refuses an unsupported no-subscribe request", async () => {
+    transport.pushHello(1, FEATURE_CREATE_NONCE);
+    await expect(
+      conn.createSession({ rows: 24, cols: 80, subscribe: false }),
+    ).rejects.toThrow(/without subscribing/);
+    expect(transport.sent.find((m) => m[0] === C2S_CREATE2)).toBeUndefined();
   });
 
   it("createSession with argv and env sets the exec features", () => {
@@ -989,6 +1030,118 @@ describe("BlitConnection", () => {
       text: "one\ntwo",
       totalLines: 4242,
     });
+  });
+
+  it("copyRange rejects when a connected transport never replies", async () => {
+    transport.pushList([{ ptyId: 7, tag: "" }]);
+    const session = conn.getSnapshot().sessions[0];
+    vi.useFakeTimers();
+    try {
+      const promise = conn.copyRange(session.id, 100, 0, 0, 0);
+      const rejected = expect(promise).rejects.toThrow(
+        "Copy range request timed out",
+      );
+      await vi.advanceTimersByTimeAsync(60_000);
+      await rejected;
+      expect(transport.status).toBe("connected");
+    } finally {
+      conn.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it("copyRange rejects a session that is already closed", async () => {
+    transport.pushList([{ ptyId: 7, tag: "" }]);
+    const session = conn.getSnapshot().sessions[0];
+    transport.pushClosed(7);
+
+    await expect(conn.copyRange(session.id, 100, 0, 0, 0)).rejects.toThrow(
+      "Cannot copy a closed session",
+    );
+    expect(
+      transport.sent.some((message) => message[0] === C2S_COPY_RANGE),
+    ).toBe(false);
+  });
+
+  it("copyRange rejects a correlated missing-PTY response", async () => {
+    transport.pushList([{ ptyId: 7, tag: "" }]);
+    const session = conn.getSnapshot().sessions[0];
+    const promise = conn.copyRange(session.id, 100, 0, 0, 0);
+    const msg = transport.sent.find(
+      (message) => message[0] === C2S_COPY_RANGE,
+    )!;
+
+    transport.pushCopyFailed(
+      msg[1] | (msg[2] << 8),
+      STATUS_NOT_FOUND,
+      "terminal not found",
+    );
+    await expect(promise).rejects.toThrow(
+      "Copy failed: not found: terminal not found",
+    );
+  });
+
+  // --- awaitSessionExit ---
+
+  it("awaitSessionExit resolves an already-exited session", async () => {
+    transport.pushList([{ ptyId: 7, tag: "" }]);
+    const session = conn.getSnapshot().sessions[0];
+    transport.pushExited(7, 23);
+
+    await expect(conn.awaitSessionExit(session.id)).resolves.toMatchObject({
+      state: "exited",
+      exitStatus: 23,
+    });
+  });
+
+  it("awaitSessionExit observes an exit during listener setup", async () => {
+    transport.pushList([{ ptyId: 7, tag: "" }]);
+    const session = conn.getSnapshot().sessions[0];
+    const subscribe = conn.subscribe;
+    conn.subscribe = (listener) => {
+      const unsubscribe = subscribe(listener);
+      transport.pushExited(7, 4);
+      return unsubscribe;
+    };
+
+    await expect(conn.awaitSessionExit(session.id)).resolves.toMatchObject({
+      state: "exited",
+      exitStatus: 4,
+    });
+  });
+
+  it("awaitSessionExit resolves when the session closes", async () => {
+    transport.pushList([{ ptyId: 7, tag: "" }]);
+    const session = conn.getSnapshot().sessions[0];
+    const promise = conn.awaitSessionExit(session.id);
+    transport.pushClosed(7);
+
+    await expect(promise).resolves.toMatchObject({ state: "closed" });
+  });
+
+  it("awaitSessionExit resolves a disconnect as a closed session", async () => {
+    transport.pushList([{ ptyId: 7, tag: "" }]);
+    const session = conn.getSnapshot().sessions[0];
+    const promise = conn.awaitSessionExit(session.id);
+    transport.setStatus("disconnected");
+
+    await expect(promise).resolves.toMatchObject({ state: "closed" });
+  });
+
+  it("awaitSessionExit rejects on timeout", async () => {
+    transport.pushList([{ ptyId: 7, tag: "" }]);
+    const session = conn.getSnapshot().sessions[0];
+    vi.useFakeTimers();
+    try {
+      const promise = conn.awaitSessionExit(session.id, { timeoutMs: 50 });
+      const rejected = expect(promise).rejects.toThrow(
+        "Session exit wait timed out",
+      );
+      await vi.advanceTimersByTimeAsync(50);
+      await rejected;
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   // --- closeSession ---
@@ -1595,6 +1748,27 @@ describe("BlitConnection", () => {
   it("leaves the server version null for servers that omit it", () => {
     transport.pushHello(1, FEATURE_CREATE_NONCE, 1n);
     expect(conn.getSnapshot().serverVersion).toBeNull();
+  });
+
+  it("rejects previous-generation requests on a second HELLO", async () => {
+    transport.pushHello(1, FEATURE_CREATE_NONCE | FEATURE_CREATE_STATUS);
+    transport.pushList([{ ptyId: 7, tag: "" }]);
+    const session = conn.getSnapshot().sessions[0];
+    const create = conn.createSession({ rows: 24, cols: 80 });
+    const copy = conn.copyRange(session.id, 100, 0, 0, 0);
+    const search = conn.search("needle");
+    const cwd = conn.sessionCwd(session.id);
+    const clipboard = (
+      conn as unknown as { requestClipboardMimes(): Promise<string[]> }
+    ).requestClipboardMimes();
+    const rejections = [create, copy, search, cwd, clipboard].map((request) =>
+      expect(request).rejects.toThrow("Connection re-established"),
+    );
+
+    transport.pushHello(1, FEATURE_CREATE_NONCE | FEATURE_CREATE_STATUS);
+
+    await Promise.all(rejections);
+    expect(transport.status).toBe("connected");
   });
 
   it("supportsRestart reflects FEATURE_RESTART", () => {

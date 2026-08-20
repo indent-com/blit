@@ -12,6 +12,7 @@ export {
   SEARCH_SOURCE_VISIBLE,
   SEARCH_SOURCE_SCROLLBACK,
 } from "./BlitConnection";
+export type { AwaitSessionExitOptions } from "./BlitConnection";
 
 export type { BlitWasmModule } from "./TerminalStore";
 export { AudioPlayer } from "./AudioPlayer";

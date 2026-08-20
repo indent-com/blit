@@ -22,6 +22,7 @@ import {
   FEATURE_CREATE_NONCE,
   FEATURE_CREATE_STATUS,
   FEATURE_CREATE_EXEC,
+  FEATURE_CREATE_NO_SUBSCRIBE,
   FEATURE_PTY_DEADLINE,
   FEATURE_KILL_MODE,
   FEATURE_RESIZE_BATCH,
@@ -39,6 +40,7 @@ import {
   S2C_CREATED,
   S2C_CREATED_N,
   S2C_CREATE_FAILED,
+  S2C_COPY_FAILED,
   S2C_EXITED,
   S2C_HELLO,
   S2C_KICKED,
@@ -511,6 +513,16 @@ export interface CreateSessionOptions {
    *  creation so it survives this client dying. Rejected unless the server
    *  advertised `FEATURE_PTY_DEADLINE`. */
   deadlineMs?: number;
+  /** Whether this connection should receive terminal frame updates
+   *  immediately. Defaults to true. Setting false needs
+   *  `FEATURE_CREATE_NO_SUBSCRIBE`. */
+  subscribe?: boolean;
+}
+
+export interface AwaitSessionExitOptions {
+  /** Reject if the session has not exited or closed within this many
+   *  milliseconds. Omit to wait without a client-side deadline. */
+  timeoutMs?: number;
 }
 
 type ResizeSessionOptions = {
@@ -523,6 +535,7 @@ type PendingCreate = {
   resolve: (session: BlitSession) => void;
   reject: (error: Error) => void;
   command?: string;
+  timer: ReturnType<typeof setTimeout>;
 };
 
 type PendingSearch = {
@@ -702,6 +715,10 @@ const FS_UPLOAD_MAX_IN_FLIGHT = 512 * 1024;
 const FS_UPLOAD_DEFAULT_CHUNK = 256 * 1024;
 /** The server's compositor read itself is bounded to two seconds. */
 const CLIPBOARD_REQUEST_TIMEOUT_MS = 2_500;
+/** Correlated terminal requests are normally answered from in-memory state.
+ *  Bound them independently of transport status: a socket can remain open
+ *  after application frames have stopped progressing. */
+const PROTOCOL_REQUEST_TIMEOUT_MS = 15_000;
 
 function isLiveSession(session: InternalSession): boolean {
   return (
@@ -795,6 +812,7 @@ export class BlitConnection {
     {
       resolve: (result: CopyRangeResult) => void;
       reject: (error: Error) => void;
+      timer: ReturnType<typeof setTimeout>;
     }
   >();
   private readonly pendingClientLists = new Map<
@@ -1259,6 +1277,7 @@ export class BlitConnection {
       supportsChannelWatch: false,
       supportsExtensions: false,
       supportsCreateExec: false,
+      supportsCreateNoSubscribe: false,
       supportsDesktopMedia: false,
       retryCount: 0,
       bootGeneration: null,
@@ -1432,6 +1451,70 @@ export class BlitConnection {
     return s ? toPublicSession(s) : null;
   }
 
+  /** Wait until one session exits or closes without a check/subscribe race.
+   *
+   * Subscription happens before the state recheck, so an exit delivered
+   * during listener setup is observed either by the listener or by the
+   * recheck. The resolved session carries its final state and exit status. */
+  awaitSessionExit(
+    sessionId: SessionId,
+    options: AwaitSessionExitOptions = {},
+  ): Promise<BlitSession> {
+    if (!this.sessionsById.has(sessionId)) {
+      return Promise.reject(connectionError("Unknown session"));
+    }
+    const timeoutMs = options.timeoutMs;
+    if (
+      timeoutMs !== undefined &&
+      (!Number.isFinite(timeoutMs) || timeoutMs < 0)
+    ) {
+      return Promise.reject(
+        connectionError("Session exit timeout must be a non-negative number"),
+      );
+    }
+
+    return new Promise<BlitSession>((resolve, reject) => {
+      let settled = false;
+      let unsubscribe: (() => void) | null = null;
+      let unsubscribeWhenReady = false;
+      let timer: ReturnType<typeof setTimeout> | null = null;
+
+      const cleanup = () => {
+        if (timer !== null) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        if (unsubscribe) unsubscribe();
+        else unsubscribeWhenReady = true;
+      };
+      const check = () => {
+        if (settled) return;
+        const session = this.sessionsById.get(sessionId);
+        if (
+          !session ||
+          (session.state !== "exited" && session.state !== "closed")
+        ) {
+          return;
+        }
+        settled = true;
+        cleanup();
+        resolve(toPublicSession(session));
+      };
+
+      unsubscribe = this.subscribe(check);
+      if (unsubscribeWhenReady) unsubscribe();
+      check();
+      if (!settled && timeoutMs !== undefined) {
+        timer = setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          reject(connectionError("Session exit wait timed out"));
+        }, timeoutMs);
+      }
+    });
+  }
+
   getDebugStats(sessionId: SessionId | null): ReturnType<
     TerminalStore["getDebugStats"]
   > & {
@@ -1473,6 +1556,14 @@ export class BlitConnection {
     if (options.deadlineMs != null && !(this.features & FEATURE_PTY_DEADLINE)) {
       throw connectionError("Server does not support terminal deadlines");
     }
+    if (
+      options.subscribe === false &&
+      !(this.features & FEATURE_CREATE_NO_SUBSCRIBE)
+    ) {
+      throw connectionError(
+        "Server does not support creating a terminal without subscribing",
+      );
+    }
 
     return new Promise<BlitSession>((resolve, reject) => {
       let nonce = 0;
@@ -1486,10 +1577,17 @@ export class BlitConnection {
         if (src) srcPtyId = src.ptyId;
       }
 
+      const timer = setTimeout(() => {
+        const pending = this.pendingCreates.get(nonce);
+        if (!pending) return;
+        this.pendingCreates.delete(nonce);
+        pending.reject(connectionError("PTY creation request timed out"));
+      }, PROTOCOL_REQUEST_TIMEOUT_MS);
       this.pendingCreates.set(nonce, {
         resolve,
         reject,
         command: options.command ?? options.argv?.join(" "),
+        timer,
       });
       this.transport.send(
         buildCreate2Message(nonce, options.rows, options.cols, {
@@ -1501,6 +1599,7 @@ export class BlitConnection {
           env: options.env,
           deadlineMs: options.deadlineMs,
           wantStatus: (this.features & FEATURE_CREATE_STATUS) !== 0,
+          subscribe: options.subscribe,
         }),
       );
     });
@@ -1524,12 +1623,21 @@ export class BlitConnection {
     if (!session) {
       return Promise.reject(connectionError("Unknown session"));
     }
+    if (session.state === "closed") {
+      return Promise.reject(connectionError("Cannot copy a closed session"));
+    }
     return new Promise<CopyRangeResult>((resolve, reject) => {
       let nonce = 0;
       do {
         nonce = this.nonceCounter = (this.nonceCounter + 1) & 0xffff;
       } while (this.pendingCreates.has(nonce) || this.pendingReads.has(nonce));
-      this.pendingReads.set(nonce, { resolve, reject });
+      const timer = setTimeout(() => {
+        const pending = this.pendingReads.get(nonce);
+        if (!pending) return;
+        this.pendingReads.delete(nonce);
+        pending.reject(connectionError("Copy range request timed out"));
+      }, PROTOCOL_REQUEST_TIMEOUT_MS);
+      this.pendingReads.set(nonce, { resolve, reject, timer });
       this.transport.send(
         buildCopyRangeMessage(
           nonce,
@@ -5881,6 +5989,7 @@ export class BlitConnection {
             .value as [number, PendingCreate];
           command = pending.command?.trim() || null;
           this.pendingCreates.delete(firstNonce);
+          clearTimeout(pending.timer);
           const session = this.upsertLiveSession(ptyId, tag, "active", command);
           pending.resolve(toPublicSession(session));
         } else {
@@ -5899,6 +6008,7 @@ export class BlitConnection {
         const session = this.upsertLiveSession(ptyId, tag, "active", command);
         if (pending) {
           this.pendingCreates.delete(nonce);
+          clearTimeout(pending.timer);
           pending.resolve(toPublicSession(session));
         }
 
@@ -5910,6 +6020,7 @@ export class BlitConnection {
         const pending = this.pendingCreates.get(nonce);
         if (!pending) return;
         this.pendingCreates.delete(nonce);
+        clearTimeout(pending.timer);
         const detail = textDecoder.decode(bytes.subarray(4));
         pending.reject(
           connectionError(
@@ -6087,6 +6198,18 @@ export class BlitConnection {
           this.transport.close();
           return;
         }
+        // A transparent upstream replacement leaves the transport connected,
+        // so statuschange cannot retire requests sent to the server that just
+        // disappeared. Reject them before accepting any state from the new
+        // generation; a late reply must not settle a request across this
+        // boundary.
+        const generationError = connectionError("Connection re-established");
+        this.waylandClipboardOwned = null;
+        this.waylandClipboardText = null;
+        this.rejectPendingClipboardRequests(generationError);
+        this.rejectPendingCreates(generationError);
+        this.rejectPendingSearches(generationError);
+        this.rejectPendingReads(generationError);
         this.features = features;
         this.syncSurfaceTouchCapability();
         this.hasReceivedList = false;
@@ -6142,6 +6265,8 @@ export class BlitConnection {
           supportsExtensions: (features & FEATURE_EXTENSION) !== 0,
           supportsDesktopMedia: (features & FEATURE_DESKTOP_MEDIA) !== 0,
           supportsCreateExec: (features & FEATURE_CREATE_EXEC) !== 0,
+          supportsCreateNoSubscribe:
+            (features & FEATURE_CREATE_NO_SUBSCRIBE) !== 0,
           bootGeneration,
           serverVersion,
         };
@@ -6150,21 +6275,18 @@ export class BlitConnection {
         this.audioPlayer.reset();
         this.desktopStore.reset();
         this.mediaStore.reset();
-        this.mprisStore.reset(connectionError("Connection re-established"));
+        this.mprisStore.reset(generationError);
         this.resetSurfaceSubsForReconnect();
         // Fs syncs do not survive a server session change: old sync_ids
         // are meaningless on the new session.
-        this.resetFsSyncs(connectionError("Connection re-established"));
-        this.resetClientControl(
-          connectionError("Connection re-established"),
-          false,
-        );
+        this.resetFsSyncs(generationError);
+        this.resetClientControl(generationError, false);
         this.startClientCatalogWatch();
-        this.resetGitRepos(connectionError("Connection re-established"));
-        this.resetLspAttachments(connectionError("Connection re-established"));
-        this.resetChannels(connectionError("Connection re-established"));
-        this.resetExtensions(connectionError("Connection re-established"));
-        this.resetKv(connectionError("Connection re-established"));
+        this.resetGitRepos(generationError);
+        this.resetLspAttachments(generationError);
+        this.resetChannels(generationError);
+        this.resetExtensions(generationError);
+        this.resetKv(generationError);
         this.resetFragmentReassembly();
         // Pushed cwds belong to the old server session's ptys.
         this.termCwds.clear();
@@ -6566,8 +6688,24 @@ export class BlitConnection {
         const pending = this.pendingReads.get(nonce);
         if (pending) {
           this.pendingReads.delete(nonce);
+          clearTimeout(pending.timer);
           pending.resolve({ text, totalLines });
         }
+        return;
+      }
+      case S2C_COPY_FAILED: {
+        if (bytes.length < 4) return;
+        const nonce = bytes[1] | (bytes[2] << 8);
+        const pending = this.pendingReads.get(nonce);
+        if (!pending) return;
+        this.pendingReads.delete(nonce);
+        clearTimeout(pending.timer);
+        const detail = textDecoder.decode(bytes.subarray(4));
+        pending.reject(
+          connectionError(
+            `Copy failed: ${statusText(bytes[3])}${detail ? `: ${detail}` : ""}`,
+          ),
+        );
         return;
       }
       case S2C_FS_SYNCED: {
@@ -7751,6 +7889,7 @@ export class BlitConnection {
 
   private rejectPendingCreates(error: Error): void {
     for (const pending of this.pendingCreates.values()) {
+      clearTimeout(pending.timer);
       pending.reject(error);
     }
     this.pendingCreates.clear();
@@ -7765,6 +7904,7 @@ export class BlitConnection {
 
   private rejectPendingReads(error: Error): void {
     for (const pending of this.pendingReads.values()) {
+      clearTimeout(pending.timer);
       pending.reject(error);
     }
     this.pendingReads.clear();
