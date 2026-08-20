@@ -1832,7 +1832,7 @@ mod tests {
     }
 
     #[test]
-    fn run_and_alias_treat_every_token_after_file_as_guest_arguments() {
+    fn run_treats_every_token_after_file_as_guest_arguments() {
         let namespaced = crate::cli::Cli::try_parse_from([
             "blit",
             "--on",
@@ -1855,49 +1855,21 @@ mod tests {
             "always",
         ])
         .unwrap();
-        let alias = crate::cli::Cli::try_parse_from([
-            "blit",
-            "--on",
-            "tcp:server:1",
-            "--hub",
-            "https://server-hub.example",
-            "run",
-            "--detach",
-            "--restart",
-            "on-failure",
-            "labelled",
-            "module.wasm",
-            "--on",
-            "guest-target",
-            "--hub",
-            "guest-hub",
-            "--json",
-            "--restart",
-            "always",
-        ])
-        .unwrap();
         let extract = |command| match command {
             crate::cli::Command::Extension {
                 command: ExtensionCommand::Run(args),
-            }
-            | crate::cli::Command::Run(args) => args,
+            } => args,
             _ => panic!("wrong command"),
         };
         assert_eq!(namespaced.connect.on.as_deref(), Some("tcp:server:1"));
-        assert_eq!(alias.connect.on, namespaced.connect.on);
         assert_eq!(
             namespaced.connect.hub,
             "https://server-hub.example".to_string()
         );
-        assert_eq!(alias.connect.hub, namespaced.connect.hub);
         let first = extract(namespaced.command);
-        let second = extract(alias.command);
-        assert_eq!(second.detach, first.detach);
         assert_eq!(first.restart, RestartPolicy::OnFailure);
         assert!(!first.json);
         let first = split_invocation(first.invocation).unwrap();
-        let second = split_invocation(second.invocation).unwrap();
-        assert_eq!(second, first);
         assert_eq!(first.0, ModuleSource::File(PathBuf::from("module.wasm")));
         assert_eq!(
             first.1,

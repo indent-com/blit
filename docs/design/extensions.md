@@ -2526,9 +2526,9 @@ blit ext remove SELECTOR
 blit ext commands
 ```
 
-`blit extension` is an alias for `blit ext`. The shorter top-level `blit run`
-is an exact alias for `blit ext run`; help and documentation use the namespaced
-form so creation and management are discoverable together.
+`blit extension` is an alias for `blit ext`. Extension execution stays under
+`blit ext run`; the top-level `blit run` executes a native non-PTY process as
+described in the [native process RFC](processes.md).
 
 `list` reports the ID, durable or descriptive name, definition revision, full
 module hash, enabled and desired-running state, phase, attempt, and restart
@@ -2713,7 +2713,7 @@ extension thread at all.
    server-global command/snapshot budgets, token-checked invocation, and the
    `blit.cli.v1` channel protocol.
 8. **Rust SDK and CLI.** Add `blit-guest`, a Rust example extension,
-   `blit ext run` and its `blit run` alias,
+   `blit ext run`,
    channel and command-provider wrappers, extension control and update commands,
    `@name` dispatch, help, listing, and static completion.
 
@@ -2792,7 +2792,7 @@ parsing, name ordering, page record/byte bounds, global snapshot byte/count
 admission, snapshot mutation isolation and expiry, disappearance and re-registration across
 attempts, reserved invocation flags, output ordering, backpressure,
 cancellation, result content-type validation, and the no-retry rule.
-CLI tests cover positional dash-prefixed arguments, the `blit run` alias,
+CLI tests cover positional dash-prefixed extension arguments,
 `BLOCKED` exit behavior before and after detach, and selector parsing for bare
 numeric names plus explicit `id:` and `name:` forms. They also pin retained
 output with unrelated stalled followers and verify that correlated status

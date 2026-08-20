@@ -82,6 +82,17 @@ blit terminal journal 1  # commands the shell has run (needs OSC 133)
 blit terminal output 1 --wait 60  # that command's output
 ```
 
+Run a pipe-oriented process without a terminal, connecting its stdin, stdout,
+and stderr and returning its exit code:
+
+```bash
+blit run --in /src/blit --env RUST_LOG=debug -- cargo test
+```
+
+`--in` selects the server-side working directory and `--env` is repeatable.
+The program is executed directly; use an explicit shell when shell syntax is
+needed.
+
 Inspect and disconnect other clients attached to the same server:
 
 ```bash

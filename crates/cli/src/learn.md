@@ -2,6 +2,19 @@
 
 blit is a terminal multiplexer and headless Wayland compositor. Terminals run CLI programs (PTYs) and GUI applications (compositor). Surfaces are video-encoded and streamed to browsers; the CLI gives programmatic control over both.
 
+## Running standard processes
+
+Use `blit run` for a pipe-oriented, non-PTY process. It connects stdin,
+stdout, and stderr and exits with the process's status:
+
+```bash
+blit run --in /src/blit --env RUST_LOG=debug -- cargo test
+```
+
+`--in` selects the working directory on the server and `--env` is repeatable.
+Options precede the program. The program is executed directly with no shell;
+run a shell explicitly for pipes, redirects, globs, or other shell syntax.
+
 ## Running commands
 
 ```bash

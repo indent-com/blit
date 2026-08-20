@@ -1,7 +1,7 @@
 # RFC: Native non-PTY processes
 
-- **Status:** Protocol, server, and low-level Rust packet helpers implemented;
-  integrated native-client and extension SDKs pending
+- **Status:** Protocol, server, low-level Rust packet helpers, and the attached
+  `blit run` client implemented; extension convenience SDKs pending
 - **Date:** 2026-08-05
 
 ## Summary
@@ -63,8 +63,9 @@ flowchart LR
   allowed to use the family. The single-writer rule coordinates byte offsets;
   it is not authorization.
 - **No privilege boundary.** Children run as the Blit server OS identity.
-- **No new top-level CLI command in version 1.** This RFC defines a protocol and
-  client-library surface; a future `blit exec` command can be designed on top.
+- **No lifecycle-management CLI in version 1.** `blit run` provides attached
+  spawn and standard-stream forwarding; catalog listing, detached execution,
+  watching, and control remain protocol and library surfaces.
 - **No dependency on extensions.** Extension support is one consumer, not an
   implementation prerequisite.
 
@@ -602,8 +603,9 @@ event decoding. These helpers are transport-neutral: the embedding client still
 allocates nonces and endpoint-local process IDs, multiplexes packets over its
 existing link, and sends ACKs after application consumption.
 
-The intended integrated native-client and extension SDK convenience API remains
-planned; it does not change the packet protocol:
+`blit run` uses these helpers directly for one attached process. A reusable
+integrated native-client API and the extension SDK convenience API remain
+planned; they do not change the packet protocol:
 
 ```rust
 let (process_ref, mut child) = client
@@ -841,9 +843,10 @@ list again.
 4. Implement Windows UTF-8 conversion, case-insensitive environment-key
    validation, process groups, job ownership, signaling fallbacks, and pipe
    cleanup.
-5. Add low-level Rust command, child, list, and watch helpers. Integrated native
-   client and extension convenience SDKs remain pending and require no new Wasm
-   host import.
+5. Add low-level Rust command, child, list, and watch helpers, then build
+   attached `blit run` on them with stdin/stdout/stderr forwarding and exit-code
+   propagation. Extension convenience SDKs remain pending and require no new
+   Wasm host import.
 
 Current codec tests cover packet shapes, size and field validation, binary wire
 values, Windows UTF-8 and environment-key validation, list and watch shapes,

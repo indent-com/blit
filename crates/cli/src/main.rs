@@ -12,6 +12,7 @@ mod interactive;
 mod journal;
 mod kv;
 mod lsp;
+mod process;
 mod relay;
 mod socks;
 mod transport;
@@ -1001,9 +1002,7 @@ async fn async_main() {
         Command::Run(args) => {
             let conn = &cli.connect;
             let result = match transport::connect(&conn.on, &conn.hub).await {
-                Ok(transport) => {
-                    extension::dispatch(transport, extension::ExtensionCommand::Run(args)).await
-                }
+                Ok(transport) => process::run(transport, args).await,
                 Err(e) => Err(e),
             };
             match result {

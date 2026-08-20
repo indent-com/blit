@@ -1,6 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 
-use crate::extension::{ExtensionCommand, RunArgs};
+use crate::extension::ExtensionCommand;
+use crate::process::RunArgs;
 
 /// Text for `blit --license`.  Mentions exactly the third-party components
 /// whose licenses affect distribution of *this* binary — nothing more.
@@ -376,7 +377,7 @@ pub enum Command {
         command: ExtensionCommand,
     },
 
-    /// Execute a Wasmi extension (`blit ext run` alias)
+    /// Execute a process and connect its standard streams
     Run(RunArgs),
 
     /// Manage named remotes in blit.remotes
