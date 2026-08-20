@@ -1601,6 +1601,7 @@ async fn cmd_upgrade() -> Result<(), Box<dyn std::error::Error>> {
     let bin_dir = exe_path
         .parent()
         .ok_or("cannot determine binary directory")?;
+    #[cfg(not(windows))]
     let prefix = bin_dir.parent().unwrap_or(bin_dir);
 
     let install_url = if cfg!(windows) {
@@ -1646,7 +1647,7 @@ async fn cmd_upgrade() -> Result<(), Box<dyn std::error::Error>> {
         let status = std::process::Command::new("powershell")
             .args(["-ExecutionPolicy", "Bypass", "-File"])
             .arg(&tmp)
-            .env("BLIT_PREFIX", prefix)
+            .env("BLIT_INSTALL_DIR", bin_dir)
             .status()?;
         if status.success() {
             transport::stop_proxy().await;
