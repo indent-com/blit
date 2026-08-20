@@ -3929,19 +3929,28 @@ export class BlitConnection {
     });
   }
 
-  /** Cancel, restart, enable, disable, or remove one extension. */
+  /** Cancel, restart, enable, disable, or remove one extension.
+   *  Protocol refusals reject with the server's detail. */
   controlExtension(
     extensionId: bigint,
     action: number,
   ): Promise<BlitExtensionStatus> {
     const guard = this.extensionGuard();
     if (guard) return Promise.reject(guard);
-    return new Promise((resolve, reject) => {
+    return new Promise<BlitExtensionStatus>((resolve, reject) => {
       const nonce = this.nextFsNonce(this.pendingExtensionStatuses);
       this.pendingExtensionStatuses.set(nonce, { resolve, reject });
       this.transport.send(
         buildExtensionControlMessage(nonce, extensionId, action),
       );
+    }).then((status) => {
+      if (status.status !== STATUS_OK) {
+        throw connectionError(
+          status.detail ||
+            `extension control refused (status ${status.status})`,
+        );
+      }
+      return status;
     });
   }
 

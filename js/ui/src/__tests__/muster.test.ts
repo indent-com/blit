@@ -3,9 +3,12 @@ import {
   EVENT_CAP,
   followMuster,
   groupUnits,
+  instanceCanStart,
+  musterDiagram,
   MusterMirror,
   openMuster,
   unitCanStop,
+  unitHasDetails,
   unitStartVerb,
   type MusterUnit,
 } from "../muster";
@@ -224,6 +227,76 @@ describe("groupUnits", () => {
   });
 });
 
+describe("musterDiagram", () => {
+  it("groups units and draws requirements toward their dependents", () => {
+    const units = new Map(
+      [
+        unit("main/build", {
+          instance: "main",
+          phase: "exited",
+          type: "oneshot",
+        }),
+        unit("main/api", {
+          instance: "main",
+          requires: ["main/build"],
+        }),
+        unit("worker", {
+          phase: "failed",
+          requires: ["main/api"],
+        }),
+      ].map((row) => [row.name, row as unknown as MusterUnit]),
+    );
+    const instances = new Map([
+      [
+        "main",
+        {
+          name: "main",
+          stack: "dev",
+          members: ["main/build", "main/api"],
+        },
+      ],
+    ]);
+
+    const diagram = musterDiagram(units, instances);
+    expect(diagram.nodes).toBe(3);
+    expect(diagram.edges).toBe(2);
+    expect(diagram.source).toContain('subgraph group_0["main"]');
+    expect(diagram.source).toContain('unit_0["✓ build"]');
+    expect(diagram.source).toContain('unit_1["● api"]');
+    expect(diagram.source).toContain('subgraph group_1["Standalone"]');
+    expect(diagram.source).toContain('unit_2["! worker"]');
+    expect(diagram.source).toContain("unit_0 --> unit_1");
+    expect(diagram.source).toContain("unit_1 --> unit_2");
+  });
+
+  it("escapes labels and ignores missing or duplicate requirements", () => {
+    const odd = unit('odd <&" name', {
+      phase: "stopped",
+      requires: ["missing", "missing"],
+    }) as unknown as MusterUnit;
+    const diagram = musterDiagram(new Map([[odd.name, odd]]), new Map());
+
+    expect(diagram.source).toContain("○ odd &lt;&amp;&quot; name");
+    expect(diagram.edges).toBe(0);
+  });
+});
+
+describe("unitHasDetails", () => {
+  it("does not disclose a card whose summary is the whole story", () => {
+    expect(unitHasDetails(unit("plain") as MusterUnit)).toBe(false);
+  });
+
+  it.each([
+    ["failures", { restarts: 2 }],
+    ["last exit", { lastExit: 0 }],
+    ["requirements", { requires: ["build"] }],
+    ["windows", { surfaces: [{ id: 1, title: "", width: 80, height: 24 }] }],
+    ["retained runs", { runs: [{ pty: 19, exitCode: -15, seq: 1 }] }],
+  ])("discloses %s", (_label, details) => {
+    expect(unitHasDetails(unit("detailed", details) as MusterUnit)).toBe(true);
+  });
+});
+
 describe("unitStartVerb", () => {
   it("restarts completed oneshots instead of sending a no-op start", () => {
     expect(unitStartVerb({ phase: "exited" })).toBe("restart");
@@ -234,6 +307,39 @@ describe("unitStartVerb", () => {
     expect(unitStartVerb({ phase: "activating" })).toBe("restart");
     expect(unitStartVerb({ phase: "stopped" })).toBe("start");
     expect(unitStartVerb({ phase: "failed" })).toBe("start");
+  });
+});
+
+describe("instanceCanStart", () => {
+  const instance = {
+    name: "main",
+    stack: "dev",
+    members: ["main/api", "main/web"],
+  };
+
+  it("hides Start when every member is already live or complete", () => {
+    const units = new Map([
+      ["main/api", unit("main/api") as unknown as MusterUnit],
+      [
+        "main/web",
+        unit("main/web", {
+          phase: "exited",
+          type: "oneshot",
+        }) as unknown as MusterUnit,
+      ],
+    ]);
+    expect(instanceCanStart(instance, units)).toBe(false);
+  });
+
+  it("shows Start when any full-stack member is inactive", () => {
+    const units = new Map([
+      ["main/api", unit("main/api") as unknown as MusterUnit],
+      [
+        "main/web",
+        unit("main/web", { phase: "stopped" }) as unknown as MusterUnit,
+      ],
+    ]);
+    expect(instanceCanStart(instance, units)).toBe(true);
   });
 });
 

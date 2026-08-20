@@ -8,7 +8,14 @@
  * named the same extension twice and made an update look like a fresh install.
  */
 
-import { createMemo, createSignal, For, onMount, Show } from "solid-js";
+import {
+  createMemo,
+  createSignal,
+  For,
+  onCleanup,
+  onMount,
+  Show,
+} from "solid-js";
 import type {
   BlitExtensionRecord,
   BlitWorkspace,
@@ -19,7 +26,6 @@ import {
   EXT_CONTROL_CANCEL,
   EXT_CONTROL_DISABLE,
   EXT_CONTROL_ENABLE,
-  EXT_CONTROL_REMOVE,
   EXT_CONTROL_RESTART,
   EXT_FLAG_ENABLED,
   EXT_FLAG_PERSIST,
@@ -31,6 +37,7 @@ import {
 } from "@blit-sh/core";
 import {
   defaultRegistry,
+  disableAndRemoveExtension,
   fetchRegistry,
   installFromRegistry,
   isOutdated,
@@ -50,36 +57,69 @@ export function ExtensionsPanel(props: {
   const theme = () => themeFor(props.palette);
   const scale = () => uiScale(props.fontSize);
 
-  const [installed, setInstalled] = createSignal<BlitExtensionRecord[]>([]);
+  // `null` means that the server inventory is not authoritative yet. Treating
+  // it as an empty list made every registry entry look installable during a
+  // slow or failed list request.
+  const [installed, setInstalled] = createSignal<BlitExtensionRecord[] | null>(
+    null,
+  );
   const [registry, setRegistry] = createSignal<Registry | null>(null);
   const [registryUrl, setRegistryUrl] = createSignal(defaultRegistry());
-  const [error, setError] = createSignal<string | null>(null);
+  const [inventoryError, setInventoryError] = createSignal<string | null>(null);
+  const [registryError, setRegistryError] = createSignal<string | null>(null);
+  const [actionError, setActionError] = createSignal<string | null>(null);
   const [note, setNote] = createSignal<string | null>(null);
-  const [busy, setBusy] = createSignal<string | null>(null);
+  const [inventoryLoading, setInventoryLoading] = createSignal(false);
+  const [registryLoading, setRegistryLoading] = createSignal(false);
+  const [actionBusy, setActionBusy] = createSignal<string | null>(null);
+
+  let inventoryRequest = 0;
+  let registryRequest = 0;
 
   const host = () => props.workspace.getConnection(props.connectionId);
 
   const refresh = async () => {
     const connection = host();
-    if (!connection) return;
+    const request = ++inventoryRequest;
+    setInventoryLoading(true);
+    if (!connection) {
+      setInstalled(null);
+      setInventoryError("Connection is unavailable");
+      setInventoryLoading(false);
+      return;
+    }
     try {
-      setInstalled(await connection.listExtensions());
-      setError(null);
+      const records = await connection.listExtensions();
+      if (request !== inventoryRequest) return;
+      setInstalled(records);
+      setInventoryError(null);
     } catch (failure) {
-      setError(failure instanceof Error ? failure.message : String(failure));
+      if (request !== inventoryRequest) return;
+      setInstalled(null);
+      setInventoryError(
+        failure instanceof Error ? failure.message : String(failure),
+      );
+    } finally {
+      if (request === inventoryRequest) setInventoryLoading(false);
     }
   };
 
   const loadRegistry = async () => {
-    setBusy("registry");
+    const request = ++registryRequest;
+    setRegistryLoading(true);
     try {
-      setRegistry(await fetchRegistry(registryUrl()));
-      setError(null);
+      const loaded = await fetchRegistry(registryUrl());
+      if (request !== registryRequest) return;
+      setRegistry(loaded);
+      setRegistryError(null);
     } catch (failure) {
+      if (request !== registryRequest) return;
       setRegistry(null);
-      setError(failure instanceof Error ? failure.message : String(failure));
+      setRegistryError(
+        failure instanceof Error ? failure.message : String(failure),
+      );
     } finally {
-      setBusy(null);
+      if (request === registryRequest) setRegistryLoading(false);
     }
   };
 
@@ -87,42 +127,54 @@ export function ExtensionsPanel(props: {
     void refresh();
     void loadRegistry();
   });
+  onCleanup(() => {
+    inventoryRequest++;
+    registryRequest++;
+  });
 
-  const rows = createMemo<ExtensionRow[]>(() =>
-    mergeExtensions(installed(), registry()?.extensions ?? []),
+  const rows = createMemo<ExtensionRow[]>(() => {
+    const inventory = installed();
+    return inventory === null
+      ? []
+      : mergeExtensions(inventory, registry()?.extensions ?? []);
+  });
+  const errors = createMemo(() =>
+    [actionError(), inventoryError(), registryError()].filter(
+      (error, index, all): error is string =>
+        error !== null && all.indexOf(error) === index,
+    ),
   );
+  const controlsBusy = () => actionBusy() !== null || inventoryLoading();
+  const installsBusy = () => controlsBusy() || registryLoading();
 
   const act = async (label: string, action: () => Promise<unknown>) => {
-    setBusy(label);
+    setActionBusy(label);
+    setActionError(null);
     setNote(null);
     try {
       await action();
-      setError(null);
-      await refresh();
     } catch (failure) {
-      setError(failure instanceof Error ? failure.message : String(failure));
+      setActionError(
+        failure instanceof Error ? failure.message : String(failure),
+      );
     } finally {
-      setBusy(null);
+      await refresh();
+      setActionBusy(null);
     }
   };
 
   /**
    * Install, or replace the definition of the same name in place.
    *
-   * The installed record is what makes the second case an update rather than a
-   * second definition: it carries the CAS token of what is being replaced.
+   * The install helper re-lists at click time, so a render-time snapshot can
+   * never turn an existing durable name into a duplicate create.
    */
   const install = (row: ExtensionRow) => {
     const connection = host();
     const source = registry();
     if (!connection || !source || !row.offered) return;
     void act(row.label, async () => {
-      await installFromRegistry(
-        connection,
-        source,
-        row.offered!,
-        row.installed,
-      );
+      await installFromRegistry(connection, source, row.offered!);
       setNote(tp("extensions.installed", { name: row.label }));
     });
   };
@@ -132,11 +184,7 @@ export function ExtensionsPanel(props: {
     const connection = host();
     if (!connection) return;
     void act(record.name, async () => {
-      await connection.controlExtension(
-        record.extensionId,
-        EXT_CONTROL_DISABLE,
-      );
-      await connection.controlExtension(record.extensionId, EXT_CONTROL_REMOVE);
+      await disableAndRemoveExtension(connection, record);
       setNote(tp("extensions.removed", { name: record.name }));
     });
   };
@@ -164,17 +212,19 @@ export function ExtensionsPanel(props: {
 
   return (
     <>
-      <Show when={error()}>
-        <div
-          style={{
-            color: theme().error,
-            "font-size": `${scale().sm}px`,
-            "margin-bottom": `${scale().xs}px`,
-          }}
-        >
-          {error()}
-        </div>
-      </Show>
+      <For each={errors()}>
+        {(error) => (
+          <div
+            style={{
+              color: theme().error,
+              "font-size": `${scale().sm}px`,
+              "margin-bottom": `${scale().xs}px`,
+            }}
+          >
+            {error}
+          </div>
+        )}
+      </For>
       <Show when={note()}>
         <div
           style={{
@@ -210,9 +260,14 @@ export function ExtensionsPanel(props: {
         />
         <button
           type="button"
-          disabled={busy() !== null}
+          disabled={
+            actionBusy() !== null || inventoryLoading() || registryLoading()
+          }
           style={mergeStyle(ui.btn, { "font-size": `${scale().sm}px` })}
-          onClick={() => void loadRegistry()}
+          onClick={() => {
+            void refresh();
+            void loadRegistry();
+          }}
         >
           {t("extensions.reload")}
         </button>
@@ -232,9 +287,11 @@ export function ExtensionsPanel(props: {
           each={rows()}
           fallback={
             <div style={{ color: theme().dimFg }}>
-              {busy() === "registry"
+              {inventoryLoading() || registryLoading()
                 ? t("extensions.loading")
-                : t("extensions.none")}
+                : inventoryError() || registryError()
+                  ? ""
+                  : t("extensions.none")}
             </div>
           }
         >
@@ -345,7 +402,7 @@ export function ExtensionsPanel(props: {
                 <Show when={row.offered && !row.installed}>
                   <button
                     type="button"
-                    disabled={busy() !== null}
+                    disabled={installsBusy()}
                     style={mergeStyle(ui.btn, {
                       "font-size": `${scale().sm}px`,
                     })}
@@ -358,7 +415,7 @@ export function ExtensionsPanel(props: {
                   <button
                     type="button"
                     data-extension-update
-                    disabled={busy() !== null}
+                    disabled={installsBusy()}
                     style={mergeStyle(ui.btn, {
                       "font-size": `${scale().sm}px`,
                     })}
@@ -376,7 +433,7 @@ export function ExtensionsPanel(props: {
                   <Show when={isEnabled(row.installed!)}>
                     <button
                       type="button"
-                      disabled={busy() !== null}
+                      disabled={controlsBusy()}
                       style={mergeStyle(ui.btn, {
                         "font-size": `${scale().sm}px`,
                       })}
@@ -398,12 +455,16 @@ export function ExtensionsPanel(props: {
                   <Show when={!isStopped(row.installed!)}>
                     <button
                       type="button"
-                      disabled={busy() !== null}
+                      disabled={controlsBusy()}
                       style={mergeStyle(ui.btn, {
                         "font-size": `${scale().sm}px`,
                       })}
                       onClick={() =>
-                        control(row.installed!, EXT_CONTROL_CANCEL, "extensions.stopped")
+                        control(
+                          row.installed!,
+                          EXT_CONTROL_CANCEL,
+                          "extensions.stopped",
+                        )
                       }
                     >
                       {t("extensions.stop")}
@@ -415,7 +476,7 @@ export function ExtensionsPanel(props: {
                       fallback={
                         <button
                           type="button"
-                          disabled={busy() !== null}
+                          disabled={controlsBusy()}
                           style={mergeStyle(ui.btn, {
                             "font-size": `${scale().sm}px`,
                           })}
@@ -433,7 +494,7 @@ export function ExtensionsPanel(props: {
                     >
                       <button
                         type="button"
-                        disabled={busy() !== null}
+                        disabled={controlsBusy()}
                         style={mergeStyle(ui.btn, {
                           "font-size": `${scale().sm}px`,
                         })}
@@ -450,7 +511,7 @@ export function ExtensionsPanel(props: {
                     </Show>
                     <button
                       type="button"
-                      disabled={busy() !== null}
+                      disabled={controlsBusy()}
                       style={mergeStyle(ui.btn, {
                         "font-size": `${scale().sm}px`,
                       })}

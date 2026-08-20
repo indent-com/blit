@@ -8,6 +8,7 @@ import {
   C2S_EXT_RUN,
   EXT_CONTROL_LIST,
   EXT_CONTROL_REMOVE,
+  EXT_CONTROL_RESTART,
   EXT_FLAG_PERSIST,
   EXT_INFO_LIST,
   EXT_PHASE_NEED_OBJECT,
@@ -266,6 +267,17 @@ describe("BlitConnection extensions", () => {
       ),
     );
     await expect(install).rejects.toThrow(/name already exists/);
+  });
+
+  it("rejects a refused control with the server's own detail", async () => {
+    const { transport, connection } = connect();
+    const control = connection.controlExtension(0x1234n, EXT_CONTROL_RESTART);
+    const request = sentOf(transport, C2S_EXT_CONTROL).at(-1)!;
+    const nonce = new DataView(request.buffer).getUint16(1, true);
+    transport.push(
+      status(nonce, STATUS_INVALID, EXT_PHASE_RUNNING, "extension is disabled"),
+    );
+    await expect(control).rejects.toThrow(/extension is disabled/);
   });
 
   it("stops uploading once the server says it already has the object", async () => {

@@ -144,9 +144,14 @@ import {
 } from "./musterPreview";
 import {
   formatExpandedHash,
+  formatMusterExpandedHash,
   formatPanelsHash,
+  formatProjectHash,
   parseExpandedHash,
+  parseMusterExpandedHash,
   parsePanelsHash,
+  parseProjectHash,
+  type ProjectSelection,
 } from "./panelHash";
 import { fontCatalog } from "./fontCatalog";
 import { ExplorerPanel } from "./ide/ExplorerPanel";
@@ -744,16 +749,19 @@ function WorkspaceScreen(props: {
     );
   });
   // Panel chrome in the URL hash (d= open side panels, x= expanded left-dock
-  // sections) is authoritative when present; absent keys fall back to
-  // localStorage/defaults. Parsed once up front — the focus params (s=/t=)
-  // further down read the same object.
+  // sections, r= selected Explorer project, m= Muster expansion) is
+  // authoritative when present; absent keys fall back to localStorage/defaults.
+  // Parsed once up front — the focus params (s=/t=) further down read the same
+  // object.
   const initHash = new URLSearchParams(location.hash.slice(1));
   const initPanels = parsePanelsHash(initHash.get("d"));
+  const initProject = parseProjectHash(initHash.get("r"));
   const [previewPanelOpen, setPreviewPanelOpen] = createSignal(
     initPanels?.preview ?? true,
   );
-  const [musterPreviewExpanded, setMusterPreviewExpanded] =
-    createSignal(true);
+  const [musterPreviewExpanded, setMusterPreviewExpanded] = createSignal(
+    parseMusterExpandedHash(initHash.get("m")) ?? false,
+  );
   const [previewPanelWidth, setPreviewPanelWidth] = createSignal(
     preferredPreviewPanelWidth(),
   );
@@ -850,18 +858,9 @@ function WorkspaceScreen(props: {
   // navigation, not a configured place. It carries its own connection so it
   // survives the focus moving, and a label so the picker can name it without
   // re-deriving a basename.
-  type RootSelection =
-    | { kind: "focused" }
-    | { kind: "declared"; name: string }
-    | {
-        kind: "worktree";
-        connectionId: ConnectionId;
-        path: string;
-        label: string;
-      };
-  const [rootSel, setRootSel] = createSignal<RootSelection>({
-    kind: "focused",
-  });
+  const [rootSel, setRootSel] = createSignal<ProjectSelection>(
+    initProject ?? { kind: "focused" },
+  );
   // Live cwd of the focused terminal, fed by the cwd poll below: it labels
   // the root-picker's focused-terminal option and shows in the status bar.
   // `sessionId` is what the reading is *about* — a poll that comes back
@@ -2778,6 +2777,13 @@ function WorkspaceScreen(props: {
   });
 
   function openTile(assignment: string) {
+    // Manage panels can open terminal assignments through the same tile
+    // boundary editors use. Dispatch those to the generic focused-view path;
+    // only IDE/web assignments belong in the tile registry below.
+    if (!isTileAssignment(assignment) && !isWebAssignment(assignment)) {
+      focusAssignment(assignment);
+      return;
+    }
     if (inBsp()) {
       const paneId = preferredTilePane();
       recordNav(paneId, assignment);
@@ -4307,12 +4313,14 @@ function WorkspaceScreen(props: {
       const t = stripConn(fTile);
       if (t) parts.push(`tile=${t.connectionId}:${tabId(t.bare)}`);
     }
-    // Panel chrome: which side panels are open (d=) and which left-dock
-    // sections are expanded (x=). Always written so a present key is
-    // authoritative on restore — "both panels closed" (d=) and "all sections
-    // collapsed" (x=) are states the hash must be able to carry.
+    // Panel chrome: which side panels are open (d=), which left-dock sections
+    // are expanded (x=), the Explorer's selected project (r=), and whether
+    // Muster is expanded in the right dock (m=). Always written so a present
+    // key is authoritative on restore — false/empty states must survive too.
     parts.push(`d=${formatPanelsHash(leftDockOpen(), previewPanelOpen())}`);
     parts.push(`x=${formatExpandedHash(collapsedSections())}`);
+    parts.push(`r=${encodeURIComponent(formatProjectHash(rootSel()))}`);
+    parts.push(`m=${formatMusterExpandedHash(musterPreviewExpanded())}`);
     const existing = location.hash.slice(1);
     // Strip layout-managed keys (l, p, a) from the old hash only when we
     // have fresh values to replace them.  While BSPContainer is still
@@ -4348,7 +4356,7 @@ function WorkspaceScreen(props: {
         // while a hash-restored tile ref is still resolving (the fetch
         // hasn't settled); erasing it then would lose the restore target.
         !(s.startsWith("tile=") && !pendingActiveTileRef()) &&
-        !(/^[lpastdx]=/.test(s) && written.has(s.slice(0, s.indexOf("=")))),
+        !(/^[lpastdxrm]=/.test(s) && written.has(s.slice(0, s.indexOf("=")))),
     );
     const merged = [...kept, ...parts];
     const newHash = withDebugPanelState(merged.join("&"), debugOpen);

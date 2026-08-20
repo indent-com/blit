@@ -77,6 +77,24 @@ export interface MusterUnit {
   readonly runs: readonly MusterRun[];
 }
 
+/** Whether a unit card has anything below its always-visible summary.
+ * Keep this predicate identical to MusterPanel's detail body so an empty card
+ * never advertises a disclosure that opens onto blank space. */
+export function unitHasDetails(
+  unit: Pick<
+    MusterUnit,
+    "restarts" | "lastExit" | "requires" | "surfaces" | "runs"
+  >,
+): boolean {
+  return (
+    unit.restarts > 0 ||
+    unit.lastExit !== null ||
+    unit.requires.length > 0 ||
+    unit.surfaces.length > 0 ||
+    unit.runs.length > 0
+  );
+}
+
 /**
  * The panel's primary action for a unit.
  *
@@ -94,9 +112,7 @@ export function unitStartVerb(
 }
 
 /** A completed oneshot has no process left for Stop to act on. */
-export function unitCanStop(
-  unit: Pick<MusterUnit, "phase" | "type">,
-): boolean {
+export function unitCanStop(unit: Pick<MusterUnit, "phase" | "type">): boolean {
   return unit.type !== "oneshot" || unit.phase !== "exited";
 }
 
@@ -106,6 +122,19 @@ export interface MusterInstance {
   /** The stack it came from: a subdirectory name, or a path. */
   readonly stack: string;
   readonly members: readonly string[];
+}
+
+/** A stack-level Start has work to do only when one of its members is
+ * startable. Read the instance's complete member list rather than a filtered
+ * display group, so panel filtering cannot change the available controls. */
+export function instanceCanStart(
+  instance: MusterInstance,
+  units: ReadonlyMap<string, MusterUnit>,
+): boolean {
+  return instance.members.some((name) => {
+    const unit = units.get(name);
+    return unit !== undefined && unitStartVerb(unit) === "start";
+  });
 }
 
 /** One journal record. Free-form beyond these: the extension adds fields. */
@@ -416,6 +445,92 @@ export function groupUnits(
     .sort((a, b) => a.name.localeCompare(b.name));
   if (loose.length > 0) groups.push({ instance: null, units: loose });
   return groups;
+}
+
+export interface MusterDiagram {
+  readonly source: string;
+  readonly nodes: number;
+  readonly edges: number;
+}
+
+/** Escape a label before placing it inside Mermaid's quoted node syntax. */
+function diagramLabel(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/[\r\n]+/g, " ");
+}
+
+function diagramUnitName(unit: MusterUnit): string {
+  if (!unit.instance) return unit.name;
+  const prefix = `${unit.instance}/`;
+  return unit.name.startsWith(prefix)
+    ? unit.name.slice(prefix.length)
+    : unit.name;
+}
+
+function phaseMarker(phase: MusterPhase): string {
+  switch (phase) {
+    case "running":
+      return "●";
+    case "exited":
+      return "✓";
+    case "activating":
+    case "waiting":
+    case "backoff":
+      return "◐";
+    case "failed":
+      return "!";
+    case "held":
+    case "stopped":
+      return "○";
+  }
+}
+
+/** A safe Mermaid flowchart of hard dependencies, grouped by stack instance. */
+export function musterDiagram(
+  units: ReadonlyMap<string, MusterUnit>,
+  instances: ReadonlyMap<string, MusterInstance>,
+): MusterDiagram {
+  const groups = groupUnits(units, instances).filter(
+    (group) => group.units.length > 0,
+  );
+  const ids = new Map<string, string>();
+  let nextId = 0;
+  for (const group of groups) {
+    for (const unit of group.units) ids.set(unit.name, `unit_${nextId++}`);
+  }
+
+  const lines = ["flowchart LR"];
+  for (const [groupIndex, group] of groups.entries()) {
+    const label = group.instance?.name ?? "Standalone";
+    lines.push(`  subgraph group_${groupIndex}["${diagramLabel(label)}"]`);
+    lines.push("    direction TB");
+    for (const unit of group.units) {
+      lines.push(
+        `    ${ids.get(unit.name)}["${phaseMarker(unit.phase)} ${diagramLabel(diagramUnitName(unit))}"]`,
+      );
+    }
+    lines.push("  end");
+  }
+
+  const seenEdges = new Set<string>();
+  for (const unit of units.values()) {
+    const dependent = ids.get(unit.name);
+    if (!dependent) continue;
+    for (const requirement of unit.requires) {
+      const dependency = ids.get(requirement);
+      if (!dependency) continue;
+      const edge = `${dependency} --> ${dependent}`;
+      if (seenEdges.has(edge)) continue;
+      seenEdges.add(edge);
+      lines.push(`  ${edge}`);
+    }
+  }
+
+  return { source: lines.join("\n"), nodes: ids.size, edges: seenEdges.size };
 }
 
 /** Connect to the supervisor and keep a live view of its units. */

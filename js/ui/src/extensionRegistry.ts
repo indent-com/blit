@@ -11,6 +11,12 @@
  */
 
 import {
+  EXT_CONTROL_DISABLE,
+  EXT_CONTROL_REMOVE,
+  EXT_CONTROL_STATUS,
+  EXT_FLAG_PERSIST,
+  EXT_PHASE_BLOCKED,
+  EXT_PHASE_STOPPED,
   EXT_RESTART_ALWAYS,
   formatExtensionId,
   parseModuleDigest,
@@ -91,10 +97,10 @@ export interface ExtensionRow {
  * The one list the panel shows: installed first, then what only the registry
  * has.
  *
- * Matched by name, which is the only handle the two sides share — the digest
- * cannot be it, since an update is precisely the case where the digests differ.
- * An unnamed definition (a transient `ext run` with no name) matches nothing
- * and keeps a row of its own rather than collapsing with the others.
+ * Matched by the durable name of a persistent definition, which is the only
+ * handle the two sides share — the digest cannot be it, since an update is
+ * precisely the case where the digests differ. A transient name is only a
+ * label, so it must not claim a registry entry or become an update target.
  */
 export function mergeExtensions(
   installed: readonly BlitExtensionRecord[],
@@ -102,12 +108,17 @@ export function mergeExtensions(
 ): ExtensionRow[] {
   const byName = new Map(offered.map((entry) => [entry.name, entry]));
   const claimed = new Set(
-    installed.map((record) => record.name).filter((name) => name !== ""),
+    installed
+      .filter((record) => (record.flags & EXT_FLAG_PERSIST) !== 0)
+      .map((record) => record.name),
   );
   return [
     ...installed.map((record) => {
       const id = formatExtensionId(record.extensionId);
-      const match = record.name ? byName.get(record.name) : undefined;
+      const match =
+        record.name && (record.flags & EXT_FLAG_PERSIST) !== 0
+          ? byName.get(record.name)
+          : undefined;
       return {
         key: `installed:${id}`,
         label: record.name || `id:${id}`,
@@ -188,19 +199,24 @@ export async function fetchRegistry(
 /**
  * Install a registry entry, or replace the definition of the same name.
  *
- * `installed` is what the server currently has, so an update carries the CAS
- * token of the definition it means to replace and cannot adopt a different
- * one that appeared in between.
+ * The inventory is read again at click time. The panel's rendered row is only
+ * a snapshot and may have been produced while the first list was still in
+ * flight, or another client may have changed the definition since. A fresh
+ * persistent-name match makes installation idempotent and gives updates the
+ * current CAS token.
  */
 export async function installFromRegistry(
   host: ExtensionHost,
   registry: Registry,
   entry: RegistryEntry,
-  installed?: BlitExtensionRecord,
   fetcher: typeof fetch = fetch,
 ): Promise<BlitExtensionStatus> {
   const hash = parseModuleDigest(entry.blake3);
   if (!hash) throw new Error(`${entry.name}: manifest digest is not BLAKE3`);
+  const installed = (await host.listExtensions()).find(
+    (record) =>
+      (record.flags & EXT_FLAG_PERSIST) !== 0 && record.name === entry.name,
+  );
   return host.installExtension({
     hash,
     name: entry.name,
@@ -217,4 +233,36 @@ export async function installFromRegistry(
       return new Uint8Array(await response.arrayBuffer());
     },
   });
+}
+
+const pause = (milliseconds: number) =>
+  new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
+
+/** Disable a persistent definition, wait for its attempt to stop, then remove it. */
+export async function disableAndRemoveExtension(
+  host: ExtensionHost,
+  record: BlitExtensionRecord,
+  wait: (milliseconds: number) => Promise<void> = pause,
+): Promise<void> {
+  let status = await host.controlExtension(
+    record.extensionId,
+    EXT_CONTROL_DISABLE,
+  );
+  for (let attempt = 0; ; attempt++) {
+    if (
+      status.phase === EXT_PHASE_STOPPED ||
+      status.phase === EXT_PHASE_BLOCKED
+    ) {
+      break;
+    }
+    if (attempt === 99) {
+      throw new Error(`${record.name}: extension did not stop before removal`);
+    }
+    await wait(50);
+    status = await host.controlExtension(
+      record.extensionId,
+      EXT_CONTROL_STATUS,
+    );
+  }
+  await host.controlExtension(record.extensionId, EXT_CONTROL_REMOVE);
 }

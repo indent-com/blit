@@ -59,6 +59,8 @@ export function ConnectionPanels(props: {
   fontSize: number;
   sessions?: readonly BlitSession[];
   surfaces?: readonly BlitSurface[];
+  /** Place an assignment (notably a Muster terminal) in the focused view. */
+  onOpenAssignment?: (assignment: string) => void;
   /** The server advertises the client-control family, and we may use it. */
   canListClients: boolean;
   /** The server advertises the extension family. */
@@ -268,6 +270,8 @@ export function ConnectionPanels(props: {
                 connectionId={props.connectionId}
                 palette={props.palette}
                 fontSize={props.fontSize}
+                sessions={props.sessions}
+                onOpenAssignment={props.onOpenAssignment}
               />
             </div>
           </Show>

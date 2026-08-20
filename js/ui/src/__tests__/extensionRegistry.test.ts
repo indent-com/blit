@@ -1,7 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  EXT_CONTROL_DISABLE,
+  EXT_CONTROL_REMOVE,
+  EXT_CONTROL_STATUS,
+  EXT_PHASE_STOPPED,
+  EXT_PHASE_STOPPING,
+} from "@blit-sh/core";
+import {
   PUBLIC_REGISTRY,
   defaultRegistry,
+  disableAndRemoveExtension,
   fetchRegistry,
   installFromRegistry,
   isOutdated,
@@ -102,7 +110,7 @@ describe("extension registry", () => {
         }) as unknown as Response,
     );
     const host = {
-      listExtensions: vi.fn(),
+      listExtensions: vi.fn(async () => []),
       controlExtension: vi.fn(),
       installExtension: vi.fn(async (request: any) => {
         expect(Array.from(request.hash).length).toBe(32);
@@ -114,7 +122,6 @@ describe("extension registry", () => {
       host as never,
       registry,
       registry.extensions[0]!,
-      undefined,
       fetcher as never,
     );
     expect(fetcher).not.toHaveBeenCalled();
@@ -128,7 +135,6 @@ describe("extension registry", () => {
       host as never,
       registry,
       registry.extensions[0]!,
-      undefined,
       fetcher as never,
     );
     expect(fetcher).toHaveBeenCalledWith(
@@ -153,14 +159,19 @@ describe("extension registry", () => {
       ],
     };
     const host = {
+      // The pane may still have rendered this name as available. Installation
+      // must use this fresh inventory, not that stale render-time snapshot.
+      listExtensions: vi.fn(async () => [
+        {
+          name: "systemd",
+          flags: 3,
+          extensionId: 7n,
+          definitionRevision: 3n,
+        },
+      ]),
       installExtension: vi.fn(async () => ({ phase: 4, status: 0 })),
     };
-    await installFromRegistry(
-      host as never,
-      registry,
-      registry.extensions[0]!,
-      { extensionId: 7n, definitionRevision: 3n } as never,
-    );
+    await installFromRegistry(host as never, registry, registry.extensions[0]!);
     const [first] = host.installExtension.mock.calls[0] as unknown as [
       Record<string, unknown>,
     ];
@@ -183,8 +194,8 @@ const offer = (name: string, blake3: string): RegistryEntry => ({
   brotliBytes: 1,
 });
 
-const record = (name: string, hash: string, extensionId: bigint) =>
-  ({ name, hash, extensionId, phase: 4, flags: 3 }) as never;
+const record = (name: string, hash: string, extensionId: bigint, flags = 3) =>
+  ({ name, hash, extensionId, phase: 4, flags }) as never;
 
 describe("merging installed with the registry", () => {
   // The panel used to show installed and offered as two tables, so an
@@ -224,6 +235,18 @@ describe("merging installed with the registry", () => {
     expect(rows[2]!.label).toBe("systemd");
   });
 
+  it("does not let a transient label claim a durable registry name", () => {
+    const rows = mergeExtensions(
+      [record("systemd", DIGEST, 9n, 1)],
+      [offer("systemd", DIGEST)],
+    );
+    expect(rows).toHaveLength(2);
+    expect(rows[0]!.installed?.extensionId).toBe(9n);
+    expect(rows[0]!.offered).toBeUndefined();
+    expect(rows[1]!.installed).toBeUndefined();
+    expect(rows[1]!.offered?.name).toBe("systemd");
+  });
+
   // The digest is the identity: same name, different bytes is the update.
   it("calls a row outdated only when the digests differ", () => {
     const [current] = mergeExtensions(
@@ -240,5 +263,35 @@ describe("merging installed with the registry", () => {
     expect(isOutdated(stale!)).toBe(true);
     expect(isOutdated(uninstalled!)).toBe(false);
     expect(isOutdated(unoffered!)).toBe(false);
+  });
+});
+
+describe("extension removal", () => {
+  it("waits for disable to become quiescent before removing", async () => {
+    const actions: number[] = [];
+    const host = {
+      controlExtension: vi.fn(async (_extensionId: bigint, action: number) => {
+        actions.push(action);
+        return {
+          status: 0,
+          phase:
+            action === EXT_CONTROL_DISABLE
+              ? EXT_PHASE_STOPPING
+              : EXT_PHASE_STOPPED,
+        };
+      }),
+    };
+    const wait = vi.fn(async () => {});
+    await disableAndRemoveExtension(
+      host as never,
+      record("systemd", DIGEST, 7n),
+      wait,
+    );
+    expect(actions).toEqual([
+      EXT_CONTROL_DISABLE,
+      EXT_CONTROL_STATUS,
+      EXT_CONTROL_REMOVE,
+    ]);
+    expect(wait).toHaveBeenCalledWith(50);
   });
 });

@@ -1,9 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
   formatExpandedHash,
+  formatMusterExpandedHash,
   formatPanelsHash,
+  formatProjectHash,
   parseExpandedHash,
+  parseMusterExpandedHash,
   parsePanelsHash,
+  parseProjectHash,
+  type ProjectSelection,
 } from "../panelHash";
 
 describe("panelHash panels (d=)", () => {
@@ -81,5 +86,51 @@ describe("panelHash expanded sections (x=)", () => {
     expect(parseExpandedHash("explorer,log,problems")).toEqual(
       new Set(["branches"]),
     );
+  });
+});
+
+describe("panelHash selected project (r=)", () => {
+  const roundTrip = (selection: ProjectSelection) => {
+    const encoded = encodeURIComponent(formatProjectHash(selection));
+    const decoded = new URLSearchParams(`r=${encoded}`).get("r");
+    expect(parseProjectHash(decoded)).toEqual(selection);
+  };
+
+  it("round-trips the focused pane", () => {
+    roundTrip({ kind: "focused" });
+  });
+
+  it("round-trips a declared root with hash separators in its name", () => {
+    roundTrip({ kind: "declared", name: "api & docs=preview" });
+  });
+
+  it("round-trips a worktree and its connection", () => {
+    roundTrip({
+      kind: "worktree",
+      connectionId: "build:remote",
+      path: "/src/project & tools/worktree",
+      label: "worktree",
+    });
+  });
+
+  it("rejects missing and malformed selections", () => {
+    expect(parseProjectHash(null)).toBeNull();
+    expect(parseProjectHash("d:")).toBeNull();
+    expect(parseProjectHash('w:["remote"]')).toBeNull();
+    expect(parseProjectHash("unknown")).toBeNull();
+  });
+});
+
+describe("panelHash Muster expansion (m=)", () => {
+  it("round-trips expanded and collapsed", () => {
+    expect(formatMusterExpandedHash(true)).toBe("1");
+    expect(formatMusterExpandedHash(false)).toBe("0");
+    expect(parseMusterExpandedHash("1")).toBe(true);
+    expect(parseMusterExpandedHash("0")).toBe(false);
+  });
+
+  it("leaves absent and malformed values to the collapsed default", () => {
+    expect(parseMusterExpandedHash(null)).toBeNull();
+    expect(parseMusterExpandedHash("yes")).toBeNull();
   });
 });

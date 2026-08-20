@@ -9,6 +9,16 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # Create a temp directory for the socket
 TMPDIR_E2E="${BLIT_E2E_TMPDIR:-$(mktemp -d)}"
 export BLIT_SOCK="${TMPDIR_E2E}/blit-test.sock"
+# Persistent-extension state is single-writer. Keep the test server away from
+# any developer server using the platform default database.
+export BLIT_EXTENSION_PATH="${TMPDIR_E2E}/extensions.redb"
+
+# The browser connects through the gateway's named-destination mux. Give the
+# harness one remote of its own instead of exposing the developer's real
+# blit.remotes file (which would make the UI connect to, and drive, those
+# servers while a spec believes it is using BLIT_SOCK).
+export BLIT_REMOTES="${TMPDIR_E2E}/blit.remotes"
+printf 'test = socket:%s\n' "$BLIT_SOCK" >"$BLIT_REMOTES"
 
 # Where a spec can find the server behind the gateway it is driving.  Playwright
 # starts this script as its own process tree, so an exported BLIT_SOCK reaches
@@ -29,19 +39,26 @@ mkdir -p "$BLIT_MUSTER_DIR"
 MUSTER_HANDOFF="${REPO_ROOT}/e2e/.e2e-muster-dir"
 printf '%s' "$BLIT_MUSTER_DIR" >"$MUSTER_HANDOFF"
 
+SERVER_PID=""
+GATEWAY_PID=""
 cleanup() {
     # Kill child processes
-    kill "$SERVER_PID" "$GATEWAY_PID" 2>/dev/null || true
-    wait "$SERVER_PID" "$GATEWAY_PID" 2>/dev/null || true
+    if [ -n "$SERVER_PID" ]; then
+        kill "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
+    fi
+    if [ -n "$GATEWAY_PID" ]; then
+        kill "$GATEWAY_PID" 2>/dev/null || true
+        wait "$GATEWAY_PID" 2>/dev/null || true
+    fi
     rm -f "$SOCK_HANDOFF" "$MUSTER_HANDOFF"
     rm -rf "$TMPDIR_E2E"
 }
 trap cleanup EXIT INT TERM
 
-# Start blit server.  Persistent extensions are on by default, which a spec
-# needs: a transient `ext run` ends with the CLI connection that started it, so
-# it is no use to a spec that wants an extension still serving when the browser
-# looks.
+# Start blit server. The Muster spec installs a persistent extension: a
+# transient `ext run` ends with the CLI connection that started it, so it is no
+# use to a spec that wants an extension still serving when the browser looks.
 "${REPO_ROOT}/target/debug/blit" server &
 SERVER_PID=$!
 

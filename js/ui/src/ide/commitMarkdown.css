@@ -102,6 +102,19 @@
   height: auto;
 }
 
+.blit-commit-markdown .blit-mermaid {
+  max-width: 100%;
+  overflow-x: auto;
+  margin: 0 0 0.75em;
+}
+
+.blit-commit-markdown .blit-mermaid svg {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin-inline: auto;
+}
+
 .blit-commit-markdown hr {
   border: 0;
   border-top: 1px solid currentColor;

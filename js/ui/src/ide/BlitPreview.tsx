@@ -31,6 +31,7 @@ import type { BlitWorkspace, ConnectionId, FsSyncHandle } from "@blit-sh/core";
 import { editorAssignment, previewAssignment } from "@blit-sh/core/bsp";
 import { Marked } from "marked";
 import { createBlitWorkspaceState } from "@blit-sh/solid";
+import { renderMermaid } from "../mermaid";
 import type { Theme, UIScale } from "../theme";
 import { scrollbarStyle } from "../theme";
 import { isConnReady, connGeneration } from "./reactive";
@@ -39,6 +40,7 @@ import {
   setActiveEditorFocused,
   type PreviewController,
 } from "./activeEditor";
+import { markdownCodeBlock, type MarkdownDiagrams } from "./markdownCode";
 import {
   previewKindFor,
   previewMime,
@@ -53,6 +55,7 @@ import "./commitMarkdown.css";
 /** Cap on an embedded asset. A preview should not pull a video in because
  *  a page linked one. */
 const ASSET_MAX = 8 * 1024 * 1024;
+let markdownPreviewSerial = 0;
 
 export function BlitPreview(props: {
   workspace: BlitWorkspace;
@@ -72,9 +75,13 @@ export function BlitPreview(props: {
   const [bytes, setBytes] = createSignal<Uint8Array | null>(null);
   const [error, setError] = createSignal<string | null>(null);
   const [html, setHtml] = createSignal("");
+  const [markdownDiagrams, setMarkdownDiagrams] = createSignal<
+    ReadonlyMap<string, string>
+  >(new Map());
   const [imageUrl, setImageUrl] = createSignal<string | null>(null);
   let previewScroller: HTMLDivElement | undefined;
   let markdownRoot: HTMLDivElement | undefined;
+  const diagramPrefix = `blit-preview-mermaid-${++markdownPreviewSerial}`;
 
   // Every blob URL this tile minted, revoked together on teardown or on the
   // next render — an un-revoked blob pins its bytes for the page's life.
@@ -174,8 +181,12 @@ export function BlitPreview(props: {
       const text = new TextDecoder("utf-8", { fatal: false }).decode(data);
       if (k === "markdown") {
         const rendered = await renderMarkdown(text);
-        if (!cancelled) setHtml(rendered);
+        if (!cancelled) {
+          setHtml(rendered.html);
+          setMarkdownDiagrams(rendered.diagrams);
+        }
       } else {
+        setMarkdownDiagrams(new Map());
         const rendered = await renderHtml(text);
         if (!cancelled) setHtml(rendered);
       }
@@ -197,7 +208,9 @@ export function BlitPreview(props: {
     return out;
   }
 
-  async function renderMarkdown(text: string): Promise<string> {
+  async function renderMarkdown(
+    text: string,
+  ): Promise<{ html: string; diagrams: ReadonlyMap<string, string> }> {
     // Two passes: walk the tokens to collect image references, fetch them,
     // then render with a renderer that substitutes blob URLs. marked's
     // renderer is synchronous, so the fetching cannot happen inside it.
@@ -226,6 +239,7 @@ export function BlitPreview(props: {
       breaks: false,
     });
     const headingCounts = new Map<string, number>();
+    const diagrams: MarkdownDiagrams = new Map();
     const plainText = (tokens: unknown[]): string =>
       tokens
         .map((token) => {
@@ -270,11 +284,51 @@ export function BlitPreview(props: {
               : ` data-blit-link-fragment="${escapeAttr(target.fragment)}"`;
           return `<a class="blit-md-link blit-md-link--local" data-blit-link-path="${escapeAttr(target.path)}" data-blit-link-view="${target.view}"${fragment} role="link" tabindex="0" title="${escapeAttr(tooltip)}">${label}</a>`;
         },
+        code({ text: code, lang }) {
+          return markdownCodeBlock(code, lang, diagrams, diagramPrefix);
+        },
       },
     });
     const out = marked.parse(text, { async: false });
-    return typeof out === "string" ? out : "";
+    return {
+      html: typeof out === "string" ? out : "",
+      diagrams,
+    };
   }
+
+  // Mermaid placeholders are part of the sanitized Markdown HTML. Render them
+  // after Solid has installed that HTML in the live preview DOM.
+  createEffect(() => {
+    const renderedHtml = html();
+    const diagrams = markdownDiagrams();
+    const theme = props.theme;
+    if (kind() !== "markdown" || !renderedHtml || diagrams.size === 0) return;
+
+    let cancelled = false;
+    onCleanup(() => {
+      cancelled = true;
+    });
+    queueMicrotask(() => {
+      void (async () => {
+        for (const [id, source] of diagrams) {
+          if (cancelled) return;
+          const target = markdownRoot?.querySelector<HTMLElement>(`#${id}`);
+          if (!target) continue;
+          try {
+            const svg = await renderMermaid(`${id}-svg`, source, theme);
+            if (!cancelled) target.innerHTML = svg;
+          } catch (reason) {
+            if (cancelled) return;
+            target.textContent = source;
+            target.setAttribute(
+              "title",
+              reason instanceof Error ? reason.message : String(reason),
+            );
+          }
+        }
+      })();
+    });
+  });
 
   async function renderHtml(text: string): Promise<string> {
     // Parse rather than regex so attribute rewriting cannot be fooled by

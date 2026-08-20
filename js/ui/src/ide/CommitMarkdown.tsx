@@ -1,6 +1,8 @@
 import { createEffect, createSignal, onCleanup, type JSX } from "solid-js";
 import { Marked } from "marked";
+import { renderMermaid } from "../mermaid";
 import type { Theme } from "../theme";
+import { markdownCodeBlock, type MarkdownDiagrams } from "./markdownCode";
 import "./commitMarkdown.css";
 
 const SAFE_PROTOCOL = /^(https?|mailto)$/i;
@@ -34,8 +36,7 @@ export function safeMarkdownImageUrl(src: string): string {
   return SAFE_IMAGE_PROTOCOL.test(src.slice(0, colon)) ? src : "";
 }
 
-/** Mermaid sources pulled out before parsing, keyed by placeholder id. */
-type Diagrams = Map<string, string>;
+let markdownSerial = 0;
 
 function escapeHtml(value: string): string {
   return value
@@ -60,7 +61,11 @@ function escapeAttr(value: string): string {
  * attributes are escaped, and every link/image URL is checked. Commit text is
  * repo-authored, not trusted.
  */
-function buildMarked(theme: Theme, diagrams: Diagrams): Marked {
+function buildMarked(
+  theme: Theme,
+  diagrams: MarkdownDiagrams,
+  diagramPrefix: string,
+): Marked {
   const marked = new Marked({ gfm: true, breaks: false, async: false });
   marked.use({
     renderer: {
@@ -81,135 +86,11 @@ function buildMarked(theme: Theme, diagrams: Diagrams): Marked {
         return `<a href="${escapeAttr(safe)}" target="_blank" rel="noopener noreferrer" style="color:${escapeAttr(theme.accent)}"${attrs}>${text}</a>`;
       },
       code({ text, lang }): string {
-        // A mermaid fence becomes a placeholder: mermaid needs a live element,
-        // so the diagram is rendered once this HTML is in the DOM.
-        if ((lang ?? "").trim().toLowerCase() === "mermaid") {
-          const id = `blit-mermaid-${diagrams.size}`;
-          diagrams.set(id, text);
-          return `<div class="blit-mermaid" id="${id}"></div>`;
-        }
-        const cls = lang ? ` class="language-${escapeAttr(lang)}"` : "";
-        return `<pre><code${cls}>${escapeHtml(text)}</code></pre>`;
+        return markdownCodeBlock(text, lang, diagrams, diagramPrefix);
       },
     },
   });
   return marked;
-}
-
-/** Mermaid is a large dependency and most commit messages have no diagram, so
- *  it loads only when one appears. */
-let mermaidModule: Promise<typeof import("mermaid")> | null = null;
-function loadMermaid(): Promise<typeof import("mermaid")> {
-  mermaidModule ??= import("mermaid");
-  return mermaidModule;
-}
-
-/** Parse an `rgb()`/`rgba()` string into components; null if unrecognised. */
-function parseRgb(value: string): [number, number, number] | null {
-  const m = /rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)/.exec(value);
-  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
-}
-
-/**
- * Blend `color` toward `toward` by `amount`, always returning an **opaque**
- * `rgb()`.
- *
- * Mermaid runs its own lighten/darken over whatever it is given, and that
- * math misreads `rgba()` — several of the theme's surfaces are translucent,
- * so handing them over directly is what made diagrams come out washed out
- * and flat. Everything below is composited here instead.
- */
-function blend(color: string, toward: string, amount: number): string {
-  const a = parseRgb(color);
-  const b = parseRgb(toward);
-  if (!a || !b) return color;
-  const c = a.map((v, i) => Math.round(v + (b[i] - v) * amount));
-  return `rgb(${c[0]}, ${c[1]}, ${c[2]})`;
-}
-
-/**
- * A mermaid `themeVariables` set derived from the active terminal palette.
- *
- * Node fills are the hue mixed most of the way to the background, with the
- * hue itself as the border — so a diagram is coloured but its labels keep
- * the foreground's contrast rather than becoming light-on-light. The four
- * hues blit already derives from ANSI (accent/success/warning/error) are
- * cycled through mermaid's primary/secondary/tertiary slots and through the
- * `pie*` and `git*` series, so pie charts and git graphs get distinct
- * colours from the same palette instead of mermaid's defaults.
- */
-function mermaidVars(theme: Theme): Record<string, string> {
-  const { bg, fg, accent, success, warning, error } = theme;
-  const fill = (hue: string) => blend(hue, bg, 0.78);
-  const soft = (hue: string) => blend(hue, bg, 0.88);
-  const hues = [accent, success, warning, error];
-  const series: Record<string, string> = {};
-  for (let i = 0; i < 8; i++) {
-    const hue = hues[i % hues.length];
-    // Second time round the cycle, lighten so eight slices stay distinct.
-    const c = i < hues.length ? hue : blend(hue, fg, 0.35);
-    series[`pie${i + 1}`] = c;
-    series[`git${i}`] = c;
-  }
-  return {
-    darkMode: String(!!parseRgb(bg) && luminance(bg) < 0.5),
-    background: bg,
-    fontFamily: "inherit",
-
-    primaryColor: fill(accent),
-    primaryBorderColor: accent,
-    primaryTextColor: fg,
-    secondaryColor: fill(success),
-    secondaryBorderColor: success,
-    secondaryTextColor: fg,
-    tertiaryColor: fill(warning),
-    tertiaryBorderColor: warning,
-    tertiaryTextColor: fg,
-
-    lineColor: blend(accent, fg, 0.25),
-    textColor: fg,
-    mainBkg: fill(accent),
-    nodeBorder: accent,
-    nodeTextColor: fg,
-
-    // Flowchart subgraphs.
-    clusterBkg: soft(accent),
-    clusterBorder: blend(accent, bg, 0.55),
-    titleColor: fg,
-    edgeLabelBackground: bg,
-
-    // Sequence diagrams.
-    actorBkg: fill(accent),
-    actorBorder: accent,
-    actorTextColor: fg,
-    actorLineColor: blend(fg, bg, 0.5),
-    signalColor: blend(accent, fg, 0.25),
-    signalTextColor: fg,
-    labelBoxBkgColor: fill(success),
-    labelBoxBorderColor: success,
-    labelTextColor: fg,
-    loopTextColor: fg,
-    activationBkgColor: fill(warning),
-    activationBorderColor: warning,
-    noteBkgColor: fill(warning),
-    noteBorderColor: warning,
-    noteTextColor: fg,
-    sequenceNumberColor: bg,
-
-    // Errors, and anything mermaid flags.
-    errorBkgColor: fill(error),
-    errorTextColor: fg,
-
-    ...series,
-  };
-}
-
-/** Rough relative luminance, for mermaid's light/dark switch. */
-function luminance(color: string): number {
-  const c = parseRgb(color);
-  if (!c) return 0;
-  const [r, g, b] = c.map((v) => v / 255);
-  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
 }
 
 export function CommitMarkdown(props: {
@@ -219,10 +100,11 @@ export function CommitMarkdown(props: {
 }): JSX.Element {
   const [html, setHtml] = createSignal("");
   let host: HTMLDivElement | undefined;
+  const diagramPrefix = `blit-commit-mermaid-${++markdownSerial}`;
 
   createEffect(() => {
-    const diagrams: Diagrams = new Map();
-    const marked = buildMarked(props.theme, diagrams);
+    const diagrams: MarkdownDiagrams = new Map();
+    const marked = buildMarked(props.theme, diagrams, diagramPrefix);
     const rendered = marked.parse(props.children ?? "", { async: false });
     setHtml(typeof rendered === "string" ? rendered : "");
 
@@ -231,33 +113,28 @@ export function CommitMarkdown(props: {
     onCleanup(() => {
       cancelled = true;
     });
-    void (async () => {
-      const { default: mermaid } = await loadMermaid();
-      // Mermaid needs its theme up front; it does not follow CSS variables.
-      mermaid.initialize({
-        startOnLoad: false,
-        theme: "base",
-        securityLevel: "strict",
-        themeVariables: mermaidVars(props.theme),
-      });
-      for (const [id, source] of diagrams) {
-        if (cancelled) return;
-        const target = host?.querySelector<HTMLElement>(`#${id}`);
-        if (!target) continue;
-        try {
-          const { svg } = await mermaid.render(`${id}-svg`, source);
-          if (!cancelled) target.innerHTML = svg;
-        } catch (err) {
-          // A malformed diagram shows its source rather than vanishing: the
-          // author is the one who can fix it.
-          target.textContent = source;
-          target.setAttribute(
-            "title",
-            err instanceof Error ? err.message : String(err),
-          );
+    queueMicrotask(() => {
+      void (async () => {
+        for (const [id, source] of diagrams) {
+          if (cancelled) return;
+          const target = host?.querySelector<HTMLElement>(`#${id}`);
+          if (!target) continue;
+          try {
+            const svg = await renderMermaid(`${id}-svg`, source, props.theme);
+            if (!cancelled) target.innerHTML = svg;
+          } catch (err) {
+            if (cancelled) return;
+            // A malformed diagram shows its source rather than vanishing: the
+            // author is the one who can fix it.
+            target.textContent = source;
+            target.setAttribute(
+              "title",
+              err instanceof Error ? err.message : String(err),
+            );
+          }
         }
-      }
-    })();
+      })();
+    });
   });
 
   return (

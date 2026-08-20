@@ -49,6 +49,11 @@ const UNITS: Record<string, unknown> = {
     description: "A clock that never stops",
     command: ["sh", "-c", "while :; do date; sleep 1; done"],
   },
+  "dependent.json": {
+    description: "Waits for the clock",
+    command: ["sleep", "300"],
+    requires: ["clock"],
+  },
   "dev/stack.json": { description: "A greeter stack", vars: { who: {} } },
   "dev/greeter.json": {
     description: "Greets ${who}",
@@ -155,10 +160,26 @@ test.describe("muster panel", () => {
     await expect(member).toContainText("greeter");
     await expect(member).not.toContainText("main/greeter");
 
-    // Expanding is what reveals the terminal a unit is running in.
+    // The summary is the whole story until the unit acquires secondary data,
+    // so it is plain content rather than an empty disclosure.
+    await expect(member).not.toHaveAttribute("aria-expanded", /.+/);
+    await expect(page.getByText(/terminal #\d+/).first()).toBeVisible();
+
+    // Restarting retains the old terminal. The same card now has something to
+    // disclose, and the section heading carries the context so the chip stays
+    // compact instead of repeating "kept terminal" on every run.
+    blit("@muster", "restart", "main/greeter");
+    await expect(member).toHaveAttribute("aria-expanded", "false", {
+      timeout: 10_000,
+    });
     await member.click();
     await expect(member).toHaveAttribute("aria-expanded", "true");
-    await expect(page.getByText(/terminal #\d+/).first()).toBeVisible();
+    const memberCard = member.locator("xpath=../..");
+    await expect(
+      memberCard.getByText("Retained", { exact: true }),
+    ).toBeVisible();
+    await expect(memberCard.getByText(/^#\d+ · exit /)).toBeVisible();
+    await expect(memberCard).not.toContainText("kept terminal");
 
     // The filter reaches into instances rather than matching only their names.
     await page.getByPlaceholder("Filter units…").fill("clock");
@@ -199,6 +220,61 @@ test.describe("muster panel", () => {
     });
   });
 
+  test("terminal chips drag into the focused view", async ({ page }) => {
+    await openMusterTab(page);
+
+    const clock = page
+      .locator('[data-muster-unit="clock"]')
+      .locator("xpath=..");
+    const terminal = clock.locator("[data-muster-terminal]").first();
+    await expect(terminal).toBeEnabled({ timeout: 15_000 });
+    await expect(terminal).toContainText(/terminal #\d+/);
+
+    // A Muster terminal uses the same opaque assignment payload as dock cards,
+    // editor rows, and pane grips. Existing pane drop targets can therefore
+    // place it without knowing where the drag originated.
+    const drag = await terminal.evaluate((element) => {
+      const transfer = new DataTransfer();
+      element.dispatchEvent(
+        new DragEvent("dragstart", {
+          bubbles: true,
+          cancelable: true,
+          dataTransfer: transfer,
+        }),
+      );
+      return {
+        types: [...transfer.types],
+        assignment: transfer.getData("application/x-blit-tile"),
+      };
+    });
+    expect(drag.types).toContain("application/x-blit-tile");
+    expect(drag.assignment).toBe(
+      await terminal.getAttribute("data-muster-session"),
+    );
+
+    await terminal.dragTo(page.locator("[data-muster-panel]"), {
+      targetPosition: { x: 20, y: 20 },
+    });
+    // Dropping replaces the focused Manage tile with the selected terminal.
+    await expect(page.locator(MUSTER_TAB)).toHaveCount(0);
+    await expect(page.locator("canvas").first()).toBeVisible();
+  });
+
+  test("terminal chips open on click", async ({ page }) => {
+    await openMusterTab(page);
+
+    const terminal = page
+      .locator('[data-muster-unit="clock"]')
+      .locator("xpath=..")
+      .locator("[data-muster-terminal]")
+      .first();
+    await expect(terminal).toBeEnabled({ timeout: 15_000 });
+    await terminal.click();
+
+    await expect(page.locator(MUSTER_TAB)).toHaveCount(0);
+    await expect(page.locator("canvas").first()).toBeVisible();
+  });
+
   test("backfills the journal on connect", async ({ page }) => {
     await openMusterTab(page);
     await page.locator('[data-muster-tab="journal"]').click();
@@ -207,5 +283,19 @@ test.describe("muster panel", () => {
     const journal = page.locator("[data-muster-journal]");
     await expect(journal).toContainText("clock", { timeout: 15_000 });
     await expect(journal).toContainText(/started|loaded/);
+  });
+
+  test("draws the unit dependency graph", async ({ page }) => {
+    await openMusterTab(page);
+    await expect(page.locator('[data-muster-unit="dependent"]')).toBeVisible({
+      timeout: 15_000,
+    });
+
+    await page.locator('[data-muster-tab="graph"]').click();
+    const graph = page.locator("[data-muster-graph]");
+    await expect(graph).toContainText("1 hard dependency");
+    await expect(graph.locator("svg")).toBeVisible({ timeout: 15_000 });
+    await expect(graph.locator("svg")).toContainText("clock");
+    await expect(graph.locator("svg")).toContainText("dependent");
   });
 });

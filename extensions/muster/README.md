@@ -319,7 +319,9 @@ keeps discovery out of it keeps writes out of it too.
 mirrored by `js/ui/src/muster.ts`). The tab shows the tree the CLI cannot:
 instance ▸ unit ▸ (terminal, windows). A unit's windows are there because a run
 is spawned onto its own stamped Wayland socket, so the compositor — not the
-supervisor guessing at process trees — is what says which window is whose.
+supervisor guessing at process trees — is what says which window is whose. A
+unit's current and retained terminal chips open that terminal on click and use
+the ordinary pane-assignment payload when dragged onto a pane.
 
 The wire is JSON, one object per message.
 
@@ -391,10 +393,6 @@ or starts — whatever you actually supervise.
 
 ## Not here yet
 
-- A panel row names a unit's terminal and windows; it does not open them. That
-  is frontend-only work — the pty is already in the client's session list, and
-  what is missing is a way for a BSP tile to hand the workspace something to
-  place, which is `ide/activeEditor.ts`'s registry pointed the other way.
 - The durable journal tail in kv: the ring is in memory, so `@muster log` starts
   empty after the supervisor restarts.
 - `@muster remove`, the other half of `instantiate`. Deleting an instance file

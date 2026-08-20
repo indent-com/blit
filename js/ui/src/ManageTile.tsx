@@ -64,6 +64,8 @@ export function ManageTile(props: {
   palette: TerminalPalette;
   scale: UIScale;
   fontSize: number;
+  /** Open a terminal or other pane assignment selected inside a panel. */
+  onOpenAssignment?: (assignment: string) => void;
   /** The connection is an `.ro` share: the client-control family never
    *  answers through the forwarder, so the clients tab must not be offered. */
   readOnly?: boolean;
@@ -179,6 +181,7 @@ export function ManageTile(props: {
             fontSize={props.fontSize}
             sessions={sessions()}
             surfaces={surfaces()}
+            onOpenAssignment={props.onOpenAssignment}
             canListClients={canListClients()}
             canManageExtensions={connection()?.supportsExtensions === true}
           />

@@ -48,7 +48,7 @@ export function BlitTile(props: {
   scale: UIScale;
   fontFamily: string;
   fontSize: number;
-  /** Open a further tile (e.g. from a commit's file rows). */
+  /** Open a further assignment (e.g. a commit file or Muster terminal). */
   onOpenTile: (assignment: string) => void;
   /** Whether a connection is an `.ro` share. Only a manage tile asks: its
    *  clients panel talks a family the share forwarder drops, so offering it
@@ -109,6 +109,7 @@ export function BlitTile(props: {
           palette={props.palette}
           scale={props.scale}
           fontSize={props.fontSize}
+          onOpenAssignment={props.onOpenTile}
           readOnly={props.isConnectionReadOnly?.(t.connectionId)}
           preview={props.preview}
           focused={props.focused}
