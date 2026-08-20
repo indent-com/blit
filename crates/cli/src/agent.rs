@@ -2284,7 +2284,7 @@ mod tests {
     }
 
     impl MockServer {
-        fn new(stream: tokio::net::UnixStream) -> Self {
+        fn new(stream: tokio::io::DuplexStream) -> Self {
             let (r, w) = tokio::io::split(stream);
             Self {
                 reader: Box::new(r),
@@ -2456,7 +2456,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_client_list_requests_catalog() {
-        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (client, server) = tokio::io::duplex(1 << 16);
         let mock = tokio::spawn(async move {
             let mut mock = MockServer::new(server);
             mock.send_initial_burst_with_features(FEATURE_CLIENT_CONTROL)
@@ -2501,13 +2501,13 @@ mod tests {
             .await;
         });
 
-        cmd_clients(Transport::Unix(client)).await.unwrap();
+        cmd_clients(Transport::Duplex(client)).await.unwrap();
         mock.await.unwrap();
     }
 
     #[tokio::test]
     async fn test_client_kick_waits_for_result() {
-        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (client, server) = tokio::io::duplex(1 << 16);
         let mock = tokio::spawn(async move {
             let mut mock = MockServer::new(server);
             mock.send_initial_burst_with_features(FEATURE_CLIENT_CONTROL)
@@ -2520,7 +2520,7 @@ mod tests {
             .await;
         });
 
-        cmd_kick_client(Transport::Unix(client), 42, "duplicate")
+        cmd_kick_client(Transport::Duplex(client), 42, "duplicate")
             .await
             .unwrap();
         mock.await.unwrap();
@@ -2528,7 +2528,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_client_kick_reports_refusal() {
-        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (client, server) = tokio::io::duplex(1 << 16);
         let mock = tokio::spawn(async move {
             let mut mock = MockServer::new(server);
             mock.send_initial_burst_with_features(FEATURE_CLIENT_CONTROL)
@@ -2545,7 +2545,7 @@ mod tests {
             .await;
         });
 
-        let error = cmd_kick_client(Transport::Unix(client), 42, "")
+        let error = cmd_kick_client(Transport::Duplex(client), 42, "")
             .await
             .unwrap_err();
         assert!(error.contains("client is not connected"));
@@ -2554,7 +2554,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_empty() {
-        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (client, server) = tokio::io::duplex(1 << 16);
 
         let mock = tokio::spawn(async move {
             let mut mock = MockServer::new(server);
@@ -2562,7 +2562,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         });
 
-        let transport = Transport::Unix(client);
+        let transport = Transport::Duplex(client);
         let conn = AgentConn::connect(transport).await.unwrap();
 
         assert!(conn.ptys.is_empty());
@@ -2574,7 +2574,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_with_ptys() {
-        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (client, server) = tokio::io::duplex(1 << 16);
 
         let mock = tokio::spawn(async move {
             let mut mock = MockServer::new(server);
@@ -2585,7 +2585,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         });
 
-        let transport = Transport::Unix(client);
+        let transport = Transport::Duplex(client);
         let conn = AgentConn::connect(transport).await.unwrap();
 
         assert_eq!(conn.ptys.len(), 3);
@@ -2609,7 +2609,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_start() {
-        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (client, server) = tokio::io::duplex(1 << 16);
 
         let mock = tokio::spawn(async move {
             let mut mock = MockServer::new(server);
@@ -2623,7 +2623,7 @@ mod tests {
             mock.send_created_n(nonce, 5, "").await;
         });
 
-        let transport = Transport::Unix(client);
+        let transport = Transport::Duplex(client);
         let mut conn = AgentConn::connect(transport).await.unwrap();
 
         let msg = msg_create2(1, 24, 80, "", "echo\0hello", 0);
@@ -2649,7 +2649,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_start_with_tag() {
-        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (client, server) = tokio::io::duplex(1 << 16);
 
         let mock = tokio::spawn(async move {
             let mut mock = MockServer::new(server);
@@ -2671,7 +2671,7 @@ mod tests {
             mock.send_created_n(nonce, 7, "mytag").await;
         });
 
-        let transport = Transport::Unix(client);
+        let transport = Transport::Duplex(client);
         let mut conn = AgentConn::connect(transport).await.unwrap();
 
         let msg = msg_create2(1, 24, 80, "mytag", "bash", 0);
@@ -2707,7 +2707,7 @@ mod tests {
 
     /// Drive `cmd_start` and hand back the `CREATE2` it put on the wire.
     async fn started_message(features: u32, req: StartRequest) -> Result<Vec<u8>, String> {
-        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (client, server) = tokio::io::duplex(1 << 16);
         let mock = tokio::spawn(async move {
             let mut mock = MockServer::new(server);
             mock.send_initial_burst_with_features(features).await;
@@ -2716,7 +2716,7 @@ mod tests {
             mock.send_created_n(nonce, 5, "").await;
             Some(data)
         });
-        let result = cmd_start(Transport::Unix(client), req).await;
+        let result = cmd_start(Transport::Duplex(client), req).await;
         let sent = mock.await.unwrap();
         result.map(|_| sent.expect("server saw no create"))
     }
@@ -2815,7 +2815,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_show() {
-        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (client, server) = tokio::io::duplex(1 << 16);
 
         let mock = tokio::spawn(async move {
             let mut mock = MockServer::new(server);
@@ -2833,7 +2833,7 @@ mod tests {
             assert_eq!(ack[0], blit_remote::C2S_ACK);
         });
 
-        let transport = Transport::Unix(client);
+        let transport = Transport::Duplex(client);
         let mut conn = AgentConn::connect(transport).await.unwrap();
 
         assert!(conn.has_pty(1));
@@ -2860,7 +2860,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_show_nonexistent() {
-        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (client, server) = tokio::io::duplex(1 << 16);
 
         let mock = tokio::spawn(async move {
             let mut mock = MockServer::new(server);
@@ -2869,7 +2869,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         });
 
-        let transport = Transport::Unix(client);
+        let transport = Transport::Duplex(client);
         let result = cmd_show(transport, 99, false, None, None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
@@ -2879,7 +2879,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_close() {
-        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (client, server) = tokio::io::duplex(1 << 16);
 
         let mock = tokio::spawn(async move {
             let mut mock = MockServer::new(server);
@@ -2894,7 +2894,7 @@ mod tests {
             mock.send_closed(2).await;
         });
 
-        let transport = Transport::Unix(client);
+        let transport = Transport::Duplex(client);
         let result = cmd_close(transport, 2).await;
         assert!(result.is_ok());
 
@@ -2903,7 +2903,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_close_nonexistent() {
-        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (client, server) = tokio::io::duplex(1 << 16);
 
         let mock = tokio::spawn(async move {
             let mut mock = MockServer::new(server);
@@ -2911,7 +2911,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         });
 
-        let transport = Transport::Unix(client);
+        let transport = Transport::Duplex(client);
         let result = cmd_close(transport, 99).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
@@ -2921,7 +2921,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_plain() {
-        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (client, server) = tokio::io::duplex(1 << 16);
 
         let mock = tokio::spawn(async move {
             let mut mock = MockServer::new(server);
@@ -2935,7 +2935,7 @@ mod tests {
             assert_eq!(&data[3..], b"hello");
         });
 
-        let transport = Transport::Unix(client);
+        let transport = Transport::Duplex(client);
         let result = cmd_send(transport, 1, "hello".to_string()).await;
         assert!(result.is_ok());
 
@@ -2944,7 +2944,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_escapes() {
-        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (client, server) = tokio::io::duplex(1 << 16);
 
         let mock = tokio::spawn(async move {
             let mut mock = MockServer::new(server);
@@ -2956,7 +2956,7 @@ mod tests {
             assert_eq!(&data[3..], b"line1\rline2\ttab");
         });
 
-        let transport = Transport::Unix(client);
+        let transport = Transport::Duplex(client);
         let result = cmd_send(transport, 1, "line1\\nline2\\ttab".to_string()).await;
         assert!(result.is_ok());
 
@@ -2965,7 +2965,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_hex_escape() {
-        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (client, server) = tokio::io::duplex(1 << 16);
 
         let mock = tokio::spawn(async move {
             let mut mock = MockServer::new(server);
@@ -2977,7 +2977,7 @@ mod tests {
             assert_eq!(&data[3..], &[0x1b, b'[', b'A']);
         });
 
-        let transport = Transport::Unix(client);
+        let transport = Transport::Duplex(client);
         let result = cmd_send(transport, 1, "\\x1b[A".to_string()).await;
         assert!(result.is_ok());
 
@@ -2986,7 +2986,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_terminal_click() {
-        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (client, server) = tokio::io::duplex(1 << 16);
 
         let mock = tokio::spawn(async move {
             let mut mock = MockServer::new(server);
@@ -3000,7 +3000,7 @@ mod tests {
             assert_eq!(up, vec![blit_remote::C2S_MOUSE, 1, 0, 1, 0, 10, 0, 5, 0]);
         });
 
-        let transport = Transport::Unix(client);
+        let transport = Transport::Duplex(client);
         let result = cmd_terminal_click(transport, 1, 10, 5, "left").await;
         assert!(result.is_ok());
 
@@ -3009,7 +3009,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_terminal_mouse_move() {
-        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (client, server) = tokio::io::duplex(1 << 16);
 
         let mock = tokio::spawn(async move {
             let mut mock = MockServer::new(server);
@@ -3020,7 +3020,7 @@ mod tests {
             assert_eq!(data, vec![blit_remote::C2S_MOUSE, 1, 0, 2, 34, 12, 0, 5, 0]);
         });
 
-        let transport = Transport::Unix(client);
+        let transport = Transport::Duplex(client);
         let result = cmd_mouse(transport, 1, "move", 12, 5, "right").await;
         assert!(result.is_ok());
 
@@ -3029,7 +3029,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_terminal_mouse_wheel() {
-        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (client, server) = tokio::io::duplex(1 << 16);
 
         let mock = tokio::spawn(async move {
             let mut mock = MockServer::new(server);
@@ -3040,7 +3040,7 @@ mod tests {
             assert_eq!(data, vec![blit_remote::C2S_MOUSE, 1, 0, 0, 64, 12, 0, 5, 0]);
         });
 
-        let transport = Transport::Unix(client);
+        let transport = Transport::Duplex(client);
         let result = cmd_mouse(transport, 1, "wheel-up", 12, 5, "left").await;
         assert!(result.is_ok());
 
@@ -3049,7 +3049,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_terminal_mouse_bad_button() {
-        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (client, server) = tokio::io::duplex(1 << 16);
 
         let mock = tokio::spawn(async move {
             let mut mock = MockServer::new(server);
@@ -3058,7 +3058,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         });
 
-        let transport = Transport::Unix(client);
+        let transport = Transport::Duplex(client);
         let result = cmd_mouse(transport, 1, "click", 12, 5, "nope").await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("unknown button"));
@@ -3068,7 +3068,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_history() {
-        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (client, server) = tokio::io::duplex(1 << 16);
 
         let mock = tokio::spawn(async move {
             let mut mock = MockServer::new(server);
@@ -3085,7 +3085,7 @@ mod tests {
                 .await;
         });
 
-        let transport = Transport::Unix(client);
+        let transport = Transport::Duplex(client);
         let mut conn = AgentConn::connect(transport).await.unwrap();
 
         assert!(conn.has_pty(1));
@@ -3116,7 +3116,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_to_exited_session() {
-        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (client, server) = tokio::io::duplex(1 << 16);
 
         let mock = tokio::spawn(async move {
             let mut mock = MockServer::new(server);
@@ -3125,7 +3125,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         });
 
-        let transport = Transport::Unix(client);
+        let transport = Transport::Duplex(client);
         let result = cmd_send(transport, 1, "hello".to_string()).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("has exited"));
@@ -3135,7 +3135,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_wait_already_exited() {
-        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (client, server) = tokio::io::duplex(1 << 16);
 
         let mock = tokio::spawn(async move {
             let mut mock = MockServer::new(server);
@@ -3145,7 +3145,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         });
 
-        let transport = Transport::Unix(client);
+        let transport = Transport::Duplex(client);
         let result = cmd_wait(transport, 1, 5, None).await;
         assert_eq!(result.unwrap(), 0);
 
@@ -3154,7 +3154,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_wait_exits_later() {
-        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (client, server) = tokio::io::duplex(1 << 16);
 
         let mock = tokio::spawn(async move {
             let mut mock = MockServer::new(server);
@@ -3165,7 +3165,7 @@ mod tests {
             mock.send_exited(1, 42).await;
         });
 
-        let transport = Transport::Unix(client);
+        let transport = Transport::Duplex(client);
         let result = cmd_wait(transport, 1, 5, None).await;
         assert_eq!(result.unwrap(), 42);
 
@@ -3174,7 +3174,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_wait_timeout() {
-        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (client, server) = tokio::io::duplex(1 << 16);
 
         let mock = tokio::spawn(async move {
             let mut mock = MockServer::new(server);
@@ -3183,7 +3183,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         });
 
-        let transport = Transport::Unix(client);
+        let transport = Transport::Duplex(client);
         let result = cmd_wait(transport, 1, 1, None).await;
         assert_eq!(result.unwrap(), 124);
 
@@ -3192,7 +3192,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_wait_not_found() {
-        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (client, server) = tokio::io::duplex(1 << 16);
 
         let mock = tokio::spawn(async move {
             let mut mock = MockServer::new(server);
@@ -3200,7 +3200,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         });
 
-        let transport = Transport::Unix(client);
+        let transport = Transport::Duplex(client);
         let result = cmd_wait(transport, 99, 5, None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
@@ -3210,7 +3210,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_wait_signal_exit() {
-        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (client, server) = tokio::io::duplex(1 << 16);
 
         let mock = tokio::spawn(async move {
             let mut mock = MockServer::new(server);
@@ -3221,7 +3221,7 @@ mod tests {
             mock.send_exited(1, -9).await;
         });
 
-        let transport = Transport::Unix(client);
+        let transport = Transport::Duplex(client);
         let result = cmd_wait(transport, 1, 5, None).await;
         assert_eq!(result.unwrap(), 137);
 
@@ -3234,7 +3234,7 @@ mod tests {
     /// began", but the grid scan matched whatever was already on screen.
     #[tokio::test]
     async fn wait_pattern_ignores_text_that_was_already_on_screen() {
-        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (client, server) = tokio::io::duplex(1 << 16);
 
         let mock = tokio::spawn(async move {
             let mut mock = MockServer::new(server);
@@ -3264,7 +3264,7 @@ mod tests {
             mock.answer_since(&drain, 100, "").await;
         });
 
-        let transport = Transport::Unix(client);
+        let transport = Transport::Duplex(client);
         let result = cmd_wait(transport, 1, 5, Some("BUILD (SUCCESS|FAILURE)".to_string())).await;
         // 7, not 0: the wait ended at the exit, not at the stale line.
         assert_eq!(result.unwrap(), 7);
@@ -3274,7 +3274,7 @@ mod tests {
 
     #[tokio::test]
     async fn wait_pattern_matches_output_produced_after_the_wait_began() {
-        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (client, server) = tokio::io::duplex(1 << 16);
 
         let mock = tokio::spawn(async move {
             let mut mock = MockServer::new(server);
@@ -3295,7 +3295,7 @@ mod tests {
                 .await;
         });
 
-        let transport = Transport::Unix(client);
+        let transport = Transport::Duplex(client);
         let result = cmd_wait(transport, 1, 5, Some("BUILD (SUCCESS|FAILURE)".to_string())).await;
         assert_eq!(result.unwrap(), 0);
 
@@ -3305,7 +3305,7 @@ mod tests {
     /// A line delivered in pieces still matches once, when it is complete.
     #[tokio::test]
     async fn wait_pattern_matches_a_line_split_across_reads() {
-        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (client, server) = tokio::io::duplex(1 << 16);
 
         let mock = tokio::spawn(async move {
             let mut mock = MockServer::new(server);
@@ -3328,7 +3328,7 @@ mod tests {
             mock.answer_since(&rest, 11, "URE\n").await;
         });
 
-        let transport = Transport::Unix(client);
+        let transport = Transport::Duplex(client);
         let result = cmd_wait(transport, 1, 5, Some("^BUILD FAILURE$".to_string())).await;
         assert_eq!(result.unwrap(), 0);
 
@@ -3373,7 +3373,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_wait_pattern_match() {
-        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (client, server) = tokio::io::duplex(1 << 16);
 
         let mock = tokio::spawn(async move {
             let mut mock = MockServer::new(server);
@@ -3391,7 +3391,7 @@ mod tests {
             assert_eq!(ack[0], blit_remote::C2S_ACK);
         });
 
-        let transport = Transport::Unix(client);
+        let transport = Transport::Duplex(client);
         let result = cmd_wait(transport, 1, 5, Some("BUILD (SUCCESS|FAILURE)".to_string())).await;
         assert_eq!(result.unwrap(), 0);
 
@@ -3400,7 +3400,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_wait_pattern_exits_before_match() {
-        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (client, server) = tokio::io::duplex(1 << 16);
 
         let mock = tokio::spawn(async move {
             let mut mock = MockServer::new(server);
@@ -3417,7 +3417,7 @@ mod tests {
             mock.send_exited(1, 1).await;
         });
 
-        let transport = Transport::Unix(client);
+        let transport = Transport::Duplex(client);
         let result = cmd_wait(transport, 1, 5, Some("BUILD (SUCCESS|FAILURE)".to_string())).await;
         assert_eq!(result.unwrap(), 1);
 
@@ -3426,7 +3426,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_wait_invalid_pattern() {
-        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (client, server) = tokio::io::duplex(1 << 16);
 
         let mock = tokio::spawn(async move {
             let mut mock = MockServer::new(server);
@@ -3435,7 +3435,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         });
 
-        let transport = Transport::Unix(client);
+        let transport = Transport::Duplex(client);
         let result = cmd_wait(transport, 1, 5, Some("[invalid".to_string())).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("invalid pattern"));
@@ -3445,7 +3445,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_wait_pattern_already_exited_no_match() {
-        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (client, server) = tokio::io::duplex(1 << 16);
 
         let mock = tokio::spawn(async move {
             let mut mock = MockServer::new(server);
@@ -3461,7 +3461,7 @@ mod tests {
             let _ack = mock.recv().await;
         });
 
-        let transport = Transport::Unix(client);
+        let transport = Transport::Duplex(client);
         let result = cmd_wait(transport, 1, 5, Some("BUILD (SUCCESS|FAILURE)".to_string())).await;
         assert_eq!(result.unwrap(), 0);
 
