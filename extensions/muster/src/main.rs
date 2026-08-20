@@ -187,6 +187,9 @@ struct Muster {
     /// Derived from `dir` once, because `~` expansion happens per env file and
     /// per probe and the answer never changes.
     home: String,
+    /// Environment-derived location for each named local server socket. This
+    /// becomes `${BLIT_SOCKET}` while expanding a stack instance.
+    local_sockets: LocalSockets,
     /// Watched directories. Root 0 is `dir`; pointer files in it name every
     /// external stack/include and every filtered Git worktree root.
     roots: Vec<Root>,
@@ -254,6 +257,27 @@ struct Instance {
     members: Vec<String>,
 }
 
+/// The stable named local-socket candidate that can be derived before the
+/// socket itself exists. Unlike XDG_RUNTIME_DIR, USER is not changed by the
+/// server's audio runtime.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct LocalSockets {
+    user: Option<String>,
+}
+
+impl LocalSockets {
+    fn from_environment(get: &impl Fn(&str) -> Option<String>) -> Self {
+        Self { user: get("USER") }
+    }
+
+    fn for_name(&self, name: &str) -> String {
+        if let Some(user) = &self.user {
+            return format!("/tmp/blit-{user}-{name}.sock");
+        }
+        format!("/tmp/blit-{name}.sock")
+    }
+}
+
 /// One watched directory and the mirror of its contents.
 struct Root {
     path: String,
@@ -283,7 +307,10 @@ fn run(mut client: Client, initial: &[Vec<u8>]) -> Result<(), String> {
     require(features, remote::env::FEATURE_ENV, "ENV")?;
 
     let adoptable = adoptable_tags(initial);
-    let dir = resolve_dir(&mut client)?;
+    let environment = read_environment(&mut client)?;
+    let get = |key: &str| environment_string(&environment, key);
+    let dir = resolve_dir_from(&get)?;
+    let local_sockets = LocalSockets::from_environment(&get);
     // The configuration directory is derived from HOME, so it carries it.
     let home = match dir.find("/.config/") {
         Some(at) => dir[..at].to_string(),
@@ -292,6 +319,7 @@ fn run(mut client: Client, initial: &[Vec<u8>]) -> Result<(), String> {
     let mut muster = Muster {
         dir,
         home,
+        local_sockets,
         roots: Vec::new(),
         unwatchable: BTreeMap::new(),
         rewatch_at_ms: 0,
@@ -398,9 +426,9 @@ fn require(features: u32, bit: u32, name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// `~` is not expanded by the FS family, so resolve the directory here — the
-/// same way `blit_config_dir()` does.
-fn resolve_dir(client: &mut Client) -> Result<String, String> {
+/// Read once: the extension has no ambient host environment, and both its
+/// configuration directory and named local-socket paths derive from this.
+fn read_environment(client: &mut Client) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, String> {
     let nonce = 1;
     client
         .send(&remote::env::msg_env_get(nonce))
@@ -410,12 +438,13 @@ fn resolve_dir(client: &mut Client) -> Result<String, String> {
         .map_err(|e| format!("env: {e:?}"))?
         .ok_or("connection closed reading the environment")?;
     let env = remote::env::parse_env(&reply).map_err(|e| format!("env: {e:?}"))?;
-    let get = |key: &str| {
-        env.entries
-            .get(key.as_bytes())
-            .and_then(|v| String::from_utf8(v.clone()).ok())
-    };
-    resolve_dir_from(get)
+    Ok(env.entries)
+}
+
+fn environment_string(environment: &BTreeMap<Vec<u8>, Vec<u8>>, key: &str) -> Option<String> {
+    environment
+        .get(key.as_bytes())
+        .and_then(|value| String::from_utf8(value.clone()).ok())
 }
 
 fn resolve_dir_from(get: impl Fn(&str) -> Option<String>) -> Result<String, String> {
@@ -1515,13 +1544,17 @@ impl Muster {
             (declared, templates)
         };
 
-        let vars = config::bind_vars(
+        let mut vars = config::bind_vars(
             instance_name,
             &instance.stack,
             &stack_dir,
             &declarations,
             &instance.vars,
         )?;
+        vars.insert(
+            "BLIT_SOCKET".into(),
+            serde_json::Value::String(self.local_sockets.for_name(instance_name)),
+        );
 
         let mut members = Vec::new();
         let mut units = Vec::new();
@@ -2595,9 +2628,12 @@ impl Muster {
 
     fn path_exists(&mut self, client: &mut Client, path: &str) -> bool {
         let nonce = self.next_nonce();
-        let Some(packet) =
-            remote::fs::msg_fs_read_paths(nonce, remote::fs::FS_READ_NO_CONTENT, 0, &[path])
-        else {
+        let Some(packet) = remote::fs::msg_fs_read_paths(
+            nonce,
+            remote::fs::FS_READ_NO_CONTENT | remote::fs::FS_READ_ANY_TYPE,
+            0,
+            &[path],
+        ) else {
             return false;
         };
         if client.send(&packet).is_err() {
@@ -2610,7 +2646,7 @@ impl Muster {
         };
         remote::fs::parse_fs_read_result(&reply)
             .and_then(|(_, _, records)| records.into_iter().next())
-            .is_some_and(|(status, _, _)| status == 0)
+            .is_some_and(|(status, _, _)| status == remote::fs::FS_FILE_OK)
     }
 
     fn tcp_connects(&mut self, client: &mut Client, target: &str) -> bool {
@@ -3030,6 +3066,18 @@ mod spec_tests {
         assert_eq!(
             resolve_dir_from(|key| vars.get(key).map(|value| (*value).to_owned())).unwrap(),
             "/srv/muster"
+        );
+    }
+
+    #[test]
+    fn local_socket_path_uses_blits_stable_user_fallback() {
+        let fallback = LocalSockets {
+            user: Some("alice".into()),
+        };
+        assert_eq!(fallback.for_name("epic"), "/tmp/blit-alice-epic.sock");
+        assert_eq!(
+            LocalSockets::default().for_name("epic"),
+            "/tmp/blit-epic.sock"
         );
     }
 

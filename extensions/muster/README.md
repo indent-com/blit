@@ -71,9 +71,9 @@ and `omit` resolves it. An included directory holds units only; its
 subdirectories are not stacks, because an instance names a stack by path.
 
 Inside a stack, `${STACK_DIR}` is the stack's own directory, and a relative
-`cwd` or `envFile` resolves against it. So a stack at `<repo>/.blit/muster/`
-reaches its checkout with `"cwd": "../.."`; the stack location is the checkout
-identity.
+`cwd` or `envFile` resolves against it. `${BLIT_SOCKET}` is the named local
+server socket for that instance. So a stack at `<repo>/.blit/muster/` reaches
+its checkout with `"cwd": "../.."`; the stack location is the checkout identity.
 
 **Discovery never leaves the configuration directory.** Muster does not look for
 `.blit/muster` in a repository, a cwd, or any ancestor of one: cloning a

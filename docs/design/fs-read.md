@@ -78,6 +78,13 @@ is the difference between artwork crossing a Wasm interpreter and not. A 30 KB
 icon had to be base64`d into a JSON string in there, and that cost more than
 everything else the panel did.
 
+`FS_READ_ANY_TYPE` (bit 2) is valid only together with `FS_READ_NO_CONTENT`.
+It changes the regular-file check into a pure existence check, so a directory,
+Unix socket, or other special filesystem node returns `OK`. Content-reading
+and ordinary path-resolution requests retain their regular-file semantics.
+Muster uses this for `readyWhen: {path}` so readiness can follow a service's
+Unix socket instead of an arbitrary delay.
+
 ### `FS_READ_FIRST`
 
 With `flags` bit 0 set, each group is answered by the first path in it that can

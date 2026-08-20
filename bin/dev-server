@@ -5,11 +5,15 @@ cd "$(dirname "$0")/.."
 : "${BLIT_SERVER_NAME:?BLIT_SERVER_NAME is required}"
 
 runtime="/run/user/$(id -u)"
-unset BLIT_SOCK TMPDIR
-if [[ -d "$runtime" ]]; then
-  export XDG_RUNTIME_DIR="$runtime"
+if [[ -n "${BLIT_DEV_SOCK:-}" ]]; then
+  export BLIT_SOCK="$BLIT_DEV_SOCK"
 else
-  unset XDG_RUNTIME_DIR
+  unset BLIT_SOCK TMPDIR
+  if [[ -d "$runtime" ]]; then
+    export XDG_RUNTIME_DIR="$runtime"
+  else
+    unset XDG_RUNTIME_DIR
+  fi
 fi
 
 exec ./target/profiling/blit server --verbose --name "$BLIT_SERVER_NAME"

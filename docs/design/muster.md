@@ -322,9 +322,12 @@ Only in a stack's templates, only in string values (never keys), only these:
 | `${NAME}`                 | the parameter's value                     |
 | `${NAME+N}` / `${NAME-N}` | integer offset; `NAME` must be an integer |
 
-`${INSTANCE}`, `${STACK}` and `${STACK_DIR}` are always defined — the last is
-the stack's own directory, which is what lets a repository-resident stack reach
-its checkout without the instance restating a path it already named. Unknown
+`${INSTANCE}`, `${STACK}`, `${STACK_DIR}` and `${BLIT_SOCKET}` are always
+defined. `BLIT_SOCKET` is the stable per-user `/tmp` candidate for the
+instance's named local server socket; the normal local-target resolver finds
+that candidate once it exists. The stack directory lets a repository-resident
+stack reach its checkout without the instance restating a path it already
+named. Unknown
 name, unclosed `${`, or
 an offset on a non-integer fails **that instance** — naming file, JSON pointer
 and variable — leaving other instances running. No empty-string fallback: a
@@ -405,6 +408,7 @@ the login user's runtime directory before normal named-socket resolution runs:
   "//": [
     "blit --on local:${INSTANCE} reaches this exact development server.",
     "The server's socket lock replaces an older attempt and removes stale sockets.",
+    "Readiness follows the named server's actual Unix socket.",
     "restartOnSuccess stays false: the flock-based replacement exits 0 on purpose",
     "and retrying that loops forever.",
     "timeoutStop 15s so AudioPipeline::drop can stop media processes in order."
@@ -412,8 +416,11 @@ the login user's runtime directory before normal named-socket resolution runs:
   "description": "blit server (${INSTANCE})",
   "requires": ["build"],
   "command": ["direnv", "exec", "${STACK_DIR}", "dev-server"],
-  "env": { "BLIT_SERVER_NAME": "${INSTANCE}" },
-  "readyWhen": { "delay": "1s" },
+  "env": {
+    "BLIT_SERVER_NAME": "${INSTANCE}",
+    "BLIT_DEV_SOCK": "${BLIT_SOCKET}"
+  },
+  "readyWhen": { "path": "${BLIT_SOCKET}" },
   "restartDelay": "2s",
   "startLimit": 5,
   "keep": 3,

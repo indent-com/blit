@@ -14802,7 +14802,7 @@ const FS_INDEX_MAX_BYTES: usize = 48 * 1024 * 1024;
 /// non-repo subtree) falls back to an ignore-free walk: an empty index
 /// would otherwise read as "no files here" and never consult the server.
 /// Classify one path for `FS_READ` without reading it.
-fn stat_one_for_fs_read(path: &str, per_file: u64) -> u8 {
+fn stat_one_for_fs_read(path: &str, per_file: u64, any_type: bool) -> u8 {
     use blit_remote::fs::{
         FS_FILE_NOT_FOUND, FS_FILE_OK, FS_FILE_OTHER, FS_FILE_TOO_LARGE, FS_FILE_UNREADABLE,
     };
@@ -14812,7 +14812,7 @@ fn stat_one_for_fs_read(path: &str, per_file: u64) -> u8 {
             std::io::ErrorKind::PermissionDenied => FS_FILE_UNREADABLE,
             _ => FS_FILE_OTHER,
         },
-        Ok(meta) if !meta.is_file() => FS_FILE_UNREADABLE,
+        Ok(meta) if !meta.is_file() && !any_type => FS_FILE_UNREADABLE,
         Ok(meta) if meta.len() > per_file => FS_FILE_TOO_LARGE,
         Ok(_) => FS_FILE_OK,
     }
@@ -15222,11 +15222,13 @@ async fn handle_fs_message_with_jobs<O: OutboxSend>(
             // like every other walk in this family.
             if let Some((nonce, flags, max_bytes, groups)) = parse_fs_read(data) {
                 use blit_remote::fs::{
-                    FS_FILE_NOT_FOUND, FS_FILE_OK, FS_FILE_OTHER, FS_READ_DEFAULT_BYTES,
-                    FS_READ_FIRST, FS_READ_FLAGS_KNOWN, FS_READ_MAX_TOTAL_BYTES,
-                    FS_READ_NO_CONTENT, msg_fs_read_result,
+                    FS_FILE_NOT_FOUND, FS_FILE_OK, FS_FILE_OTHER, FS_READ_ANY_TYPE,
+                    FS_READ_DEFAULT_BYTES, FS_READ_FIRST, FS_READ_FLAGS_KNOWN,
+                    FS_READ_MAX_TOTAL_BYTES, FS_READ_NO_CONTENT, msg_fs_read_result,
                 };
-                if flags & !FS_READ_FLAGS_KNOWN != 0 {
+                if flags & !FS_READ_FLAGS_KNOWN != 0
+                    || flags & FS_READ_ANY_TYPE != 0 && flags & FS_READ_NO_CONTENT == 0
+                {
                     let _ = out.send(msg_fs_read_result(nonce, FS_DONE_INVALID, &[]));
                     return;
                 }
@@ -15247,6 +15249,7 @@ async fn handle_fs_message_with_jobs<O: OutboxSend>(
                     });
                     let first_only = flags & FS_READ_FIRST != 0;
                     let no_content = flags & FS_READ_NO_CONTENT != 0;
+                    let any_type = flags & FS_READ_ANY_TYPE != 0;
                     let mut left = FS_READ_MAX_TOTAL_BYTES;
                     let mut records: Vec<(u8, String, Vec<u8>)> = Vec::new();
                     for group in groups {
@@ -15265,7 +15268,7 @@ async fn handle_fs_message_with_jobs<O: OutboxSend>(
                                 continue;
                             };
                             let (status, body) = if no_content {
-                                (stat_one_for_fs_read(&path, per_file), Vec::new())
+                                (stat_one_for_fs_read(&path, per_file, any_type), Vec::new())
                             } else {
                                 read_one_for_fs_read(&path, per_file, left)
                             };
@@ -23427,6 +23430,25 @@ mod tests {
             "a full-size target must not inherit the thumbnail's refusal"
         );
         assert_eq!(sub.vulkan_refused_extent, Some((684, 1064)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_read_can_probe_a_unix_socket_without_treating_it_as_a_file() {
+        use blit_remote::fs::{FS_FILE_OK, FS_FILE_UNREADABLE};
+        use std::os::unix::net::UnixListener;
+
+        let path = std::env::temp_dir().join(format!("blit-fs-read-socket-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let path = path.to_string_lossy();
+        assert_eq!(
+            stat_one_for_fs_read(&path, u64::MAX, false),
+            FS_FILE_UNREADABLE
+        );
+        assert_eq!(stat_one_for_fs_read(&path, u64::MAX, true), FS_FILE_OK);
+        drop(listener);
+        let _ = std::fs::remove_file(path.as_ref());
     }
 
     /// The index walk (docs/design/fs-search.md) prunes `.git`, honors

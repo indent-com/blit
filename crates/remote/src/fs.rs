@@ -70,7 +70,8 @@ pub const C2S_FS_UPLOAD_CANCEL: u8 = 0x4C;
 ///
 /// `max_bytes` is the per-file ceiling, zero meaning [`FS_READ_DEFAULT_BYTES`];
 /// a larger file is reported rather than read, so a caller drawing 2em tiles
-/// does not have a theme's megabyte SVG pushed at it. `flags` is `FS_READ_FIRST`.
+/// does not have a theme's megabyte SVG pushed at it. `flags` is a combination
+/// of `FS_READ_FIRST`, `FS_READ_NO_CONTENT`, and `FS_READ_ANY_TYPE`.
 ///
 /// Paths are grouped, and a group is one question: with `FS_READ_FIRST` each
 /// group is answered by its own first readable path, so one message can resolve
@@ -266,9 +267,13 @@ pub const FS_READ_FIRST: u8 = 1 << 0;
 /// with an empty body, and `max_bytes` still applies, so "exists but too big to
 /// be what I am looking for" is still answered as such.
 pub const FS_READ_NO_CONTENT: u8 = 1 << 1;
+/// With `FS_READ_NO_CONTENT`, accept any existing filesystem node rather than
+/// requiring a regular file. This is the existence question used by service
+/// readiness probes for Unix sockets and other special nodes.
+pub const FS_READ_ANY_TYPE: u8 = 1 << 2;
 
 /// The flags `FS_READ` understands; anything else answers `INVALID`.
-pub const FS_READ_FLAGS_KNOWN: u8 = FS_READ_FIRST | FS_READ_NO_CONTENT;
+pub const FS_READ_FLAGS_KNOWN: u8 = FS_READ_FIRST | FS_READ_NO_CONTENT | FS_READ_ANY_TYPE;
 
 /// Paths one `FS_READ` may name. Generous because the shape it replaces is a
 /// batch: a panel asking for a screenful of artwork, a supervisor reading every
@@ -3077,6 +3082,11 @@ mod tests {
                 vec![paths.iter().map(|p| Some((*p).to_string())).collect()]
             ))
         );
+
+        let flags = FS_READ_NO_CONTENT | FS_READ_ANY_TYPE;
+        let wire = msg_fs_read_paths(8, flags, 0, &["/run/example.sock"]).expect("builds");
+        assert_eq!(parse_fs_read(&wire).expect("parses").1, flags);
+        assert_eq!(FS_READ_ANY_TYPE & !FS_READ_FLAGS_KNOWN, 0);
     }
 
     /// A path this family cannot name must not cost the frame its reply: the
