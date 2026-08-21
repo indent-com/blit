@@ -129,8 +129,13 @@ export function StatusBar(props: {
   gatewayStatus: "connecting" | "connected" | "unavailable";
   status: ConnectionStatus;
   /** Opens the remotes overlay; absent when the shell has no remotes to
-   *  manage (an embedded share), which hides the chip's click affordance. */
+   *  configure (an embedded share). */
   onRemotes?: () => void;
+  /** Embedded shells have a fixed connection list rather than a remotes
+   *  dialog. These actions make the same status chip useful there: its
+   *  popover opens a connected server's management pane or retries it. */
+  onManageConnection?: (connectionId: string) => void;
+  onReconnectConnection?: (connectionId: string) => void;
   metrics: Metrics;
   palette: TerminalPalette;
   fontSize: number;
@@ -265,8 +270,10 @@ export function StatusBar(props: {
 
   const [compact, setCompact] = createSignal(false);
   const [menuOpen, setMenuOpen] = createSignal(false);
+  const [connectionOpen, setConnectionOpen] = createSignal(false);
   let identityEl: HTMLSpanElement | undefined;
   let clusterEl: HTMLSpanElement | undefined;
+  let connectionEl: HTMLSpanElement | undefined;
   // Last width the cluster had while expanded — what unfolding would cost.
   let expandedIcons: number | null = null;
   // Roughly a dozen characters of title: below that the identity is an
@@ -301,17 +308,23 @@ export function StatusBar(props: {
       onCleanup(() => ro.disconnect());
     }
     const onPointerDown = (e: PointerEvent) => {
-      if (!menuOpen()) return;
-      if (clusterEl && !clusterEl.contains(e.target as Node))
+      if (menuOpen() && clusterEl && !clusterEl.contains(e.target as Node))
         setMenuOpen(false);
+      if (
+        connectionOpen() &&
+        connectionEl &&
+        !connectionEl.contains(e.target as Node)
+      )
+        setConnectionOpen(false);
     };
     const onKeyDown = (e: KeyboardEvent) => {
-      if (!menuOpen() || e.key !== "Escape") return;
+      if ((!menuOpen() && !connectionOpen()) || e.key !== "Escape") return;
       // Swallowed: Escape belongs to the menu while it is up, not to the
       // terminal underneath (which would receive it as an ESC byte).
       e.preventDefault();
       e.stopPropagation();
       setMenuOpen(false);
+      setConnectionOpen(false);
     };
     document.addEventListener("pointerdown", onPointerDown, true);
     document.addEventListener("keydown", onKeyDown, true);
@@ -336,7 +349,23 @@ export function StatusBar(props: {
   };
 
   // Worst status across all connections (for aria)
-  const worstStatus = () => props.status;
+  const worstStatus = () => connectionStatusLabel(props.status);
+  const connectionActionable = () =>
+    !!(
+      props.onRemotes ||
+      props.onManageConnection ||
+      props.onReconnectConnection
+    );
+
+  const activateConnectionStatus = () => {
+    if (props.onRemotes) {
+      props.onRemotes();
+      return;
+    }
+    if (!connectionActionable()) return;
+    setMenuOpen(false);
+    setConnectionOpen((open) => !open);
+  };
 
   return (
     <>
@@ -705,74 +734,99 @@ export function StatusBar(props: {
         </button>
       </Show>
 
-      {/* Connection status indicator — opens remotes overlay when the
-          shell has one to open */}
-      <button
-        role="status"
-        aria-label={worstStatus()}
-        onClick={props.onRemotes}
-        disabled={!props.onRemotes}
+      {/* App shells open their remotes dialog here. Embedded shells have no
+          remotes config, so the same control opens a small per-connection
+          status/action popover instead. */}
+      <span
+        ref={connectionEl}
         style={{
-          ...iconButtonStyle(),
-          display: "flex",
-          "align-items": "center",
-          gap: "3px",
-          cursor: props.onRemotes ? "pointer" : "default",
+          position: "relative",
+          display: "inline-flex",
+          "flex-shrink": 0,
         }}
       >
-        <Show when={connCounts().ok > 0}>
-          <ConnectionDot
-            color={theme().success}
-            count={connCounts().ok}
-            total={props.connections.length}
-            size={dotSize()}
-          />
-        </Show>
-        <Show when={connCounts().busy > 0}>
-          <ConnectionDot
-            color={theme().warning}
-            count={connCounts().busy}
-            total={props.connections.length}
-            size={dotSize()}
-          />
-        </Show>
-        <Show when={connCounts().bad > 0}>
-          <ConnectionDot
-            color={theme().error}
-            count={connCounts().bad}
-            total={props.connections.length}
-            size={dotSize()}
-          />
-        </Show>
-        {/* Gateway dot — shown when no blit connections exist and the
-            gateway itself is still connecting or unreachable. */}
-        <Show
-          when={
-            props.connections.length === 0 &&
-            props.gatewayStatus === "connecting"
-          }
+        <button
+          role="status"
+          aria-label={worstStatus()}
+          aria-haspopup={!props.onRemotes ? "dialog" : undefined}
+          aria-expanded={!props.onRemotes ? connectionOpen() : undefined}
+          onClick={activateConnectionStatus}
+          disabled={!connectionActionable()}
+          style={{
+            ...iconButtonStyle(),
+            display: "flex",
+            "align-items": "center",
+            gap: "3px",
+            cursor: connectionActionable() ? "pointer" : "default",
+          }}
         >
-          <ConnectionDot
-            color={theme().warning}
-            count={1}
-            total={1}
-            size={dotSize()}
+          <Show when={connCounts().ok > 0}>
+            <ConnectionDot
+              color={theme().success}
+              count={connCounts().ok}
+              total={props.connections.length}
+              size={dotSize()}
+            />
+          </Show>
+          <Show when={connCounts().busy > 0}>
+            <ConnectionDot
+              color={theme().warning}
+              count={connCounts().busy}
+              total={props.connections.length}
+              size={dotSize()}
+            />
+          </Show>
+          <Show when={connCounts().bad > 0}>
+            <ConnectionDot
+              color={theme().error}
+              count={connCounts().bad}
+              total={props.connections.length}
+              size={dotSize()}
+            />
+          </Show>
+          {/* Gateway dot — shown when no blit connections exist and the
+              gateway itself is still connecting or unreachable. */}
+          <Show
+            when={
+              props.connections.length === 0 &&
+              props.gatewayStatus === "connecting"
+            }
+          >
+            <ConnectionDot
+              color={theme().warning}
+              count={1}
+              total={1}
+              size={dotSize()}
+            />
+          </Show>
+          <Show
+            when={
+              props.connections.length === 0 &&
+              props.gatewayStatus === "unavailable"
+            }
+          >
+            <ConnectionDot
+              color={theme().error}
+              count={1}
+              total={1}
+              size={dotSize()}
+            />
+          </Show>
+        </button>
+
+        <Show when={connectionOpen() && !props.onRemotes}>
+          <ConnectionStatusPopover
+            connections={props.connections}
+            labels={props.connectionLabels}
+            theme={theme()}
+            scale={scale()}
+            dark={props.palette.dark}
+            onManage={props.onManageConnection}
+            onReconnect={props.onReconnectConnection}
+            onClose={() => setConnectionOpen(false)}
           />
         </Show>
-        <Show
-          when={
-            props.connections.length === 0 &&
-            props.gatewayStatus === "unavailable"
-          }
-        >
-          <ConnectionDot
-            color={theme().error}
-            count={1}
-            total={1}
-            size={dotSize()}
-          />
-        </Show>
-      </button>
+      </span>
 
       <Show when={props.debug}>
         <DebugPanel
@@ -786,6 +840,205 @@ export function StatusBar(props: {
         />
       </Show>
     </>
+  );
+}
+
+function connectionStatusLabel(status: ConnectionStatus): string {
+  switch (status) {
+    case "connected":
+      return t("status.connected");
+    case "connecting":
+      return t("status.connecting");
+    case "authenticating":
+      return t("status.authenticating");
+    case "error":
+      return t("status.connectionFailed");
+    case "disconnected":
+    case "closed":
+      return t("status.disconnected");
+  }
+}
+
+function connectionStatusText(connection: BlitConnectionSnapshot): string {
+  if (connection.status === "disconnected" && connection.retryCount > 0)
+    return t("status.connectionFailed");
+  return connectionStatusLabel(connection.status);
+}
+
+function connectionStatusColor(
+  connection: BlitConnectionSnapshot,
+  theme: Theme,
+): string {
+  if (connection.status === "connected") return theme.success;
+  if (
+    connection.status === "connecting" ||
+    connection.status === "authenticating"
+  )
+    return theme.warning;
+  return theme.error;
+}
+
+function ConnectionStatusPopover(props: {
+  connections: readonly BlitConnectionSnapshot[];
+  labels?: Map<string, string>;
+  theme: Theme;
+  scale: UIScale;
+  dark: boolean;
+  onManage?: (connectionId: string) => void;
+  onReconnect?: (connectionId: string) => void;
+  onClose: () => void;
+}) {
+  const actionStyle = (): JSX.CSSProperties => ({
+    ...ui.btn,
+    border: `1px solid ${props.theme.subtleBorder}`,
+    "background-color": props.theme.inputBg,
+    color: props.theme.fg,
+    padding: `${props.scale.controlY + 1}px ${props.scale.controlX}px`,
+    "font-family": "inherit",
+    "font-size": `${props.scale.sm}px`,
+    "white-space": "nowrap",
+    opacity: 1,
+  });
+
+  return (
+    <div
+      role="dialog"
+      aria-label={t("statusbar.connectionStatus")}
+      data-blit-connection-status-popover=""
+      style={{
+        position: "absolute",
+        bottom: "100%",
+        right: 0,
+        "margin-bottom": `${props.scale.tightGap}px`,
+        width: "min(24em, calc(100vw - 2em))",
+        overflow: "hidden",
+        "background-color": props.theme.solidPanelBg,
+        color: props.theme.fg,
+        border: `1px solid ${props.theme.border}`,
+        "box-shadow": props.dark
+          ? "0 8px 24px rgba(0,0,0,0.45)"
+          : "0 8px 24px rgba(0,0,0,0.15)",
+        "font-size": `${props.scale.md}px`,
+        "z-index": z.statusMenu,
+      }}
+    >
+      <For each={props.connections}>
+        {(connection, index) => (
+          <div
+            data-blit-connection-status={connection.status}
+            style={{
+              display: "grid",
+              gap: `${props.scale.controlY + 1}px`,
+              padding: `${props.scale.controlX}px`,
+              "border-top":
+                index() === 0
+                  ? "none"
+                  : `1px solid ${props.theme.subtleBorder}`,
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                "align-items": "center",
+                gap: `${props.scale.tightGap}px`,
+                "min-width": 0,
+              }}
+            >
+              <span
+                aria-hidden="true"
+                style={{
+                  width: `${Math.max(7, props.scale.xs * 0.55)}px`,
+                  height: `${Math.max(7, props.scale.xs * 0.55)}px`,
+                  "border-radius": "50%",
+                  "background-color": connectionStatusColor(
+                    connection,
+                    props.theme,
+                  ),
+                  "flex-shrink": 0,
+                }}
+              />
+              <strong
+                style={{
+                  overflow: "hidden",
+                  "text-overflow": "ellipsis",
+                  "white-space": "nowrap",
+                }}
+              >
+                {props.labels?.get(connection.id) ?? connection.id}
+              </strong>
+              <span
+                style={{
+                  "margin-left": "auto",
+                  color: connectionStatusColor(connection, props.theme),
+                  "font-size": `${props.scale.sm}px`,
+                  "white-space": "nowrap",
+                }}
+              >
+                {connectionStatusText(connection)}
+              </span>
+            </div>
+
+            <Show when={connection.error && connection.error !== "auth"}>
+              <div
+                style={{
+                  color: props.theme.dimFg,
+                  "font-size": `${props.scale.sm}px`,
+                  "line-height": 1.35,
+                  "overflow-wrap": "anywhere",
+                }}
+              >
+                {connection.error}
+              </div>
+            </Show>
+
+            <Show when={connection.retryCount > 0}>
+              <div
+                style={{
+                  color: props.theme.dimFg,
+                  "font-size": `${props.scale.xs}px`,
+                }}
+              >
+                {connection.retryCount === 1
+                  ? t("disconnected.retryOne")
+                  : tp("disconnected.retryMany", {
+                      count: connection.retryCount,
+                    })}
+              </div>
+            </Show>
+
+            <Show
+              when={connection.status === "connected" && props.onManage}
+              fallback={
+                <Show
+                  when={connection.status !== "connected" && props.onReconnect}
+                >
+                  <div>
+                    <button
+                      onClick={() => props.onReconnect?.(connection.id)}
+                      style={actionStyle()}
+                    >
+                      {t("disconnected.reconnectNow")}
+                    </button>
+                  </div>
+                </Show>
+              }
+            >
+              <div>
+                <button
+                  onClick={() => {
+                    props.onClose();
+                    props.onManage?.(connection.id);
+                  }}
+                  style={actionStyle()}
+                >
+                  {t("statusbar.manageServer")}
+                </button>
+              </div>
+            </Show>
+          </div>
+        )}
+      </For>
+    </div>
   );
 }
 

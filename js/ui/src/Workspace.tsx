@@ -5516,6 +5516,16 @@ function WorkspaceScreen(props: {
                 ? () => toggleOverlay("remotes")
                 : undefined
             }
+            onManageConnection={
+              shellCapabilities().remotes
+                ? undefined
+                : (connectionId) => openTile(manageAssignment(connectionId))
+            }
+            onReconnectConnection={
+              shellCapabilities().remotes
+                ? undefined
+                : (connectionId) => workspace.reconnectConnection(connectionId)
+            }
             metrics={metrics()}
             palette={palette()}
             fontSize={fontSize()}
