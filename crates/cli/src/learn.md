@@ -79,6 +79,27 @@ continue from if it truncated.
 Both `show` and line-based `history` accept `--cols`/`--rows` to resize before
 reading, and `--ansi` to preserve colors.
 
+## Server event journal
+
+The binary event journal is disabled by event type rather than globally. Its
+default 1 MiB ring retains low-throughput lifecycle events; enable hot paths
+only for targeted captures.
+
+```bash
+blit events config
+blit events set --events 'default,+frame.*,+pty.*' --size 8388608
+blit events dump > snapshot.events              # one binary snapshot
+blit events tail > live.events                  # history, then follow
+blit events tail --from-now -o live.events      # follow new events locally
+ID=$(blit events record start /var/log/blit.events) # detached server writer
+blit events record list
+blit events record stop "$ID"
+```
+
+`dump` and `tail` write binary `BLITEVT1` data to stdout unless `--output`
+names a local path. `record` paths are on the server and continue after the
+starting client disconnects.
+
 ## Commands in a live shell
 
 A shell that emits OSC 133 records each command (see

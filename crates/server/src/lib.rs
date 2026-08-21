@@ -12,6 +12,7 @@ use blit_remote::desktop::{
     msg_notification_update, msg_tray_menu, msg_tray_snapshot, msg_tray_update,
     parse_desktop_subscribe, parse_notification_event, parse_tray_event,
 };
+use blit_remote::events::EventType;
 #[cfg(target_os = "linux")]
 use blit_remote::media::{
     ACTIVE_CAMERA, ACTIVE_MICROPHONE, ACTIVE_SCREENCAST, C2S_MEDIA_CONTROL, C2S_MEDIA_DATA,
@@ -78,6 +79,7 @@ mod capacity_diagnostics;
 mod channel;
 #[cfg(target_os = "linux")]
 mod desktop_bus;
+mod events;
 mod extension;
 pub mod extension_catalog;
 mod extension_jobs;
@@ -123,6 +125,31 @@ pub use surface_encoder::SurfaceH264EncoderPreference;
 pub use surface_encoder::{SurfaceBandwidth, SurfaceEncoding, SurfaceSpeed};
 
 type PtyFds = Arc<std::sync::RwLock<FxHashMap<u16, PtyWriteTarget>>>;
+
+/// Conditional event emission. `$payload` is evaluated only while the event's
+/// activation bit is set, which is the invariant that keeps full byte capture
+/// free when operators leave the low-throughput default enabled.
+macro_rules! blit_event {
+    ($log:expr, $kind:expr) => {{
+        let log = &$log;
+        let kind = $kind;
+        if log.enabled(kind) {
+            log.record(kind, 0, &[]);
+        }
+    }};
+    ($log:expr, $kind:expr, $payload:expr) => {{
+        let log = &$log;
+        let kind = $kind;
+        if log.enabled(kind) {
+            let payload = $payload;
+            log.record(kind, 0, &payload);
+        }
+    }};
+}
+
+tokio::task_local! {
+    static EVENT_WRITE_CONTEXT: (Arc<events::EventLog>, Arc<AtomicU64>);
+}
 
 /// Command-line overrides for extension and channel deployment policy.
 ///
@@ -1584,6 +1611,45 @@ async fn write_frame_counted_with_timeout(
 ) -> Result<(), FrameWriteError> {
     write_frame_with_timeout(writer, payload, no_progress_timeout).await?;
     outbound_bytes.fetch_add((payload.len() as u64).saturating_add(4), Ordering::Relaxed);
+    // A live event-record envelope is deliberately excluded: recording its
+    // delivery would create another record to deliver forever. Other event
+    // control/results, and physical fragments of large packets, stay visible.
+    let recursive_event_record = payload.first() == Some(&blit_remote::events::EVENTS)
+        && payload.get(2) == Some(&blit_remote::events::EVENTS_RECORD);
+    if !recursive_event_record {
+        let _ = EVENT_WRITE_CONTEXT.try_with(|(log, client_id)| {
+            let client_id = client_id.load(Ordering::Relaxed);
+            blit_event!(
+                log,
+                EventType::FrameWrite,
+                events::payload_frame(client_id, payload,)
+            );
+            blit_event!(log, EventType::MessageWrite, {
+                let mut summary = events::payload_client(client_id);
+                summary.push(payload.first().copied().unwrap_or(0));
+                summary.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                summary
+            });
+            blit_event!(log, EventType::OutboxQueue, {
+                let mut summary = events::payload_client(client_id);
+                summary.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                summary
+            });
+            match payload.first().copied() {
+                Some(blit_remote::S2C_SURFACE_FRAME) => blit_event!(
+                    log,
+                    EventType::SurfaceFrame,
+                    events::payload_frame(client_id, payload)
+                ),
+                Some(blit_remote::S2C_AUDIO_FRAME) => blit_event!(
+                    log,
+                    EventType::AudioFrame,
+                    events::payload_frame(client_id, payload)
+                ),
+                _ => {}
+            }
+        });
+    }
     Ok(())
 }
 
@@ -8148,6 +8214,7 @@ impl Session {
 
 struct AppStateInner {
     config: Config,
+    events: Arc<events::EventLog>,
     #[cfg(any(unix, windows))]
     process_server: process::Server,
     /// Opaque identifier shared by every connection to this server process.
@@ -8226,6 +8293,7 @@ fn new_boot_generation() -> u64 {
 }
 
 fn nudge_delivery(state: &AppState) {
+    blit_event!(state.events, EventType::TickNudge);
     state.delivery_notify.notify_one();
 }
 
@@ -9402,6 +9470,11 @@ async fn evict_exited(state: &AppState) {
         // Already exited by construction, so the fd and the child are gone;
         // this is only dropping the retained terminal state.
         drop(pty);
+        blit_event!(
+            state.events,
+            EventType::PtyRemove,
+            id.to_le_bytes().to_vec()
+        );
         state.pty_fds.write().unwrap().remove(&id);
         for client in sess.clients.values_mut() {
             unsubscribe_client_from(client, id);
@@ -9435,17 +9508,27 @@ fn stop_grace() -> Duration {
 async fn enforce_deadlines(state: &AppState) {
     let now = Instant::now();
     let mut sess = state.session.lock().await;
-    for pty in sess.ptys.values_mut() {
+    for (&pty_id, pty) in &mut sess.ptys {
         if pty.exited {
             continue;
         }
         if pty.stop_deadline.is_some_and(|d| now >= d) {
             pty.stop_deadline = None;
+            blit_event!(state.events, EventType::Deadline, {
+                let mut payload = pty_id.to_le_bytes().to_vec();
+                payload.push(2);
+                payload
+            });
             pty::kill_pty(&pty.handle, SIGKILL, true);
         } else if pty.deadline.is_some_and(|d| now >= d) {
             pty.deadline = None;
             pty.exit_reason = blit_remote::EXIT_REASON_DEADLINE;
             pty.stop_deadline = Some(now + stop_grace());
+            blit_event!(state.events, EventType::Deadline, {
+                let mut payload = pty_id.to_le_bytes().to_vec();
+                payload.push(1);
+                payload
+            });
             pty::kill_pty(&pty.handle, SIGTERM, true);
         }
     }
@@ -9456,6 +9539,8 @@ async fn enforce_deadlines(state: &AppState) {
 /// Ordered reader EOF normally finalizes first. A descendant can keep the slave open, so the
 /// deadline forces one unpaced drain before cleanup instead of waiting forever.
 async fn supervise(state: &AppState) {
+    let pass_started = Instant::now();
+    blit_event!(state.events, EventType::Supervisor, vec![1]);
     let now = Instant::now();
     let fallback_due = {
         let mut sess = state.session.lock().await;
@@ -9674,6 +9759,13 @@ async fn supervise(state: &AppState) {
         }
     }
     evict_exited(state).await;
+    blit_event!(state.events, EventType::Supervisor, {
+        let mut payload = vec![2];
+        payload.extend_from_slice(
+            &(pass_started.elapsed().as_nanos().min(u64::MAX as u128) as u64).to_le_bytes(),
+        );
+        payload
+    });
 }
 
 /// Run a terminal's exit path.
@@ -9698,6 +9790,12 @@ async fn cleanup_pty_internal(pty_id: u16, generation: Option<u64>, state: &AppS
         pty.stop_deadline = None;
         pty::close_pty(&pty.handle);
         pty.exit_status = pty::collect_exit_status(&pty.handle);
+        blit_event!(state.events, EventType::PtyExit, {
+            let mut payload = pty_id.to_le_bytes().to_vec();
+            payload.extend_from_slice(&pty.exit_status.to_le_bytes());
+            payload.push(pty.exit_reason);
+            payload
+        });
         pty.mark_dirty();
         // A command still running when the shell dies never gets its `D`
         // marker; closing it here is what stops a waiter hanging until its
@@ -9814,6 +9912,12 @@ pub async fn run(config: Config) {
     // environment now, before any feature mask or service is constructed.
     let _ = ensure_deployment_settings();
     kv::configure_server_name(&config.name);
+    let (event_log, startup_event_file) = events::EventLog::from_env();
+    blit_event!(event_log, EventType::ServerStart, {
+        let mut payload = events::payload_name(env!("CARGO_PKG_VERSION"));
+        payload.extend_from_slice(&events::payload_name(config.name.as_str()));
+        payload
+    });
     #[cfg(any(unix, windows))]
     let process_server = process::Server::new(config.verbose, config.processes);
     let boot_generation = new_boot_generation();
@@ -9836,6 +9940,7 @@ pub async fn run(config: Config) {
         extension::ExtensionService::from_env(config.allow_persistent_extensions, &config.name);
     let state: AppState = Arc::new(AppStateInner {
         config,
+        events: event_log.clone(),
         #[cfg(any(unix, windows))]
         process_server,
         boot_generation,
@@ -9849,6 +9954,19 @@ pub async fn run(config: Config) {
         extension_jobs: extension_jobs::GlobalTracker::from_env(),
         extensions: extensions.clone(),
     });
+    if let Some(file) = startup_event_file {
+        match event_log.start_file_stream(&file.path, file.flags).await {
+            Ok(stream_id) => blit_event!(event_log, EventType::StreamStart, {
+                let mut payload = stream_id.to_le_bytes().to_vec();
+                payload.extend_from_slice(&events::payload_name(&file.path));
+                payload
+            }),
+            Err(error) => {
+                eprintln!("blit-server: event file stream: {error}");
+                blit_event!(event_log, EventType::Error, events::payload_name(&error));
+            }
+        }
+    }
     extensions.restore(state.clone()).await;
 
     // Start the compositor eagerly so it is ready before any client
@@ -9876,6 +9994,11 @@ pub async fn run(config: Config) {
         .filter(|&v| v > 0)
         .map(Duration::from_micros);
     tokio::spawn(async move {
+        blit_event!(
+            delivery_state.events,
+            EventType::TaskStart,
+            events::payload_name("delivery")
+        );
         let mut next_deadline: Option<Instant> = None;
         let mut last_tick: Option<Instant> = None;
         loop {
@@ -9901,6 +10024,11 @@ pub async fn run(config: Config) {
 
     let supervisor_state = state.clone();
     tokio::spawn(async move {
+        blit_event!(
+            supervisor_state.events,
+            EventType::TaskStart,
+            events::payload_name("supervisor")
+        );
         supervisor_loop(supervisor_state).await;
     });
 
@@ -9968,6 +10096,8 @@ pub async fn run(config: Config) {
         state.extensions.shutdown().await;
         state.process_server.shutdown().await;
         state.connections.wait_empty().await;
+        blit_event!(state.events, EventType::ServerStop);
+        state.events.shutdown_file_streams().await;
         return;
     }
 
@@ -10004,6 +10134,8 @@ pub async fn run(config: Config) {
     state.process_server.shutdown().await;
     state.extensions.shutdown().await;
     state.connections.wait_empty().await;
+    blit_event!(state.events, EventType::ServerStop);
+    state.events.shutdown_file_streams().await;
 }
 
 /// Minimum interval between blanket RequestFrame rounds.  Keeps video
@@ -10034,7 +10166,17 @@ fn blanket_frame_interval(sess: &Session) -> Option<Duration> {
 }
 
 async fn tick(state: &AppState) -> TickOutcome {
+    let tick_started = Instant::now();
+    blit_event!(state.events, EventType::TickStart);
+    let lock_started = Instant::now();
     let mut sess = state.session.lock().await;
+    blit_event!(state.events, EventType::SessionLock, {
+        let mut payload = events::payload_name("tick");
+        payload.extend_from_slice(
+            &(lock_started.elapsed().as_nanos().min(u64::MAX as u128) as u64).to_le_bytes(),
+        );
+        payload
+    });
     sess.tick_fires += 1;
     let mut next_deadline: Option<Instant> = None;
     let now = Instant::now();
@@ -10152,6 +10294,16 @@ async fn tick(state: &AppState) -> TickOutcome {
                     width,
                     height,
                 } => {
+                    blit_event!(state.events, EventType::CompositorEvent, {
+                        let mut payload = vec![1];
+                        payload.extend_from_slice(&surface_id.to_le_bytes());
+                        payload.extend_from_slice(&parent_id.to_le_bytes());
+                        payload.extend_from_slice(&width.to_le_bytes());
+                        payload.extend_from_slice(&height.to_le_bytes());
+                        payload.extend_from_slice(&events::payload_name(&title));
+                        payload.extend_from_slice(&events::payload_name(&app_id));
+                        payload
+                    });
                     broadcast.push(msg_surface_created(
                         surface_id, parent_id, width, height, &title, &app_id,
                     ));
@@ -10180,6 +10332,11 @@ async fn tick(state: &AppState) -> TickOutcome {
                     invalidate_client_encoders.push(surface_id);
                 }
                 CompositorEvent::SurfaceDestroyed { surface_id } => {
+                    blit_event!(state.events, EventType::CompositorEvent, {
+                        let mut payload = vec![2];
+                        payload.extend_from_slice(&surface_id.to_le_bytes());
+                        payload
+                    });
                     #[cfg(target_os = "linux")]
                     {
                         let retired = retire_screencast_surface(cs, surface_id);
@@ -10213,6 +10370,16 @@ async fn tick(state: &AppState) -> TickOutcome {
                     timestamp_sub_us,
                     encoder_skip,
                 } => {
+                    blit_event!(state.events, EventType::CompositorEvent, {
+                        let mut payload = vec![3];
+                        payload.extend_from_slice(&surface_id.to_le_bytes());
+                        payload.extend_from_slice(&width.to_le_bytes());
+                        payload.extend_from_slice(&height.to_le_bytes());
+                        payload.extend_from_slice(&timestamp_ms.to_le_bytes());
+                        payload.extend_from_slice(&timestamp_sub_us.to_le_bytes());
+                        payload.push(encoder_skip as u8);
+                        payload
+                    });
                     surface_commit_count += 1;
                     #[cfg(target_os = "linux")]
                     let screencast_frame = {
@@ -10285,6 +10452,16 @@ async fn tick(state: &AppState) -> TickOutcome {
                     timestamp_ms,
                     timestamp_sub_us,
                 } => {
+                    blit_event!(state.events, EventType::SurfaceEncode, {
+                        let mut payload = frame.surface_id.to_le_bytes().to_vec();
+                        payload.extend_from_slice(&frame.client_id.to_le_bytes());
+                        payload.extend_from_slice(&frame.width.to_le_bytes());
+                        payload.extend_from_slice(&frame.height.to_le_bytes());
+                        payload.extend_from_slice(&(frame.data.len() as u32).to_le_bytes());
+                        payload.push(frame.codec_flag);
+                        payload.push(frame.is_keyframe as u8);
+                        payload
+                    });
                     surface_commit_count += 1;
                     cs.pixel_generation += 1;
                     let new_is_keyframe = frame.is_keyframe;
@@ -13411,21 +13588,58 @@ async fn tick(state: &AppState) -> TickOutcome {
             };
             match input {
                 PtyInput::Data(data) => {
+                    blit_event!(state.events, EventType::PtyRead, {
+                        let mut payload = id.to_le_bytes().to_vec();
+                        payload.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                        payload.extend_from_slice(&data);
+                        payload
+                    });
                     budget = budget.saturating_sub(data.len());
+                    let parse_started = Instant::now();
                     if let Some(msg) = feed_pty_chunk(pty, id, &data) {
                         cwd_msgs.push(msg);
                     }
+                    blit_event!(state.events, EventType::PtyParse, {
+                        let mut payload = id.to_le_bytes().to_vec();
+                        payload.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                        payload.extend_from_slice(
+                            &(parse_started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+                                .to_le_bytes(),
+                        );
+                        payload
+                    });
                     pty.mark_output_dirty(now, output_coalesce_cap);
                 }
                 PtyInput::SyncBoundary { before } => {
+                    blit_event!(state.events, EventType::PtyRead, {
+                        let mut payload = id.to_le_bytes().to_vec();
+                        payload.extend_from_slice(&(before.len() as u32).to_le_bytes());
+                        payload.extend_from_slice(&before);
+                        payload
+                    });
                     budget = budget.saturating_sub(before.len());
                     if !before.is_empty() {
+                        let parse_started = Instant::now();
                         if let Some(msg) = feed_pty_chunk(pty, id, &before) {
                             cwd_msgs.push(msg);
                         }
+                        blit_event!(state.events, EventType::PtyParse, {
+                            let mut payload = id.to_le_bytes().to_vec();
+                            payload.extend_from_slice(&(before.len() as u32).to_le_bytes());
+                            payload.extend_from_slice(
+                                &(parse_started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+                                    .to_le_bytes(),
+                            );
+                            payload
+                        });
                         pty.mark_output_dirty(now, output_coalesce_cap);
                     }
                     if !pty.driver.synced_output() {
+                        blit_event!(
+                            state.events,
+                            EventType::PtySnapshot,
+                            id.to_le_bytes().to_vec()
+                        );
                         let frame = take_snapshot(pty);
                         enqueue_ready_frame(&mut pty.ready_frames, frame);
                         pty.clear_dirty();
@@ -13542,6 +13756,11 @@ async fn tick(state: &AppState) -> TickOutcome {
         // it, ordinary shell output is immediate and alternate-screen output
         // reaches here after either a short quiet period or the display-rate
         // liveness ceiling.
+        blit_event!(
+            state.events,
+            EventType::PtySnapshot,
+            id.to_le_bytes().to_vec()
+        );
         snapshots.insert(id, take_snapshot(pty));
         pty.clear_dirty();
         sess.tick_snaps += 1;
@@ -14070,6 +14289,14 @@ async fn tick(state: &AppState) -> TickOutcome {
         next_deadline = Some(next_deadline.map_or(blanket_deadline, |d| d.min(blanket_deadline)));
     }
 
+    blit_event!(state.events, EventType::TickStop, {
+        let mut payload = (tick_started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+            .to_le_bytes()
+            .to_vec();
+        payload.extend_from_slice(&(sess.clients.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&(sess.ptys.len() as u32).to_le_bytes());
+        payload
+    });
     TickOutcome { next_deadline }
 }
 
@@ -17564,6 +17791,271 @@ async fn deliver_terminal_notice(
     tokio::time::timeout(timeout, sent_rx).await.is_ok()
 }
 
+fn protocol_event_type(opcode: u8) -> Option<EventType> {
+    use blit_remote::events::EVENTS;
+    match opcode {
+        blit_remote::fs::C2S_FS_SYNC..=blit_remote::fs::C2S_FS_READ => Some(EventType::FsRequest),
+        blit_remote::lsp::C2S_LSP_OPEN..=blit_remote::lsp::C2S_LSP_BUFFER => {
+            Some(EventType::LspRequest)
+        }
+        blit_remote::kv::C2S_KV_OPEN..=blit_remote::env::C2S_ENV_GET => Some(EventType::KvRequest),
+        blit_remote::net::C2S_NET_OPEN..=blit_remote::net::C2S_NET_DGRAM => {
+            Some(EventType::NetRequest)
+        }
+        blit_remote::extension::EXT_RUN..=blit_remote::extension::EXT_COMMAND => {
+            Some(EventType::ExtensionRequest)
+        }
+        blit_remote::channel::CHANNEL => Some(EventType::ChannelRequest),
+        blit_remote::git::C2S_GIT_OPEN..=blit_remote::git::C2S_GIT_WORKTREES => {
+            Some(EventType::GitRequest)
+        }
+        blit_remote::process::C2S_PROCESS_SPAWN..=blit_remote::process::C2S_PROCESS_WATCH => {
+            Some(EventType::ProcessRequest)
+        }
+        C2S_CLIENT_LIST | C2S_CLIENT_WATCH | C2S_CLIENT_UNWATCH | C2S_KICK | EVENTS => {
+            Some(EventType::ClientControl)
+        }
+        C2S_SURFACE_INPUT..=blit_remote::media::C2S_MEDIA_DATA => {
+            Some(EventType::CompositorCommand)
+        }
+        _ => None,
+    }
+}
+
+fn events_config_message(state: &AppState, nonce: u16) -> Vec<u8> {
+    let stats = state.events.stats();
+    blit_remote::events::msg_events_config(
+        nonce,
+        stats.capacity as u64,
+        stats.used as u64,
+        stats.records,
+        stats.dropped,
+        stats.next_sequence,
+        state.events.activations(),
+    )
+}
+
+async fn handle_events_message(
+    data: &[u8],
+    state: &AppState,
+    out: &TrackedOutboxSender,
+    client_streams: &mut HashMap<u32, tokio::task::JoinHandle<()>>,
+    client_id: u64,
+) {
+    use blit_remote::events::{
+        EVENTS_STREAM_HISTORY, EVENTS_TARGET_CLIENT, EventStreamInfo, EventsRequest,
+        msg_events_dumped, msg_events_record, msg_events_result, msg_events_stream_gap,
+        msg_events_stream_started, msg_events_stream_stopped, msg_events_streams,
+        parse_events_request,
+    };
+    let request = match parse_events_request(data) {
+        Ok(request) => request,
+        Err(error) => {
+            blit_event!(
+                state.events,
+                EventType::ProtocolError,
+                events::payload_name(&error.to_string())
+            );
+            if data.len() >= 5 {
+                let nonce = u16::from_le_bytes([data[3], data[4]]);
+                let _ = out.send(msg_events_result(
+                    nonce,
+                    STATUS_INVALID,
+                    0,
+                    &error.to_string(),
+                ));
+            }
+            return;
+        }
+    };
+    match request {
+        EventsRequest::ConfigGet { nonce } => {
+            let _ = out.send(events_config_message(state, nonce));
+        }
+        EventsRequest::ConfigSet {
+            nonce,
+            size,
+            activations,
+        } => {
+            let Ok(size) = usize::try_from(size) else {
+                let _ = out.send(msg_events_result(
+                    nonce,
+                    STATUS_TOO_LARGE,
+                    0,
+                    "event ring size does not fit this host",
+                ));
+                return;
+            };
+            let log = state.events.clone();
+            let result =
+                tokio::task::spawn_blocking(move || log.configure(size, activations)).await;
+            match result {
+                Ok(Ok(_)) => {
+                    blit_event!(state.events, EventType::ConfigChange, {
+                        let mut payload = events::payload_client(client_id);
+                        payload.extend_from_slice(&(size as u64).to_le_bytes());
+                        payload.extend_from_slice(&activations.to_bytes());
+                        payload
+                    });
+                    let _ = out.send(events_config_message(state, nonce));
+                }
+                Ok(Err(detail)) => {
+                    let _ = out.send(msg_events_result(nonce, STATUS_INVALID, 0, detail));
+                }
+                Err(_) => {
+                    let _ = out.send(msg_events_result(
+                        nonce,
+                        STATUS_OTHER,
+                        0,
+                        "event configuration task failed",
+                    ));
+                }
+            }
+        }
+        EventsRequest::Dump { nonce } => {
+            let log = state.events.clone();
+            let out = out.clone();
+            tokio::spawn(async move {
+                blit_event!(
+                    log,
+                    EventType::TaskStart,
+                    events::payload_name("events.dump")
+                );
+                let dump_log = log.clone();
+                if let Ok(dump) = tokio::task::spawn_blocking(move || dump_log.dump()).await {
+                    let _ = out.send(msg_events_dumped(nonce, &dump));
+                }
+                blit_event!(
+                    log,
+                    EventType::TaskStop,
+                    events::payload_name("events.dump")
+                );
+            });
+        }
+        EventsRequest::StreamStart {
+            nonce,
+            target,
+            flags,
+            path: _,
+        } if target == EVENTS_TARGET_CLIENT => {
+            let history = flags & EVENTS_STREAM_HISTORY != 0;
+            let (stream_id, dump, mut receiver) = state.events.client_stream(history);
+            let _ = out.send(msg_events_stream_started(nonce, STATUS_OK, stream_id, ""));
+            let out = out.clone();
+            let log = state.events.clone();
+            let task = tokio::spawn(async move {
+                blit_event!(
+                    log,
+                    EventType::TaskStart,
+                    events::payload_name("events.client-stream")
+                );
+                if let Some(dump) = dump
+                    && out.send(msg_events_dumped(nonce, &dump)).is_err()
+                {
+                    blit_event!(
+                        log,
+                        EventType::TaskStop,
+                        events::payload_name("events.client-stream")
+                    );
+                    return;
+                }
+                loop {
+                    match receiver.recv().await {
+                        Ok(record) => {
+                            if out.send(msg_events_record(stream_id, &record)).is_err() {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(lost)) => {
+                            if out.send(msg_events_stream_gap(stream_id, lost)).is_err() {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+                let _ = out.send(msg_events_stream_stopped(stream_id, STATUS_OK, ""));
+                blit_event!(
+                    log,
+                    EventType::TaskStop,
+                    events::payload_name("events.client-stream")
+                );
+            });
+            client_streams.insert(stream_id, task);
+            blit_event!(state.events, EventType::StreamStart, {
+                let mut payload = events::payload_client(client_id);
+                payload.extend_from_slice(&stream_id.to_le_bytes());
+                payload.push(EVENTS_TARGET_CLIENT);
+                payload
+            });
+        }
+        EventsRequest::StreamStart {
+            nonce,
+            target: _,
+            flags,
+            path,
+        } => match state.events.start_file_stream(path, flags).await {
+            Ok(stream_id) => {
+                let _ = out.send(msg_events_stream_started(nonce, STATUS_OK, stream_id, ""));
+                blit_event!(state.events, EventType::StreamStart, {
+                    let mut payload = events::payload_client(client_id);
+                    payload.extend_from_slice(&stream_id.to_le_bytes());
+                    payload.push(blit_remote::events::EVENTS_TARGET_FILE);
+                    payload.extend_from_slice(&events::payload_name(path));
+                    payload
+                });
+            }
+            Err(error) => {
+                let _ = out.send(msg_events_stream_started(nonce, STATUS_OTHER, 0, &error));
+            }
+        },
+        EventsRequest::StreamStop { nonce, stream_id } => {
+            let stopped_client = if let Some(task) = client_streams.remove(&stream_id) {
+                let was_running = !task.is_finished();
+                task.abort();
+                if was_running {
+                    blit_event!(
+                        state.events,
+                        EventType::TaskStop,
+                        events::payload_name("events.client-stream")
+                    );
+                }
+                true
+            } else {
+                false
+            };
+            let stopped = stopped_client || state.events.stop_file_stream(stream_id).await;
+            let status = if stopped { STATUS_OK } else { STATUS_NOT_FOUND };
+            let detail = if stopped {
+                ""
+            } else {
+                "event stream not found"
+            };
+            let _ = out.send(msg_events_result(nonce, status, stream_id, detail));
+            if stopped {
+                blit_event!(state.events, EventType::StreamStop, {
+                    let mut payload = events::payload_client(client_id);
+                    payload.extend_from_slice(&stream_id.to_le_bytes());
+                    payload
+                });
+            }
+        }
+        EventsRequest::StreamList { nonce } => {
+            let streams = state.events.file_streams();
+            let wire = streams
+                .iter()
+                .map(|stream| EventStreamInfo {
+                    stream_id: stream.id,
+                    running: stream.running,
+                    flags: stream.flags,
+                    path: &stream.path,
+                })
+                .collect::<Vec<_>>();
+            let _ = out.send(msg_events_streams(nonce, &wire));
+        }
+    }
+}
+
 /// Connection-local mirror of this client's auxiliary subscription tables.
 ///
 /// `sync` runs after *every* filesystem, git, LSP, KV and network message, so
@@ -17633,6 +18125,11 @@ pub(crate) fn spawn_network_client<S: AsyncRead + AsyncWrite + Unpin + Send + 's
 ) -> bool {
     let options = ConnectionOptions::network();
     let Some(registration) = state.connections.register(options.cancellation.clone()) else {
+        blit_event!(
+            state.events,
+            EventType::ClientReject,
+            events::payload_name("shutdown")
+        );
         return false;
     };
     let max = state.config.max_connections;
@@ -17644,11 +18141,32 @@ pub(crate) fn spawn_network_client<S: AsyncRead + AsyncWrite + Unpin + Send + 's
         .is_ok();
     if !admitted {
         eprintln!("max connections ({max}) reached, rejecting");
+        blit_event!(
+            state.events,
+            EventType::ClientReject,
+            events::payload_name("capacity")
+        );
+        blit_event!(
+            state.events,
+            EventType::Capacity,
+            events::payload_name("connections")
+        );
         return false;
     }
+    blit_event!(state.events, EventType::ConnectionAccept);
     tokio::spawn(async move {
+        blit_event!(
+            state.events,
+            EventType::TaskStart,
+            events::payload_name("client")
+        );
         handle_client_registered(stream, state.clone(), options, registration).await;
         state.active_connections.fetch_sub(1, Ordering::AcqRel);
+        blit_event!(
+            state.events,
+            EventType::TaskStop,
+            events::payload_name("client")
+        );
     });
     true
 }
@@ -17733,6 +18251,7 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
     // Filesystem syncs are connection-scoped; engines write into the same
     // outbox as everything else and die with this map on disconnect.
     let fs_out = out_tx.clone();
+    let event_out = out_tx.clone();
     #[cfg(any(unix, windows))]
     let processes = state.process_server.endpoint(process_out_tx);
     #[cfg(any(unix, windows))]
@@ -17742,6 +18261,7 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
     let mut lsp_conns = LspConns::with_jobs(extension_jobs.clone(), native_open_tx.clone());
     let mut kv_subs = kv::KvSubs::default();
     let mut aux_mirror = AuxSubscriptionMirror::default();
+    let mut event_streams: HashMap<u32, tokio::task::JoinHandle<()>> = HashMap::new();
     // BLIT_NET=0 turns the relay off: the bit is unadvertised AND every
     // NET_OPEN is refused with PERMISSION, so a client that ignores
     // feature bits still gets its one reply.
@@ -17804,7 +18324,15 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
     let sender_profile = options.profile;
     let sender_no_progress_timeout =
         extension_origin.then_some(extension_outbox_config.no_progress_timeout);
-    let sender = tokio::spawn(async move {
+    let event_client_id = Arc::new(AtomicU64::new(0));
+    let sender_event_client_id = event_client_id.clone();
+    let sender_event_log = state.events.clone();
+    let sender_future = async move {
+        blit_event!(
+            sender_event_log,
+            EventType::TaskStart,
+            events::payload_name("client.writer")
+        );
         tokio::select! {
             biased;
             _ = sender_cancellation.cancelled() => {}
@@ -18088,7 +18616,16 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
         // A failed/closed writer is also a connection exit. Wake the reader
         // so it cannot retain connection-scoped state behind a half-open peer.
         sender_cancellation.cancel();
-    });
+        blit_event!(
+            sender_event_log,
+            EventType::TaskStop,
+            events::payload_name("client.writer")
+        );
+    };
+    let sender = tokio::spawn(EVENT_WRITE_CONTEXT.scope(
+        (state.events.clone(), sender_event_client_id),
+        sender_future,
+    ));
     let client_id = 'session_setup: {
         let mut sess = state.session.lock().await;
         if state.connections.is_shutting_down() {
@@ -18109,6 +18646,7 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
         }
         let client_id = sess.next_client_id;
         sess.next_client_id += 1;
+        event_client_id.store(client_id, Ordering::Release);
         sess.channels
             .register_endpoint(client_id, options.origin.channel_peer_name(client_id));
         sess.clients.insert(
@@ -18249,6 +18787,9 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
         // BLIT_LSP=0 disables the family: the bit is simply not
         // advertised, matching the dispatch gate.
         let mut features = features;
+        if !extension_origin {
+            features |= blit_remote::events::FEATURE_EVENTS;
+        }
         if lsp_enabled {
             features |= blit_remote::lsp::FEATURE_LSP;
         }
@@ -18496,6 +19037,11 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
         let _ = sender.await;
         return;
     };
+    blit_event!(
+        state.events,
+        EventType::ClientConnect,
+        events::payload_client(client_id)
+    );
 
     state
         .extensions
@@ -18578,11 +19124,54 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
         if data.is_empty() {
             continue;
         }
+        blit_event!(
+            state.events,
+            EventType::FrameRead,
+            events::payload_frame(client_id, &data)
+        );
+        blit_event!(state.events, EventType::MessageRead, {
+            let mut payload = events::payload_client(client_id);
+            payload.push(data[0]);
+            payload.extend_from_slice(&(data.len().min(u32::MAX as usize) as u32).to_le_bytes());
+            payload
+        });
+        if let Some(kind) = protocol_event_type(data[0]) {
+            blit_event!(state.events, kind, {
+                let mut payload = events::payload_client(client_id);
+                payload.push(data[0]);
+                payload
+                    .extend_from_slice(&(data.len().min(u32::MAX as usize) as u32).to_le_bytes());
+                payload
+            });
+        }
         // The process-wide latch is the admission linearization point. A
         // packet already being applied when it flips may finish; no packet
         // read afterward may start an extension or channel operation.
         if state.connections.is_shutting_down() {
             break;
+        }
+
+        if data[0] == blit_remote::events::EVENTS {
+            if extension_origin {
+                if data.len() >= 5 {
+                    let nonce = u16::from_le_bytes([data[3], data[4]]);
+                    let _ = event_out.send(blit_remote::events::msg_events_result(
+                        nonce,
+                        blit_remote::STATUS_PERMISSION,
+                        0,
+                        "event inspection is unavailable to extension endpoints",
+                    ));
+                }
+                blit_event!(
+                    state.events,
+                    EventType::ProtocolError,
+                    events::payload_name("extension attempted event inspection")
+                );
+            } else {
+                handle_events_message(&data, &state, &event_out, &mut event_streams, client_id)
+                    .await;
+            }
+            continue;
         }
 
         if data[0] == C2S_ACK {
@@ -19197,6 +19786,12 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
         // the correct escape sequence using the terminal's current mouse mode/encoding.
         if data[0] == C2S_MOUSE && data.len() >= 9 {
             let pid = u16::from_le_bytes([data[1], data[2]]);
+            blit_event!(state.events, EventType::PtyInput, {
+                let mut payload = events::payload_client(client_id);
+                payload.extend_from_slice(&pid.to_le_bytes());
+                payload.extend_from_slice(&data[3..]);
+                payload
+            });
             let type_ = data[3];
             let button = data[4];
             let col = u16::from_le_bytes([data[5], data[6]]);
@@ -19209,6 +19804,12 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     .mouse_event(type_, button, col, row, echo, icanon)
                     && let Some(&fd) = state.pty_fds.read().unwrap().get(&pid)
                 {
+                    blit_event!(state.events, EventType::PtyWrite, {
+                        let mut payload = pid.to_le_bytes().to_vec();
+                        payload.extend_from_slice(&(seq.len() as u32).to_le_bytes());
+                        payload.extend_from_slice(&seq);
+                        payload
+                    });
                     pty::pty_write_all(fd, &seq);
                 }
             }
@@ -19217,6 +19818,12 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
 
         if data[0] == C2S_INPUT && data.len() >= 3 {
             let pid = u16::from_le_bytes([data[1], data[2]]);
+            blit_event!(state.events, EventType::PtyInput, {
+                let mut payload = events::payload_client(client_id);
+                payload.extend_from_slice(&pid.to_le_bytes());
+                payload.extend_from_slice(&data[3..]);
+                payload
+            });
             let mut need_nudge = false;
             {
                 let mut sess = state.session.lock().await;
@@ -19234,6 +19841,13 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                 // integer between lookup and write — routing input to the
                 // wrong fd. (Mirrors the C2S_MOUSE handler above.)
                 if let Some(&fd) = state.pty_fds.read().unwrap().get(&pid) {
+                    blit_event!(state.events, EventType::PtyWrite, {
+                        let bytes = &data[3..];
+                        let mut payload = pid.to_le_bytes().to_vec();
+                        payload.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                        payload.extend_from_slice(bytes);
+                        payload
+                    });
                     pty::pty_write_all(fd, &data[3..]);
                 }
             }
@@ -19989,6 +20603,11 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                 }
             }
             C2S_RESIZE if data.len() >= 7 => {
+                blit_event!(state.events, EventType::PtyResize, {
+                    let mut payload = events::payload_client(client_id);
+                    payload.extend_from_slice(&data[1..]);
+                    payload
+                });
                 let entries = data[1..].chunks_exact(6);
                 if !entries.remainder().is_empty() {
                     continue;
@@ -20057,6 +20676,11 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     continue;
                 }
                 let Some(id) = sess.allocate_pty_id(config.max_ptys) else {
+                    blit_event!(
+                        state.events,
+                        EventType::Capacity,
+                        events::payload_name("ptys")
+                    );
                     continue;
                 };
                 let socket_name = sess
@@ -20101,6 +20725,11 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     msg.extend_from_slice(&id.to_le_bytes());
                     msg.extend_from_slice(pty.tag.as_bytes());
                     sess.ptys.insert(id, pty);
+                    blit_event!(state.events, EventType::PtyCreate, {
+                        let mut payload = id.to_le_bytes().to_vec();
+                        payload.extend_from_slice(&events::payload_name(tag));
+                        payload
+                    });
                     if let Some(c) = sess.clients.get_mut(&client_id) {
                         c.lead = Some(id);
                         c.view_sizes.insert(id, (rows, cols));
@@ -20155,6 +20784,11 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     continue;
                 }
                 let Some(id) = sess.allocate_pty_id(config.max_ptys) else {
+                    blit_event!(
+                        state.events,
+                        EventType::Capacity,
+                        events::payload_name("ptys")
+                    );
                     continue;
                 };
                 let socket_name = sess
@@ -20205,6 +20839,11 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     broadcast_msg.extend_from_slice(&id.to_le_bytes());
                     broadcast_msg.extend_from_slice(tag_bytes);
                     sess.ptys.insert(id, pty);
+                    blit_event!(state.events, EventType::PtyCreate, {
+                        let mut payload = id.to_le_bytes().to_vec();
+                        payload.extend_from_slice(&events::payload_name(tag));
+                        payload
+                    });
                     if let Some(c) = sess.clients.get_mut(&client_id) {
                         c.lead = Some(id);
                         c.view_sizes.insert(id, (rows, cols));
@@ -20257,6 +20896,11 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     continue;
                 }
                 let Some(id) = sess.allocate_pty_id(config.max_ptys) else {
+                    blit_event!(
+                        state.events,
+                        EventType::Capacity,
+                        events::payload_name("ptys")
+                    );
                     continue;
                 };
                 let socket_name = sess
@@ -20299,6 +20943,11 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     msg.extend_from_slice(&id.to_le_bytes());
                     msg.extend_from_slice(pty.tag.as_bytes());
                     sess.ptys.insert(id, pty);
+                    blit_event!(state.events, EventType::PtyCreate, {
+                        let mut payload = id.to_le_bytes().to_vec();
+                        payload.extend_from_slice(&events::payload_name(tag));
+                        payload
+                    });
                     if let Some(c) = sess.clients.get_mut(&client_id) {
                         c.lead = Some(id);
                         c.view_sizes.insert(id, (rows, cols));
@@ -20373,6 +21022,11 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     continue;
                 }
                 let Some(id) = sess.allocate_pty_id(config.max_ptys) else {
+                    blit_event!(
+                        state.events,
+                        EventType::Capacity,
+                        events::payload_name("ptys")
+                    );
                     refuse_create(
                         &sess,
                         client_id,
@@ -20447,6 +21101,11 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     broadcast_msg.extend_from_slice(&id.to_le_bytes());
                     broadcast_msg.extend_from_slice(tag_bytes);
                     sess.ptys.insert(id, pty);
+                    blit_event!(state.events, EventType::PtyCreate, {
+                        let mut payload = id.to_le_bytes().to_vec();
+                        payload.extend_from_slice(&events::payload_name(tag));
+                        payload
+                    });
                     if let Some(c) = sess.clients.get_mut(&client_id) {
                         if subscribe_creator {
                             c.lead = Some(id);
@@ -21531,6 +22190,11 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
 
                 if let Some(pty) = sess.ptys.get_mut(&pid) {
                     let (rows, _cols) = pty.driver.size();
+                    blit_event!(
+                        state.events,
+                        EventType::PtySnapshot,
+                        pid.to_le_bytes().to_vec()
+                    );
                     let viewport = take_snapshot(pty);
                     let scrollback_lines = viewport.scrollback_lines() as usize;
                     let total_lines = scrollback_lines + rows as usize;
@@ -21699,6 +22363,11 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
             C2S_CLOSE if data.len() >= 3 => {
                 let pid = u16::from_le_bytes([data[1], data[2]]);
                 if let Some(pty) = sess.ptys.remove(&pid) {
+                    blit_event!(state.events, EventType::PtyRemove, {
+                        let mut payload = pid.to_le_bytes().to_vec();
+                        payload.push(1);
+                        payload
+                    });
                     if !pty.exited {
                         state.pty_fds.write().unwrap().remove(&pid);
                         drop(pty.reader_handle);
@@ -21936,6 +22605,22 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
     drop(git_repos);
     drop(lsp_conns);
     drop(kv_subs);
+    for (stream_id, task) in event_streams.drain() {
+        let was_running = !task.is_finished();
+        task.abort();
+        if was_running {
+            blit_event!(
+                state.events,
+                EventType::TaskStop,
+                events::payload_name("events.client-stream")
+            );
+        }
+        blit_event!(state.events, EventType::StreamStop, {
+            let mut payload = events::payload_client(client_id);
+            payload.extend_from_slice(&stream_id.to_le_bytes());
+            payload
+        });
+    }
     net::shutdown(&mut net_sockets);
     options.cancellation.cancel();
     if let Some(jobs) = &extension_jobs {
@@ -21956,6 +22641,11 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
     if state.config.verbose {
         eprintln!("{} disconnected", options.origin.label());
     }
+    blit_event!(
+        state.events,
+        EventType::ClientDisconnect,
+        events::payload_client(client_id)
+    );
 }
 
 #[cfg(test)]
@@ -21999,6 +22689,10 @@ mod tests {
                     allow_forward_insecure: false,
                     allow_persistent_extensions: false,
                 },
+                events: events::EventLog::new(
+                    events::DEFAULT_RING_SIZE,
+                    blit_remote::events::ActivationSet::default(),
+                ),
                 process_server,
                 boot_generation: 1,
                 session: Mutex::new(Session::new_with_boot_generation(1)),
@@ -22094,6 +22788,99 @@ mod tests {
             assert_eq!(stdout, b"out\x01");
             assert_eq!(stderr, b"err\x02");
             assert_eq!((exit.reason, exit.code), (PROCESS_EXIT_RETURNED, 7));
+
+            drop(client);
+            timeout(Duration::from_secs(5), connection)
+                .await
+                .expect("connection cleanup timed out")
+                .unwrap();
+            process_server.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn events_family_configures_and_dumps_through_framed_connection() {
+            let process_server = process::Server::new(false, false);
+            let state = test_state(process_server.clone());
+            let (mut client, server_stream) = tokio::io::duplex(4 * 1024 * 1024);
+            let connection = tokio::spawn(handle_client_with_options(
+                server_stream,
+                state,
+                ConnectionOptions::network(),
+            ));
+
+            let mut advertised = false;
+            loop {
+                let frame = next_frame(&mut client).await;
+                match frame.first().copied() {
+                    Some(S2C_HELLO) => {
+                        let features = u32::from_le_bytes(frame[3..7].try_into().unwrap());
+                        advertised = features & blit_remote::events::FEATURE_EVENTS != 0;
+                    }
+                    Some(S2C_READY) => break,
+                    _ => {}
+                }
+            }
+            assert!(advertised);
+
+            assert!(
+                write_frame(
+                    &mut client,
+                    &blit_remote::events::msg_events_stream_list(50),
+                )
+                .await
+            );
+            loop {
+                let frame = next_frame(&mut client).await;
+                if let Ok(blit_remote::events::EventsMessage::Streams { nonce: 50, streams }) =
+                    blit_remote::events::parse_events_message(&frame)
+                {
+                    assert!(streams.is_empty());
+                    break;
+                }
+            }
+
+            assert!(
+                write_frame(
+                    &mut client,
+                    &blit_remote::events::msg_events_config_set(
+                        51,
+                        events::MIN_RING_SIZE as u64,
+                        blit_remote::events::ActivationSet::low_throughput(),
+                    ),
+                )
+                .await
+            );
+            loop {
+                let frame = next_frame(&mut client).await;
+                if let Ok(blit_remote::events::EventsMessage::Config {
+                    nonce: 51,
+                    size,
+                    activations,
+                    ..
+                }) = blit_remote::events::parse_events_message(&frame)
+                {
+                    assert_eq!(size, events::MIN_RING_SIZE as u64);
+                    assert_eq!(
+                        activations,
+                        blit_remote::events::ActivationSet::low_throughput()
+                    );
+                    break;
+                }
+            }
+
+            assert!(write_frame(&mut client, &blit_remote::events::msg_events_dump(52),).await);
+            loop {
+                let frame = next_frame(&mut client).await;
+                if let Ok(blit_remote::events::EventsMessage::Dump { nonce: 52, bytes }) =
+                    blit_remote::events::parse_events_message(&frame)
+                {
+                    assert_eq!(
+                        &bytes[..blit_remote::events::EVENT_DUMP_MAGIC.len()],
+                        blit_remote::events::EVENT_DUMP_MAGIC
+                    );
+                    break;
+                }
+            }
 
             drop(client);
             timeout(Duration::from_secs(5), connection)

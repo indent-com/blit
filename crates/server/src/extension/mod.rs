@@ -5753,6 +5753,10 @@ mod tests {
                 allow_forward_insecure: false,
                 allow_persistent_extensions: true,
             },
+            events: super::super::events::EventLog::new(
+                super::super::events::DEFAULT_RING_SIZE,
+                blit_remote::events::ActivationSet::default(),
+            ),
             #[cfg(any(unix, windows))]
             process_server: super::super::process::Server::new(false, false),
             boot_generation,

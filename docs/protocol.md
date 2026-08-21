@@ -112,6 +112,7 @@ every pending operation as a connection error in that case.
 | `0x51` | `TERM_OUTPUT`           | `[nonce:2][pty_id:2][index:8][max_bytes:4][flags:1]` — one command's output; `index = u64::MAX` is the newest ([design/term-journal.md](design/term-journal.md))                                                                                               |
 | `0x52` | `TERM_SINCE`            | `[nonce:2][pty_id:2][from_seq:8][from_col:2][max_bytes:4][flags:1]` — output since a sequence cursor; `flags` bit 0 (`SINCE_PROBE`) reports the cursor and returns no text ([design/term-journal.md](design/term-journal.md))                                  |
 | `0x53` | `TERM_JOURNAL_WAIT`     | `[nonce:2][pty_id:2][index:8][timeout_ms:4]` — block until that command finishes; `index = u64::MAX` waits on whatever is running, or the next one to start ([design/term-journal.md](design/term-journal.md))                                                 |
+| `0xD0` | `EVENTS`                | `[version:1][operation:1][nonce:2][body:N]` — `blit.events.v1` config, dump, and stream control ([design/events.md](design/events.md))                                                                                                                         |
 
 **Notes:**
 
@@ -371,6 +372,7 @@ shared sizing input without a `SURFACE_RESIZE` entry.
 | `0x50` | `TERM_JOURNAL`         | `[nonce:2][pty_id:2][status:1][oldest_index:8][next_index:8][count:2][records…]` — answer to `C2S_TERM_JOURNAL` ([design/term-journal.md](design/term-journal.md))                                                                                                                                                                          |
 | `0x51` | `TERM_OUTPUT`          | `[nonce:2][pty_id:2][status:1][flags:1][start_seq:8][start_col:2][next_seq:8][next_col:2][text_len:4][text:N]` — answers `TERM_OUTPUT` and `TERM_SINCE`; `next_*` is the cursor to resume from ([design/term-journal.md](design/term-journal.md))                                                                                           |
 | `0x52` | `TERM_COMMAND`         | `[nonce:2][pty_id:2][status:1][record]` — answer to `C2S_TERM_JOURNAL_WAIT`; on timeout the record is still flagged `RUNNING` ([design/term-journal.md](design/term-journal.md))                                                                                                                                                            |
+| `0xD0` | `EVENTS`               | `[version:1][operation:1][body:N]` — correlated config/dump/start results or stream record/stop/gap ([design/events.md](design/events.md))                                                                                                                                                                                               |
 
 **Notes:**
 
@@ -409,6 +411,7 @@ shared sizing input without a `SURFACE_RESIZE` entry.
 | 28  | `TERM_JOURNAL`        | Per-command journal and sequence-addressed output               |
 | 29  | `CREATE_EXEC`         | `CREATE2(HAS_ARGV)` and `CREATE2(HAS_ENV)`; Unix hosts only     |
 | 30  | `CREATE_NO_SUBSCRIBE` | `CREATE2(NO_SUBSCRIBE)` skips creator frame subscription        |
+| 31  | `EVENTS`              | Server supports the `blit.events.v1` binary event journal       |
 
 Bit 26 is advertised with bit 12 and never alone; it is separate because a
 `WATCH` an older server does not know is dropped by the channel family's
