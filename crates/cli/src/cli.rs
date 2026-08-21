@@ -323,6 +323,12 @@ pub enum Command {
         command: Option<ClientCommand>,
     },
 
+    /// Inspect and configure the server's binary event journal
+    Events {
+        #[command(subcommand)]
+        command: EventsCommand,
+    },
+
     /// Manage compositor surfaces
     #[command(alias = "s")]
     Surface {
@@ -669,6 +675,93 @@ pub enum Command {
     /// subcommand boundary still captures every token after `@name` verbatim.
     #[command(external_subcommand)]
     External(Vec<String>),
+}
+
+// ── Event journal subcommands ────────────────────────────────────────────
+
+#[derive(Subcommand)]
+pub enum EventsCommand {
+    /// Show config revision, ring use/loss counters, and active event types
+    Config,
+
+    /// Replace ring size and/or activation bitset
+    Set {
+        /// Ring capacity in bytes (4 KiB through just under 64 MiB)
+        #[arg(long)]
+        size: Option<u64>,
+
+        /// Activation selectors: default, all, none, exact names, category.*,
+        /// with optional + or - prefixes
+        #[arg(long, value_name = "SPEC")]
+        events: Option<String>,
+
+        /// Apply only while the server configuration is still at this revision
+        #[arg(long, value_name = "REVISION")]
+        if_revision: Option<u64>,
+    },
+
+    /// Write one retained binary snapshot to stdout or a local file
+    Dump {
+        /// Local output path; defaults to stdout. Use - for stdout explicitly.
+        #[arg(short, long, value_name = "LOCAL_PATH")]
+        output: Option<String>,
+    },
+
+    /// Follow events in the foreground, writing stdout or a local file
+    ///
+    /// The stream ends with this client connection. A connection may own at
+    /// most four concurrent event tails.
+    Tail {
+        /// Local output path; defaults to stdout. Use - for stdout explicitly.
+        #[arg(short, long, value_name = "LOCAL_PATH")]
+        output: Option<String>,
+
+        /// Append to --output instead of truncating it
+        #[arg(long, requires = "output")]
+        append: bool,
+
+        /// Follow only events produced after this command starts
+        #[arg(long)]
+        from_now: bool,
+    },
+
+    /// Manage detached recordings written by the server
+    Record {
+        #[command(subcommand)]
+        command: EventsRecordCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum EventsRecordCommand {
+    /// Start a detached recording to a path on the server
+    ///
+    /// Returns an ID only after the initial header/history has been flushed.
+    /// The server permits at most eight detached recordings process-wide.
+    Start {
+        /// Destination path on the server
+        #[arg(value_name = "SERVER_PATH")]
+        path: String,
+
+        /// Append instead of truncating the server file
+        #[arg(long)]
+        append: bool,
+
+        /// Record only events produced after this command starts
+        #[arg(long)]
+        from_now: bool,
+    },
+
+    /// List recordings as TSV: ID, STATE, RECORDS, BYTES, LOST, HISTORY, MODE, PATH, ERROR
+    List,
+
+    /// Stop and flush a server recording
+    ///
+    /// Returns an error if any recording write or final flush failed.
+    Stop {
+        /// Recording ID from `blit events record start` or `list`
+        id: u32,
+    },
 }
 
 // ── Terminal subcommands ─────────────────────────────────────────────────

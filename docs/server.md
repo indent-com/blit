@@ -19,6 +19,11 @@ no RPC API beyond the binary protocol described in
 | `BLIT_TERM_JOURNAL_MAX`               | `256`                                              | Finished command records retained per PTY                                              |
 | `BLIT_TERM_JOURNAL_CMD_MAX`           | `4096`                                             | Bytes of command-line text retained per record                                         |
 | `BLIT_TERM_OUTPUT_MAX`                | `1048576` (1 MiB)                                  | Server ceiling on a `TERM_OUTPUT` / `TERM_SINCE` `max_bytes`                           |
+| `BLIT_EVENTS_SIZE`                    | `1048576` (1 MiB)                                  | Process-wide binary event-ring capacity                                                |
+| `BLIT_EVENTS`                         | `default`                                          | Fine-grained event activation selectors                                                |
+| `BLIT_EVENTS_FILE`                    | unset                                              | Start a persistent server-side binary event stream                                     |
+| `BLIT_EVENTS_FILE_HISTORY`            | `1`                                                | `0` excludes retained history from the startup file                                    |
+| `BLIT_EVENTS_FILE_APPEND`             | `0`                                                | `1` appends the startup file instead of truncating                                     |
 | `BLIT_VAAPI_DEVICE`                   | `/dev/dri/renderD128`                              | VA-API render node for surface encoding and camera decoding                            |
 | `BLIT_CUDA_DEVICE`                    | `0`                                                | CUDA device ordinal for NVENC and NVDEC                                                |
 | `BLIT_FD_CHANNEL`                     | unset                                              | fd-channel file descriptor                                                             |

@@ -218,6 +218,16 @@ impl AgentConn {
         Ok(data)
     }
 
+    pub(crate) async fn recv_unbounded(&mut self) -> Result<Vec<u8>, String> {
+        let data = read_message(&mut self.reader, &mut self.fragment_buf)
+            .await
+            .ok_or_else(|| "server closed connection".to_string())?;
+        if let Some(error) = self.note_kick(&data) {
+            return Err(error);
+        }
+        Ok(data)
+    }
+
     pub(crate) fn has_pty(&self, id: u16) -> bool {
         self.ptys.iter().any(|p| p.id == id)
     }

@@ -2,6 +2,7 @@ mod agent;
 mod attach;
 mod cli;
 mod completion;
+mod events;
 mod extension;
 mod forward;
 mod fs;
@@ -457,6 +458,20 @@ async fn async_main() {
             };
             if let Err(e) = result {
                 eprintln!("blit: {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Events { command } => {
+            let conn = &cli.connect;
+            let transport = match transport::connect(&conn.on, &conn.hub).await {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("blit: {e}");
+                    std::process::exit(1);
+                }
+            };
+            if let Err(error) = events::run(transport, command).await {
+                eprintln!("blit: {error}");
                 std::process::exit(1);
             }
         }

@@ -44,6 +44,9 @@ pub mod media;
 /// cursor a client feeds back to read only what is new.
 pub mod journal;
 
+/// Process-wide binary server event journal (`blit.events.v1`).
+pub mod events;
+
 /// Cap on any single LZ4-decompressed payload, protocol-wide
 /// (docs/protocol.md "Compressed payloads"). Receivers check the prepended
 /// size against it *before* allocating, so a hostile or corrupt length
