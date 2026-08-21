@@ -165,6 +165,7 @@ impl AgentConn {
     }
 
     /// The reason this connection was kicked, once `recv` has seen one.
+    #[cfg(unix)]
     pub(crate) fn kicked_reason(&self) -> Option<&str> {
         self.kicked.as_deref()
     }

@@ -4,6 +4,8 @@ use blit_alacritty::{
 use blit_compositor::{
     CompositorCommand, CompositorEvent, CompositorHandle, TouchPhase, TouchPoint,
 };
+#[cfg(unix)]
+use blit_remote::FEATURE_CREATE_EXEC;
 #[cfg(target_os = "linux")]
 use blit_remote::desktop::{
     C2S_DESKTOP_SUBSCRIBE, C2S_NOTIFICATION_EVENT, C2S_TRAY_EVENT, DESKTOP_SUBSCRIBE_NOTIFICATIONS,
@@ -36,19 +38,18 @@ use blit_remote::{
     C2S_SURFACE_RESIZE, C2S_SURFACE_SUBSCRIBE, C2S_SURFACE_TEXT, C2S_SURFACE_TOUCH,
     C2S_SURFACE_UNSUBSCRIBE, C2S_TERM_CWD, C2S_UNSUBSCRIBE, CAPTURE_FORMAT_AVIF,
     CAPTURE_FORMAT_PNG, CLIENT_FEATURE_SURFACE_TIMESTAMP_SUB_US, CLIENT_LIST_WANT_ORIGIN,
-    FEATURE_CLIENT_CONTROL, FEATURE_CLIENT_ORIGIN, FEATURE_COPY_RANGE, FEATURE_CREATE_EXEC,
-    FEATURE_CREATE_NO_SUBSCRIBE, FEATURE_CREATE_NONCE, FEATURE_CREATE_STATUS, FEATURE_KILL_MODE,
-    FEATURE_PTY_DEADLINE, FEATURE_RESIZE_BATCH, FEATURE_RESTART, FEATURE_SCROLL_BY, FrameState,
-    KICK_REASON_MAX, KILL_LEADER_ONLY, READ_ANSI, READ_TAIL, REMOTE_INPUT_POINTER,
-    REMOTE_INPUT_TOUCH, S2C_CLOSED, S2C_CREATE_FAILED, S2C_CREATED, S2C_CREATED_N, S2C_LIST,
-    S2C_PING, S2C_QUIT, S2C_READY, S2C_SEARCH_RESULTS, S2C_SURFACE_CAPTURE, S2C_SURFACE_LIST,
-    S2C_TEXT, S2C_TITLE, STATUS_BUDGET, STATUS_CONFLICT, STATUS_INVALID, STATUS_NOT_FOUND,
-    STATUS_OK, STATUS_OTHER, STATUS_TOO_LARGE, SURFACE_FRAME_CODEC_H264,
-    SURFACE_FRAME_FLAG_KEYFRAME, SURFACE_POINTER_AXIS2_LEN, SURFACE_POINTER_DOWN,
-    SURFACE_POINTER_LEAVE, SURFACE_POINTER_MOVE, SURFACE_POINTER_UP, SURFACE_TOUCH_CANCEL,
-    SURFACE_TOUCH_DISABLE, SURFACE_TOUCH_DOWN, SURFACE_TOUCH_ENABLE, SURFACE_TOUCH_MOTION,
-    SURFACE_TOUCH_UP, build_update_msg, clamp_cursor_rect, msg_copy_failed, msg_hello,
-    msg_kick_result, msg_kicked, msg_s2c_client_list, msg_s2c_client_list2,
+    FEATURE_CLIENT_CONTROL, FEATURE_CLIENT_ORIGIN, FEATURE_COPY_RANGE, FEATURE_CREATE_NO_SUBSCRIBE,
+    FEATURE_CREATE_NONCE, FEATURE_CREATE_STATUS, FEATURE_KILL_MODE, FEATURE_PTY_DEADLINE,
+    FEATURE_RESIZE_BATCH, FEATURE_RESTART, FEATURE_SCROLL_BY, FrameState, KICK_REASON_MAX,
+    KILL_LEADER_ONLY, READ_ANSI, READ_TAIL, REMOTE_INPUT_POINTER, REMOTE_INPUT_TOUCH, S2C_CLOSED,
+    S2C_CREATE_FAILED, S2C_CREATED, S2C_CREATED_N, S2C_LIST, S2C_PING, S2C_QUIT, S2C_READY,
+    S2C_SEARCH_RESULTS, S2C_SURFACE_CAPTURE, S2C_SURFACE_LIST, S2C_TEXT, S2C_TITLE, STATUS_BUDGET,
+    STATUS_CONFLICT, STATUS_INVALID, STATUS_NOT_FOUND, STATUS_OK, STATUS_OTHER, STATUS_TOO_LARGE,
+    SURFACE_FRAME_CODEC_H264, SURFACE_FRAME_FLAG_KEYFRAME, SURFACE_POINTER_AXIS2_LEN,
+    SURFACE_POINTER_DOWN, SURFACE_POINTER_LEAVE, SURFACE_POINTER_MOVE, SURFACE_POINTER_UP,
+    SURFACE_TOUCH_CANCEL, SURFACE_TOUCH_DISABLE, SURFACE_TOUCH_DOWN, SURFACE_TOUCH_ENABLE,
+    SURFACE_TOUCH_MOTION, SURFACE_TOUCH_UP, build_update_msg, clamp_cursor_rect, msg_copy_failed,
+    msg_hello, msg_kick_result, msg_kicked, msg_s2c_client_list, msg_s2c_client_list2,
     msg_s2c_clipboard_content, msg_s2c_clipboard_list, msg_s2c_clipboard_owner,
     msg_s2c_scroll_offset, msg_s2c_surface_remote_input, msg_s2c_used_rows, msg_surface_activated,
     msg_surface_app_id, msg_surface_created, msg_surface_destroyed, msg_surface_encoder,
@@ -19704,6 +19705,8 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
         if data[0] == blit_remote::C2S_APP_SOCKET {
             if let Some((nonce, app_id, instance_id)) = blit_remote::parse_app_socket_request(&data)
             {
+                #[cfg(not(target_os = "linux"))]
+                let _ = (app_id, instance_id);
                 #[cfg(target_os = "linux")]
                 let reply = {
                     // Names go into a filesystem path and an environment

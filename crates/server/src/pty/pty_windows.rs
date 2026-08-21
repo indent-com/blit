@@ -646,6 +646,7 @@ pub fn respawn_child(
     }
 
     let mut cmd_line = build_command_line(shell, shell_flags, command);
+    let dir_wide = dir.map(to_wide);
     let mut si: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
     si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
     si.lpAttributeList = attr_list;
@@ -661,7 +662,10 @@ pub fn respawn_child(
             0,
             EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED,
             std::ptr::null(),
-            std::ptr::null(),
+            dir_wide
+                .as_ref()
+                .map(|d| d.as_ptr())
+                .unwrap_or(std::ptr::null()),
             &si.StartupInfo,
             &mut pi,
         )
