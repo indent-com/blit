@@ -1625,6 +1625,8 @@ fn write_atomic(target: &Path, bytes: &[u8], mode: u32, durable: bool) -> io::Re
 /// create-exclusive ("New File") precondition.
 fn create_exclusive(target: &Path, bytes: &[u8], mode: u32, durable: bool) -> io::Result<()> {
     use std::io::Write as _;
+    #[cfg(not(unix))]
+    let _ = mode;
     let mut opts = fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -4234,7 +4236,9 @@ impl SyncEngine {
                 };
                 let lock = path_write_lock(&target);
                 let _guard = lock.lock().unwrap();
-                let mut builder = fs::DirBuilder::new();
+                let builder = fs::DirBuilder::new();
+                #[cfg(unix)]
+                let mut builder = builder;
                 #[cfg(unix)]
                 if o.mode != 0 {
                     use std::os::unix::fs::DirBuilderExt;

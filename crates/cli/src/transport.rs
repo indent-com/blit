@@ -156,11 +156,30 @@ pub async fn connect_ipc(path: &str) -> Result<Transport, String> {
     #[cfg(windows)]
     {
         use tokio::net::windows::named_pipe::ClientOptions;
-        Ok(Transport::NamedPipe(
-            ClientOptions::new()
-                .open(path)
-                .map_err(|e| format!("cannot connect to {path}: {e}"))?,
-        ))
+
+        // `CreateFile` opens an available pipe instance immediately.  The
+        // server creates its next instance only after accepting that client,
+        // so a readiness probe followed immediately by the real connection
+        // can briefly see ERROR_PIPE_BUSY.  Unlike a Unix socket, that does
+        // not mean the server is unavailable.
+        const ERROR_PIPE_BUSY: i32 = 231;
+        const PIPE_BUSY_RETRIES: usize = 100;
+        const PIPE_BUSY_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
+
+        for attempt in 0..=PIPE_BUSY_RETRIES {
+            match ClientOptions::new().open(path) {
+                Ok(pipe) => return Ok(Transport::NamedPipe(pipe)),
+                Err(error)
+                    if error.raw_os_error() == Some(ERROR_PIPE_BUSY)
+                        && attempt < PIPE_BUSY_RETRIES =>
+                {
+                    tokio::time::sleep(PIPE_BUSY_RETRY_DELAY).await;
+                }
+                Err(error) => return Err(format!("cannot connect to {path}: {error}")),
+            }
+        }
+
+        unreachable!("the final pipe-open attempt always returns")
     }
 }
 
@@ -784,6 +803,35 @@ fn spawn_detached_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn connect_ipc_waits_for_next_pipe_instance() {
+        use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+
+        let pipe_name = format!(r"\\.\pipe\blit-test-connect-{}", std::process::id());
+        let first_server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&pipe_name)
+            .unwrap();
+        let first_client = ClientOptions::new().open(&pipe_name).unwrap();
+        first_server.connect().await.unwrap();
+
+        // Keep the first instance occupied long enough that the second client
+        // must encounter ERROR_PIPE_BUSY before the listener creates another.
+        let next_name = pipe_name.clone();
+        let next_instance = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let server = ServerOptions::new().create(&next_name).unwrap();
+            server.connect().await.unwrap();
+        });
+
+        let second_client = connect_ipc(&pipe_name).await.unwrap();
+        drop(second_client);
+        drop(first_client);
+        drop(first_server);
+        next_instance.await.unwrap();
+    }
 
     #[tokio::test]
     async fn monitored_child_reports_early_exit() {

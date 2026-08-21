@@ -32,8 +32,10 @@ use tokio::task::AbortHandle;
 #[cfg(unix)]
 use crate::pty;
 
+#[cfg(all(windows, test))]
+use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
 #[cfg(windows)]
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 #[cfg(windows)]
 use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
 #[cfg(windows)]
@@ -50,8 +52,11 @@ use windows_sys::Win32::System::JobObjects::{
 };
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{
-    CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, OpenProcess, OpenThread, PROCESS_SYNCHRONIZE,
-    ResumeThread, THREAD_SUSPEND_RESUME, WaitForSingleObject,
+    CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
+};
+#[cfg(all(windows, test))]
+use windows_sys::Win32::System::Threading::{
+    OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
 };
 
 const DEFAULT_MAX_PER_CLIENT: usize = 16;
