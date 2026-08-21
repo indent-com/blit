@@ -44,11 +44,11 @@ const MIN_NATIVE_STACK_BYTES: usize = 64 * 1024;
 /// Per-attempt containment policy sampled by the server at startup.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WasmiHostConfig {
-    /// Maximum bytes in the attempt's only linear memory.
+    /// Maximum Wasm linear-memory or QuickJS heap bytes.
     pub memory_bytes: usize,
     /// Maximum elements in the attempt's optional table.
     pub table_elements: usize,
-    /// Maximum Wasmi value-stack bytes.
+    /// Maximum interpreter value/runtime-stack bytes.
     pub value_stack_bytes: usize,
     /// Maximum Wasmi call depth.
     pub call_depth: usize,
@@ -142,7 +142,7 @@ pub struct AttemptFailure {
 }
 
 impl AttemptFailure {
-    fn new(kind: FailureKind, detail: impl Into<String>) -> Self {
+    pub(super) fn new(kind: FailureKind, detail: impl Into<String>) -> Self {
         let mut detail = detail.into();
         const DETAIL_MAX: usize = 4 * 1024;
         if detail.len() > DETAIL_MAX {
@@ -234,7 +234,7 @@ impl std::error::Error for LifecycleError {}
 /// Cancellation handle safe to keep in the asynchronous supervisor.
 #[derive(Clone, Debug)]
 pub struct AttemptCancellation {
-    inner: Arc<AttemptShared>,
+    pub(super) inner: Arc<AttemptShared>,
 }
 
 impl AttemptCancellation {
@@ -251,7 +251,7 @@ impl AttemptCancellation {
 /// Async side of the two acknowledged packet handoffs.
 #[derive(Clone, Debug)]
 pub struct HostBridge {
-    shared: Arc<AttemptShared>,
+    pub(super) shared: Arc<AttemptShared>,
 }
 
 impl HostBridge {
@@ -467,12 +467,7 @@ pub fn spawn_attempt(spec: AttemptSpec) -> Result<WasmiAttempt, SpawnError> {
         return Err(SpawnError::InvalidExtensionId);
     }
     let names = extension_thread_names(spec.label.as_deref(), &spec.module_hash, spec.extension_id);
-    let io = Arc::new(HostIo::new());
-    let shared = Arc::new(AttemptShared {
-        io: Arc::clone(&io),
-        start: Mutex::new(false),
-        start_cv: Condvar::new(),
-    });
+    let shared = new_attempt_shared();
     let bridge = HostBridge {
         shared: Arc::clone(&shared),
     };
@@ -493,6 +488,16 @@ pub fn spawn_attempt(spec: AttemptSpec) -> Result<WasmiAttempt, SpawnError> {
         prepared: false,
         started: false,
         thread: Some(thread),
+    })
+}
+
+/// Allocate the runtime-neutral packet handoffs and start latch used by every
+/// extension backend.
+pub(super) fn new_attempt_shared() -> Arc<AttemptShared> {
+    Arc::new(AttemptShared {
+        io: Arc::new(HostIo::new()),
+        start: Mutex::new(false),
+        start_cv: Condvar::new(),
     })
 }
 
@@ -1062,19 +1067,96 @@ fn failure(kind: FailureKind, context: &str, error: impl fmt::Display) -> Attemp
 }
 
 #[derive(Debug)]
-struct AttemptShared {
-    io: Arc<HostIo>,
-    start: Mutex<bool>,
-    start_cv: Condvar,
+pub(super) struct AttemptShared {
+    pub(super) io: Arc<HostIo>,
+    pub(super) start: Mutex<bool>,
+    pub(super) start_cv: Condvar,
 }
 
 #[derive(Debug)]
-struct HostIo {
-    incoming: Arc<PacketHandoff>,
-    outgoing: Arc<PacketHandoff>,
-    cancelled: AtomicBool,
+pub(super) struct HostIo {
+    pub(super) incoming: Arc<PacketHandoff>,
+    pub(super) outgoing: Arc<PacketHandoff>,
+    pub(super) cancelled: AtomicBool,
     bootstrap_complete: AtomicBool,
     monotonic_origin: Instant,
+}
+
+/// Native equivalent of `blit_v1`, used by the QuickJS backend through the
+/// same guest SDK bootstrap and packet reassembly code as Wasm guests.
+pub(super) struct NativeHost {
+    io: Arc<HostIo>,
+}
+
+impl NativeHost {
+    pub(super) fn new(io: Arc<HostIo>) -> Self {
+        Self { io }
+    }
+}
+
+impl blit_guest::native_host::Host for NativeHost {
+    fn send(&mut self, packet: &[u8]) -> i32 {
+        if !self.io.bootstrap_complete.load(Ordering::Acquire) {
+            return -1;
+        }
+        let Some(reservation) = self.io.outgoing.reserve_blocking() else {
+            return -1;
+        };
+        if reservation.commit(packet.to_vec()).is_err() {
+            return -1;
+        }
+        0
+    }
+
+    fn recv(&mut self, buffer: &mut [u8]) -> i32 {
+        let mut received_init = false;
+        let result = self.io.incoming.copy_blocking(buffer.len(), |packet| {
+            received_init = packet.get(..2)
+                == Some(
+                    &[
+                        blit_remote::extension::EXT_INFO,
+                        blit_remote::extension::EXT_INFO_INIT,
+                    ][..],
+                );
+            buffer[..packet.len()].copy_from_slice(packet);
+            Ok::<(), ()>(())
+        });
+        let result = match result {
+            Ok(result) => result,
+            Err(_) => return 0,
+        };
+        if received_init {
+            self.io.bootstrap_complete.store(true, Ordering::Release);
+        }
+        match result {
+            CopyResult::Closed => 0,
+            CopyResult::Copied(length) | CopyResult::TooSmall(length) => length as i32,
+        }
+    }
+
+    fn wait(&mut self, deadline_ns: i64) -> i32 {
+        match self.io.wait_for_incoming(deadline_ns) {
+            WaitResult::Deadline => 0,
+            WaitResult::Packet => 1,
+            WaitResult::Closed => 2,
+        }
+    }
+
+    fn clock(&mut self, kind: i32) -> i64 {
+        match kind {
+            0 => realtime_ns(),
+            1 => self.io.monotonic_ns(),
+            _ => 0,
+        }
+    }
+
+    fn random(&mut self, destination: &mut [u8]) {
+        let _ = getrandom::fill(destination);
+    }
+
+    fn try_random(&mut self, destination: &mut [u8]) -> bool {
+        getrandom::fill(destination).is_ok()
+    }
 }
 
 impl HostIo {
@@ -1088,7 +1170,7 @@ impl HostIo {
         }
     }
 
-    fn abort_handoffs(&self) {
+    pub(super) fn abort_handoffs(&self) {
         self.incoming.abort();
         self.outgoing.abort();
     }
@@ -1128,7 +1210,7 @@ enum WaitResult {
 }
 
 #[derive(Debug)]
-struct PacketHandoff {
+pub(super) struct PacketHandoff {
     state: Mutex<SlotState>,
     ready_cv: Condvar,
     available_cv: Condvar,
@@ -1249,7 +1331,7 @@ impl PacketHandoff {
         }
     }
 
-    fn seal_producer(&self) {
+    pub(super) fn seal_producer(&self) {
         let mut state = lock_unpoison(&self.state);
         state.producer_closed = true;
         drop(state);
@@ -1257,7 +1339,7 @@ impl PacketHandoff {
         self.notify_available();
     }
 
-    fn close_consumer(&self) {
+    pub(super) fn close_consumer(&self) {
         let mut state = lock_unpoison(&self.state);
         state.consumer_closed = true;
         state.packet.take();

@@ -275,10 +275,11 @@ Writes are compare-and-swap when you ask: `--if-hash H` writes only if the
 current value still hashes to H, exiting 1 on conflict. Without it a put is
 an unconditional overwrite. `--durable` waits for disk.
 
-## Wasmi extensions
+## Extensions
 
 ```bash
 blit ext run worker.wasm arg1 --guest-flag
+blit ext run worker.js arg1 --guest-flag
 blit ext list
 blit ext status NAME
 blit ext attach NAME
@@ -286,6 +287,15 @@ blit ext commands --on prod
 blit --on prod @builder --help
 blit --on prod @builder build --release app
 ```
+
+Objects beginning with the WebAssembly magic bytes run in Wasmi. Other
+objects must be UTF-8 ECMAScript modules and run directly in QuickJS. A
+QuickJS module may export a default function; its integer return value is the
+extension exit code. The global `blit` object provides the initialized
+`context`, complete-packet `send`/`recv`, `wait`/`waitUntil`, clocks, random
+bytes, sleep, and logging. `recv()` blocks and returns `undefined` only when the
+endpoint closes. `wait()` returns 1 for a packet and 2 for closure;
+`waitUntil()` also returns 0 when its deadline is reached.
 
 `blit ext commands` lists live command namespaces advertised by named,
 persistent extensions. Connection options must precede `@name`; every later

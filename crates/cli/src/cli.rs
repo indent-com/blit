@@ -76,7 +76,7 @@ pub struct ConnectOpts {
 /// Startup-only extension and native-channel deployment policy.
 #[derive(Args, Clone, Debug, Default)]
 pub struct ServerDeploymentOpts {
-    /// Disable Wasmi extensions (equivalent to BLIT_EXT=0)
+    /// Disable extensions (equivalent to BLIT_EXT=0)
     #[arg(long)]
     no_extensions: bool,
 
@@ -108,7 +108,7 @@ pub struct ServerDeploymentOpts {
     #[arg(long, value_name = "BYTES")]
     ext_argument_store_max: Option<u64>,
 
-    /// Maximum raw Wasm module bytes (hard ceiling: 64 MiB)
+    /// Maximum raw extension-object bytes (hard ceiling: 64 MiB)
     #[arg(long, value_name = "BYTES")]
     ext_module_max: Option<u64>,
 
@@ -140,7 +140,7 @@ pub struct ServerDeploymentOpts {
     #[arg(long, value_name = "N")]
     ext_max_validating: Option<u64>,
 
-    /// Maximum Wasm linear-memory bytes per attempt
+    /// Maximum runtime memory bytes per attempt
     #[arg(long, value_name = "BYTES")]
     ext_memory_max: Option<u64>,
 
@@ -200,7 +200,7 @@ pub struct ServerDeploymentOpts {
     #[arg(long, value_name = "N")]
     ext_table_elements_max: Option<u64>,
 
-    /// Maximum Wasmi value-stack bytes per attempt
+    /// Maximum interpreter value-stack bytes per attempt
     #[arg(long, value_name = "BYTES")]
     ext_value_stack_max: Option<u64>,
 
@@ -376,7 +376,7 @@ pub enum Command {
         command: LspCommand,
     },
 
-    /// Run and manage Wasmi extensions
+    /// Run and manage extensions
     #[command(name = "ext", alias = "extension")]
     Extension {
         #[command(subcommand)]
@@ -591,7 +591,7 @@ pub enum Command {
         #[arg(long)]
         allow_forward_insecure: bool,
 
-        /// Refuse durable Wasmi extensions and do not restore desired
+        /// Refuse durable extensions and do not restore desired
         /// definitions (or set BLIT_ALLOW_EXT_PERSIST=0). Transient
         /// extensions still run. This is the recovery path for a persistent
         /// definition that breaks the server it starts in.

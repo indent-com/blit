@@ -42,6 +42,7 @@ let
         || pkgs.lib.hasSuffix ".html" path
         || pkgs.lib.hasSuffix ".html.br" path
         || baseNameOf path == "learn.md"
+        || pkgs.lib.hasSuffix "/crates/guest/README.md" path
         || baseNameOf path == "LICENSE"
         || pkgs.lib.hasInfix "/js/ui/dist/" path
         || pkgs.lib.hasSuffix ".h264" path

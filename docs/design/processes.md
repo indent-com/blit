@@ -76,8 +76,8 @@ execution. The family occupies the free direction-local `0xC0` through `0xC7`
 block. Git reserves `0xB5` through `0xBF`, so this RFC does not consume that
 space.
 
-This is a normal Blit family. A Wasmi extension reaches it through
-`blit_v1.send` and `blit_v1.recv`; a network client sends the same packets over
+This is a normal Blit family. Wasmi and QuickJS extensions reach it through
+their ordinary packet endpoint; a network client sends the same packets over
 its existing transport. The server implementation and public catalog are
 shared. When `FEATURE_PROCESS` is advertised, every logical client may use it.
 
@@ -821,9 +821,9 @@ interprets them.
 
 The family uses the common status registry in [the protocol](../protocol.md).
 Its direction-local `0xC0` through `0xC7` block does not overlap existing Git
-allocations or the extension/channel proposal. A Wasmi extension can use it
-through the ordinary packet ABI once both independently negotiated features are
-available; neither RFC changes the other ABI.
+allocations or the extension/channel proposal. An extension can use it through
+the ordinary packet endpoint once both independently negotiated features are
+available; neither RFC changes the other runtime contract.
 
 Public references are meaningful only with the `boot_generation` advertised by
 the same `S2C_HELLO`. After a restart, clients discard cached references and

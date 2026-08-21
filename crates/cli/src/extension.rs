@@ -1,4 +1,4 @@
-//! `blit ext` — Wasmi extension lifecycle client.
+//! `blit ext` — extension lifecycle client.
 //!
 //! The wire adapter in this module is intentionally narrow.  The remote crate
 //! currently owns bounded C2S decoding and `EXT_INFO(INIT)`; until it also owns
@@ -88,8 +88,7 @@ pub struct RunArgs {
     /// A label, or the unique durable name under --persist
     pub name: String,
 
-    /// WebAssembly module (a path or an https:// URL) followed by UTF-8
-    /// arguments passed verbatim
+    /// Wasm or JavaScript extension (a path or an https:// URL), then UTF-8 arguments
     #[arg(
         value_names = ["MODULE", "ARGS"],
         num_args = 1..,
@@ -112,8 +111,7 @@ pub struct UpdateArgs {
     /// Exact persistent extension name
     pub name: String,
 
-    /// Replacement WebAssembly module (a path or an https:// URL) followed
-    /// by UTF-8 arguments passed verbatim
+    /// Replacement Wasm or JavaScript extension, then UTF-8 arguments
     #[arg(
         value_names = ["MODULE", "ARGS"],
         num_args = 1..,
@@ -125,7 +123,7 @@ pub struct UpdateArgs {
 
 #[derive(Subcommand, Clone, Debug)]
 pub enum ExtensionCommand {
-    /// Execute a WebAssembly extension
+    /// Execute a Wasm or JavaScript extension
     Run(RunArgs),
 
     /// List visible extensions
@@ -792,7 +790,7 @@ fn split_invocation(invocation: Vec<OsString>) -> Result<(ModuleSource, Vec<Stri
     let mut invocation = invocation.into_iter();
     let file = invocation
         .next()
-        .ok_or_else(|| "missing WebAssembly module MODULE".to_string())
+        .ok_or_else(|| "missing extension object MODULE".to_string())
         .and_then(ModuleSource::parse)?;
     let args = invocation
         .map(|arg| {
@@ -896,7 +894,7 @@ fn find_selectable<'a>(
     }
 }
 
-/// Where the module bytes come from. The server never learns either form:
+/// Where the extension bytes come from. The server never learns either form:
 /// `EXT_RUN` carries the BLAKE3 digest, so a locator is purely a client-side
 /// convenience that ends in the same content-addressed admission path.
 ///
@@ -910,7 +908,7 @@ enum ModuleSource {
     Url { url: String, pin: Option<[u8; 32]> },
 }
 
-/// How long a module download may take before the command gives up.
+/// How long an extension download may take before the command gives up.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn parse_digest(text: &str) -> Result<[u8; 32], String> {

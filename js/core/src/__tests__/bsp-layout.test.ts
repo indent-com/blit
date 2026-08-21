@@ -2,11 +2,14 @@ import { describe, it, expect } from "vitest";
 import {
   enumeratePanes,
   assignSessionsToPanes,
+  carryAssignmentsToPanes,
   assignmentsAfterDrop,
   buildCandidateOrder,
   reconcileAssignments,
   adjustWeights,
   surfaceAssignment,
+  editorAssignment,
+  webAssignment,
   PRESETS,
 } from "../bsp/layout";
 import { parseDSL } from "../bsp/dsl";
@@ -87,6 +90,53 @@ describe("assignSessionsToPanes", () => {
     const result = assignSessionsToPanes(panes, []);
     expect(result.assignments["0"]).toBeNull();
     expect(result.assignments["1"]).toBeNull();
+  });
+});
+
+describe("carryAssignmentsToPanes", () => {
+  it("leaves added panes empty instead of filling them with other live sessions", () => {
+    const currentPanes = enumeratePanes(parseDSL("line(a, b)").root);
+    const nextPanes = enumeratePanes(
+      parseDSL("col(line(a, b), line(c, d))").root,
+    );
+    const editor = editorAssignment("local", "/src/main.ts");
+
+    const result = carryAssignmentsToPanes({
+      currentPanes,
+      nextPanes,
+      previous: { assignments: { "0": "session-1", "1": editor } },
+      liveSessionIds: ["session-1", "session-2", "session-3"],
+    });
+
+    expect(result.assignments).toEqual({
+      "0.0": "session-1",
+      "0.1": editor,
+      "1.0": null,
+      "1.1": null,
+    });
+  });
+
+  it("carries every content kind across a layout change", () => {
+    const currentPanes = enumeratePanes(parseDSL("line(a, b, c)").root);
+    const nextPanes = enumeratePanes(parseDSL("col(a, b, c)").root);
+    const surface = surfaceAssignment("local", 7);
+    const editor = editorAssignment("local", "/src/main.ts");
+    const web = webAssignment("local", "http://localhost:3000");
+
+    const result = carryAssignmentsToPanes({
+      currentPanes,
+      nextPanes,
+      previous: {
+        assignments: { "0": surface, "1": editor, "2": web },
+      },
+      liveSessionIds: [],
+    });
+
+    expect(result.assignments).toEqual({
+      "0": surface,
+      "1": editor,
+      "2": web,
+    });
   });
 });
 

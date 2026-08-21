@@ -134,7 +134,7 @@ blit --on local:test terminal start htop # auto-starts a second instance
 ```
 
 Every server has a name; omitting `--name` uses `default`. Each instance uses a
-named socket and stores its KV database, installed extensions, and Wasm cache
+named socket and stores its KV database, installed extensions, and object cache
 under `blit/instances/<name>/` in the platform state/cache directories. The
 `@session` extension's intent is in that instance's KV database, while
 `@muster` reads the corresponding platform configuration directory at

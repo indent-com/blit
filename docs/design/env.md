@@ -21,13 +21,13 @@ in the whole server — inside a dead function — and no message carried the
 compositor socket, `XDG_RUNTIME_DIR`, the desktop bus address, or the audio
 sockets. That knowledge belonged solely to the PTY spawn path.
 
-The immediate consumer is a Wasm extension. An extension's host ABI is five
-imports — `send`, `recv`, `wait`, `clock`, `random` — with no filesystem, no
-process, and no environment access; everything else it does, it does by speaking
-this protocol as an ordinary client. So an extension that wants to enumerate
-installed applications cannot read `XDG_DATA_DIRS` to find them. It can already
-_read_ `/usr/share/applications` through the fs family, which accepts an
-arbitrary root. It just could not find out where to look.
+The immediate consumer is an extension. Wasm's five-import host ABI and
+QuickJS's native bindings both expose the same packet endpoint, with no direct
+filesystem, process, or environment access; everything else an extension does,
+it does by speaking this protocol as an ordinary client. So an extension that
+wants to enumerate installed applications cannot read `XDG_DATA_DIRS` to find
+them. It can already _read_ `/usr/share/applications` through the fs family,
+which accepts an arbitrary root. It just could not find out where to look.
 
 Putting this in the protocol rather than adding a sixth wasm import is
 deliberate: the ABI is kept minimal on purpose, and a protocol family gets
