@@ -88,6 +88,7 @@ only for targeted captures.
 ```bash
 blit events config
 blit events set --events 'default,+frame.*,+pty.*' --size 8388608
+blit events set --if-revision 12 --events default --size 1048576
 blit events dump > snapshot.events              # one binary snapshot
 blit events tail > live.events                  # history, then follow
 blit events tail --from-now -o live.events      # follow new events locally
@@ -98,7 +99,10 @@ blit events record stop "$ID"
 
 `dump` and `tail` write binary `BLITEVT1` data to stdout unless `--output`
 names a local path. `record` paths are on the server and continue after the
-starting client disconnects.
+starting client disconnects. A recording id is returned only after its header
+and history are flushed; `record list` shows state, counters, and delayed write
+errors. Event operations from extensions use the same access and stream budgets
+as direct clients.
 
 ## Commands in a live shell
 

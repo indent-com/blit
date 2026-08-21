@@ -34,6 +34,13 @@ pub const EVENTS_STREAMS: u8 = 8;
 pub const EVENTS_TARGET_CLIENT: u8 = 0;
 pub const EVENTS_TARGET_FILE: u8 = 1;
 
+/// Sentinel in CONFIG_SET for an unconditional configuration replacement.
+pub const EVENTS_CONFIG_REVISION_ANY: u64 = u64::MAX;
+
+pub const EVENTS_STREAM_STATE_RUNNING: u8 = 1;
+pub const EVENTS_STREAM_STATE_STOPPED: u8 = 2;
+pub const EVENTS_STREAM_STATE_FAILED: u8 = 3;
+
 /// Start a stream with the current retained history before live records.
 pub const EVENTS_STREAM_HISTORY: u8 = 1 << 0;
 /// Open a file target for append instead of truncating it.
@@ -48,6 +55,16 @@ pub const EVENT_RECORD_HEADER_LEN: usize = 32;
 /// Synthetic record type used only by file streams when their live receiver
 /// lagged. Its payload is one little-endian `u64` count.
 pub const EVENT_TYPE_STREAM_GAP: u16 = u16::MAX;
+
+/// Stages in a correlated `pty.create` payload. The fixed payload is
+/// `[connection_id:u64][nonce:u16][stage:u8][status:u8][pty_id:u16]`.
+pub const PTY_CREATE_REQUEST_RECEIVED: u8 = 1;
+pub const PTY_CREATE_SESSION_ACQUIRED: u8 = 2;
+pub const PTY_CREATE_SPAWN_BEGIN: u8 = 3;
+pub const PTY_CREATE_SPAWN_END: u8 = 4;
+pub const PTY_CREATE_REGISTERED: u8 = 5;
+pub const PTY_CREATE_REFUSED: u8 = 6;
+pub const PTY_CREATE_REPLY_WRITTEN: u8 = 7;
 
 /// Stable event ids. The numeric value is also its activation-bit index.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -295,6 +312,7 @@ pub enum EventsRequest<'a> {
     },
     ConfigSet {
         nonce: u16,
+        expected_revision: u64,
         size: u64,
         activations: ActivationSet,
     },
@@ -360,16 +378,19 @@ pub fn parse_events_request(packet: &[u8]) -> Result<EventsRequest<'_>, EventsDe
         EVENTS_CONFIG_GET if body.is_empty() => Ok(EventsRequest::ConfigGet { nonce }),
         EVENTS_CONFIG_GET => Err(EventsDecodeError::TrailingBytes),
         EVENTS_CONFIG_SET => {
-            if body.len() < 8 + ACTIVATION_BYTES {
+            if body.len() < 16 + ACTIVATION_BYTES {
                 return Err(EventsDecodeError::Truncated);
             }
-            if body.len() != 8 + ACTIVATION_BYTES {
+            if body.len() != 16 + ACTIVATION_BYTES {
                 return Err(EventsDecodeError::TrailingBytes);
             }
             Ok(EventsRequest::ConfigSet {
                 nonce,
-                size: u64::from_le_bytes(body[..8].try_into().expect("checked length")),
-                activations: ActivationSet::from_bytes(&body[8..]).expect("checked length"),
+                expected_revision: u64::from_le_bytes(
+                    body[..8].try_into().expect("checked length"),
+                ),
+                size: u64::from_le_bytes(body[8..16].try_into().expect("checked length")),
+                activations: ActivationSet::from_bytes(&body[16..]).expect("checked length"),
             })
         }
         EVENTS_DUMP if body.is_empty() => Ok(EventsRequest::Dump { nonce }),
@@ -438,8 +459,14 @@ pub fn msg_events_config_get(nonce: u16) -> Vec<u8> {
     request(EVENTS_CONFIG_GET, nonce)
 }
 
-pub fn msg_events_config_set(nonce: u16, size: u64, activations: ActivationSet) -> Vec<u8> {
+pub fn msg_events_config_set(
+    nonce: u16,
+    expected_revision: u64,
+    size: u64,
+    activations: ActivationSet,
+) -> Vec<u8> {
     let mut msg = request(EVENTS_CONFIG_SET, nonce);
+    msg.extend_from_slice(&expected_revision.to_le_bytes());
     msg.extend_from_slice(&size.to_le_bytes());
     msg.extend_from_slice(&activations.to_bytes());
     msg
@@ -473,15 +500,31 @@ pub fn msg_events_stream_list(nonce: u16) -> Vec<u8> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EventStreamInfo<'a> {
     pub stream_id: u32,
-    pub running: bool,
+    pub state: u8,
     pub flags: u8,
+    pub records: u64,
+    pub bytes: u64,
+    pub lost: u64,
     pub path: &'a str,
+    pub error: &'a str,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EventConfig {
+    pub revision: u64,
+    pub size: u64,
+    pub used: u64,
+    pub records: u64,
+    pub dropped: u64,
+    pub next_sequence: u64,
+    pub activations: ActivationSet,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EventsMessage<'a> {
     Config {
         nonce: u16,
+        revision: u64,
         size: u64,
         used: u64,
         records: u64,
@@ -505,9 +548,10 @@ pub enum EventsMessage<'a> {
         stream_id: u32,
         detail: &'a str,
     },
-    Record {
+    Records {
         stream_id: u32,
-        record: &'a [u8],
+        count: u16,
+        records: &'a [u8],
     },
     StreamStopped {
         stream_id: u32,
@@ -530,20 +574,19 @@ fn response(kind: u8, nonce: u16) -> Vec<u8> {
     msg
 }
 
-pub fn msg_events_config(
-    nonce: u16,
-    size: u64,
-    used: u64,
-    records: u64,
-    dropped: u64,
-    next_sequence: u64,
-    activations: ActivationSet,
-) -> Vec<u8> {
+pub fn msg_events_config(nonce: u16, config: EventConfig) -> Vec<u8> {
     let mut msg = response(EVENTS_CONFIG, nonce);
-    for value in [size, used, records, dropped, next_sequence] {
+    for value in [
+        config.revision,
+        config.size,
+        config.used,
+        config.records,
+        config.dropped,
+        config.next_sequence,
+    ] {
         msg.extend_from_slice(&value.to_le_bytes());
     }
-    msg.extend_from_slice(&activations.to_bytes());
+    msg.extend_from_slice(&config.activations.to_bytes());
     msg
 }
 
@@ -569,10 +612,14 @@ pub fn msg_events_stream_started(nonce: u16, status: u8, stream_id: u32, detail:
     msg
 }
 
-pub fn msg_events_record(stream_id: u32, record: &[u8]) -> Vec<u8> {
+pub fn msg_events_records<T: AsRef<[u8]>>(stream_id: u32, records: &[T]) -> Vec<u8> {
+    let count = records.len().min(u16::MAX as usize);
     let mut msg = vec![EVENTS, EVENTS_VERSION, EVENTS_RECORD];
     msg.extend_from_slice(&stream_id.to_le_bytes());
-    msg.extend_from_slice(record);
+    msg.extend_from_slice(&(count as u16).to_le_bytes());
+    for record in &records[..count] {
+        msg.extend_from_slice(record.as_ref());
+    }
     msg
 }
 
@@ -601,10 +648,19 @@ pub fn msg_events_streams(nonce: u16, streams: &[EventStreamInfo<'_>]) -> Vec<u8
             path_len -= 1;
         }
         msg.extend_from_slice(&stream.stream_id.to_le_bytes());
-        msg.push(u8::from(stream.running));
+        let mut error_len = stream.error.len().min(u16::MAX as usize);
+        while !stream.error.is_char_boundary(error_len) {
+            error_len -= 1;
+        }
+        msg.push(stream.state);
         msg.push(stream.flags & EVENTS_STREAM_FLAGS);
+        msg.extend_from_slice(&stream.records.to_le_bytes());
+        msg.extend_from_slice(&stream.bytes.to_le_bytes());
+        msg.extend_from_slice(&stream.lost.to_le_bytes());
         msg.extend_from_slice(&(path_len as u16).to_le_bytes());
+        msg.extend_from_slice(&(error_len as u16).to_le_bytes());
         msg.extend_from_slice(&stream.path.as_bytes()[..path_len]);
+        msg.extend_from_slice(&stream.error.as_bytes()[..error_len]);
     }
     msg
 }
@@ -621,7 +677,7 @@ pub fn parse_events_message(packet: &[u8]) -> Result<EventsMessage<'_>, EventsDe
     }
     match packet[2] {
         EVENTS_CONFIG => {
-            let expected = 5 + 5 * 8 + ACTIVATION_BYTES;
+            let expected = 5 + 6 * 8 + ACTIVATION_BYTES;
             if packet.len() < expected {
                 return Err(EventsDecodeError::Truncated);
             }
@@ -637,6 +693,7 @@ pub fn parse_events_message(packet: &[u8]) -> Result<EventsMessage<'_>, EventsDe
             };
             Ok(EventsMessage::Config {
                 nonce,
+                revision: take_u64(),
                 size: take_u64(),
                 used: take_u64(),
                 records: take_u64(),
@@ -680,20 +737,34 @@ pub fn parse_events_message(packet: &[u8]) -> Result<EventsMessage<'_>, EventsDe
             })
         }
         EVENTS_RECORD => {
-            if packet.len() < 7 + EVENT_RECORD_HEADER_LEN {
+            if packet.len() < 9 {
                 return Err(EventsDecodeError::Truncated);
             }
-            let record_len =
-                u32::from_le_bytes(packet[7..11].try_into().expect("checked")) as usize;
-            if record_len < EVENT_RECORD_HEADER_LEN || packet.len() < 7 + record_len {
-                return Err(EventsDecodeError::Truncated);
+            let count = u16::from_le_bytes(packet[7..9].try_into().expect("checked"));
+            if count == 0 {
+                return Err(EventsDecodeError::InvalidFlags);
             }
-            if packet.len() != 7 + record_len {
+            let mut at = 9;
+            for _ in 0..count {
+                if packet.len().saturating_sub(at) < EVENT_RECORD_HEADER_LEN {
+                    return Err(EventsDecodeError::Truncated);
+                }
+                let record_len =
+                    u32::from_le_bytes(packet[at..at + 4].try_into().expect("checked")) as usize;
+                if record_len < EVENT_RECORD_HEADER_LEN
+                    || packet.len().saturating_sub(at) < record_len
+                {
+                    return Err(EventsDecodeError::Truncated);
+                }
+                at += record_len;
+            }
+            if at != packet.len() {
                 return Err(EventsDecodeError::TrailingBytes);
             }
-            Ok(EventsMessage::Record {
+            Ok(EventsMessage::Records {
                 stream_id: u32::from_le_bytes(packet[3..7].try_into().expect("checked")),
-                record: &packet[7..],
+                count,
+                records: &packet[9..],
             })
         }
         EVENTS_STREAM_STOPPED => {
@@ -728,32 +799,50 @@ pub fn parse_events_message(packet: &[u8]) -> Result<EventsMessage<'_>, EventsDe
             let mut at = 7;
             let mut streams = Vec::with_capacity(count);
             for _ in 0..count {
-                if packet.len().saturating_sub(at) < 8 {
+                if packet.len().saturating_sub(at) < 34 {
                     return Err(EventsDecodeError::Truncated);
                 }
                 let stream_id = u32::from_le_bytes(packet[at..at + 4].try_into().expect("checked"));
-                let running = match packet[at + 4] {
-                    0 => false,
-                    1 => true,
-                    _ => return Err(EventsDecodeError::InvalidFlags),
-                };
+                let state = packet[at + 4];
+                if !matches!(
+                    state,
+                    EVENTS_STREAM_STATE_RUNNING
+                        | EVENTS_STREAM_STATE_STOPPED
+                        | EVENTS_STREAM_STATE_FAILED
+                ) {
+                    return Err(EventsDecodeError::InvalidFlags);
+                }
                 let flags = packet[at + 5];
                 if flags & !EVENTS_STREAM_FLAGS != 0 {
                     return Err(EventsDecodeError::InvalidFlags);
                 }
-                let path_len = u16::from_le_bytes([packet[at + 6], packet[at + 7]]) as usize;
-                at += 8;
-                if packet.len().saturating_sub(at) < path_len {
+                let records =
+                    u64::from_le_bytes(packet[at + 6..at + 14].try_into().expect("checked"));
+                let bytes =
+                    u64::from_le_bytes(packet[at + 14..at + 22].try_into().expect("checked"));
+                let lost =
+                    u64::from_le_bytes(packet[at + 22..at + 30].try_into().expect("checked"));
+                let path_len = u16::from_le_bytes([packet[at + 30], packet[at + 31]]) as usize;
+                let error_len = u16::from_le_bytes([packet[at + 32], packet[at + 33]]) as usize;
+                at += 34;
+                if packet.len().saturating_sub(at) < path_len.saturating_add(error_len) {
                     return Err(EventsDecodeError::Truncated);
                 }
                 let path = std::str::from_utf8(&packet[at..at + path_len])
                     .map_err(|_| EventsDecodeError::InvalidPath)?;
                 at += path_len;
+                let error = std::str::from_utf8(&packet[at..at + error_len])
+                    .map_err(|_| EventsDecodeError::InvalidPath)?;
+                at += error_len;
                 streams.push(EventStreamInfo {
                     stream_id,
-                    running,
+                    state,
                     flags,
+                    records,
+                    bytes,
+                    lost,
                     path,
+                    error,
                 });
             }
             if at != packet.len() {
@@ -787,9 +876,10 @@ mod tests {
     fn request_codecs_round_trip() {
         let activations = ActivationSet([1, 2, 3, 4]);
         assert_eq!(
-            parse_events_request(&msg_events_config_set(9, 1024, activations)).unwrap(),
+            parse_events_request(&msg_events_config_set(9, 17, 1024, activations)).unwrap(),
             EventsRequest::ConfigSet {
                 nonce: 9,
+                expected_revision: 17,
                 size: 1024,
                 activations
             }
@@ -825,11 +915,23 @@ mod tests {
     #[test]
     fn response_codecs_round_trip() {
         let activations = ActivationSet([5, 6, 7, 8]);
-        let msg = msg_events_config(2, 100, 80, 3, 4, 9, activations);
+        let msg = msg_events_config(
+            2,
+            EventConfig {
+                revision: 17,
+                size: 100,
+                used: 80,
+                records: 3,
+                dropped: 4,
+                next_sequence: 9,
+                activations,
+            },
+        );
         assert_eq!(
             parse_events_message(&msg).unwrap(),
             EventsMessage::Config {
                 nonce: 2,
+                revision: 17,
                 size: 100,
                 used: 80,
                 records: 3,
@@ -850,9 +952,13 @@ mod tests {
         );
         let streams = [EventStreamInfo {
             stream_id: 12,
-            running: true,
+            state: EVENTS_STREAM_STATE_FAILED,
             flags: EVENTS_STREAM_HISTORY,
+            records: 19,
+            bytes: 2048,
+            lost: 3,
             path: "/tmp/events.bin",
+            error: "disk full",
         }];
         let message = msg_events_streams(5, &streams);
         assert_eq!(
@@ -860,6 +966,19 @@ mod tests {
             EventsMessage::Streams {
                 nonce: 5,
                 streams: streams.to_vec(),
+            }
+        );
+        let record = [EVENT_RECORD_HEADER_LEN as u8; EVENT_RECORD_HEADER_LEN];
+        let mut record = record.to_vec();
+        record[..4].copy_from_slice(&(EVENT_RECORD_HEADER_LEN as u32).to_le_bytes());
+        let records = [&record[..], &record[..]];
+        let message = msg_events_records(9, &records);
+        assert_eq!(
+            parse_events_message(&message).unwrap(),
+            EventsMessage::Records {
+                stream_id: 9,
+                count: 2,
+                records: &[record.as_slice(), record.as_slice()].concat(),
             }
         );
     }

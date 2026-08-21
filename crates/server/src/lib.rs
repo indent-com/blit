@@ -40,14 +40,15 @@ use blit_remote::{
     FEATURE_CREATE_NO_SUBSCRIBE, FEATURE_CREATE_NONCE, FEATURE_CREATE_STATUS, FEATURE_KILL_MODE,
     FEATURE_PTY_DEADLINE, FEATURE_RESIZE_BATCH, FEATURE_RESTART, FEATURE_SCROLL_BY, FrameState,
     KICK_REASON_MAX, KILL_LEADER_ONLY, READ_ANSI, READ_TAIL, REMOTE_INPUT_POINTER,
-    REMOTE_INPUT_TOUCH, S2C_CLOSED, S2C_CREATED, S2C_CREATED_N, S2C_LIST, S2C_PING, S2C_QUIT,
-    S2C_READY, S2C_SEARCH_RESULTS, S2C_SURFACE_CAPTURE, S2C_SURFACE_LIST, S2C_TEXT, S2C_TITLE,
-    STATUS_BUDGET, STATUS_INVALID, STATUS_NOT_FOUND, STATUS_OK, STATUS_OTHER, STATUS_TOO_LARGE,
-    SURFACE_FRAME_CODEC_H264, SURFACE_FRAME_FLAG_KEYFRAME, SURFACE_POINTER_AXIS2_LEN,
-    SURFACE_POINTER_DOWN, SURFACE_POINTER_LEAVE, SURFACE_POINTER_MOVE, SURFACE_POINTER_UP,
-    SURFACE_TOUCH_CANCEL, SURFACE_TOUCH_DISABLE, SURFACE_TOUCH_DOWN, SURFACE_TOUCH_ENABLE,
-    SURFACE_TOUCH_MOTION, SURFACE_TOUCH_UP, build_update_msg, clamp_cursor_rect, msg_copy_failed,
-    msg_hello, msg_kick_result, msg_kicked, msg_s2c_client_list, msg_s2c_client_list2,
+    REMOTE_INPUT_TOUCH, S2C_CLOSED, S2C_CREATE_FAILED, S2C_CREATED, S2C_CREATED_N, S2C_LIST,
+    S2C_PING, S2C_QUIT, S2C_READY, S2C_SEARCH_RESULTS, S2C_SURFACE_CAPTURE, S2C_SURFACE_LIST,
+    S2C_TEXT, S2C_TITLE, STATUS_BUDGET, STATUS_CONFLICT, STATUS_INVALID, STATUS_NOT_FOUND,
+    STATUS_OK, STATUS_OTHER, STATUS_TOO_LARGE, SURFACE_FRAME_CODEC_H264,
+    SURFACE_FRAME_FLAG_KEYFRAME, SURFACE_POINTER_AXIS2_LEN, SURFACE_POINTER_DOWN,
+    SURFACE_POINTER_LEAVE, SURFACE_POINTER_MOVE, SURFACE_POINTER_UP, SURFACE_TOUCH_CANCEL,
+    SURFACE_TOUCH_DISABLE, SURFACE_TOUCH_DOWN, SURFACE_TOUCH_ENABLE, SURFACE_TOUCH_MOTION,
+    SURFACE_TOUCH_UP, build_update_msg, clamp_cursor_rect, msg_copy_failed, msg_hello,
+    msg_kick_result, msg_kicked, msg_s2c_client_list, msg_s2c_client_list2,
     msg_s2c_clipboard_content, msg_s2c_clipboard_list, msg_s2c_clipboard_owner,
     msg_s2c_scroll_offset, msg_s2c_surface_remote_input, msg_s2c_used_rows, msg_surface_activated,
     msg_surface_app_id, msg_surface_created, msg_surface_destroyed, msg_surface_encoder,
@@ -1619,6 +1620,38 @@ async fn write_frame_counted_with_timeout(
     if !recursive_event_record {
         let _ = EVENT_WRITE_CONTEXT.try_with(|(log, client_id)| {
             let client_id = client_id.load(Ordering::Relaxed);
+            match payload.first().copied() {
+                Some(S2C_CREATED_N) if payload.len() >= 5 => {
+                    let nonce = u16::from_le_bytes([payload[1], payload[2]]);
+                    let pty_id = u16::from_le_bytes([payload[3], payload[4]]);
+                    blit_event!(
+                        log,
+                        EventType::PtyCreate,
+                        events::payload_pty_create_stage(
+                            client_id,
+                            nonce,
+                            blit_remote::events::PTY_CREATE_REPLY_WRITTEN,
+                            STATUS_OK,
+                            pty_id,
+                        )
+                    );
+                }
+                Some(S2C_CREATE_FAILED) if payload.len() >= 4 => {
+                    let nonce = u16::from_le_bytes([payload[1], payload[2]]);
+                    blit_event!(
+                        log,
+                        EventType::PtyCreate,
+                        events::payload_pty_create_stage(
+                            client_id,
+                            nonce,
+                            blit_remote::events::PTY_CREATE_REPLY_WRITTEN,
+                            payload[3],
+                            0,
+                        )
+                    );
+                }
+                _ => {}
+            }
             blit_event!(
                 log,
                 EventType::FrameWrite,
@@ -9153,6 +9186,7 @@ fn resolve_term_cwd(osc7: Option<&str>, kernel: impl FnOnce() -> Option<String>)
 /// no-op for them — a server must not send `S2C_CREATE_FAILED` to a client
 /// that did not ask for it (docs/protocol.md, "Common status registry").
 fn refuse_create(
+    event_log: &events::EventLog,
     sess: &Session,
     client_id: u64,
     want_status: bool,
@@ -9160,6 +9194,17 @@ fn refuse_create(
     status: u8,
     detail: &str,
 ) {
+    blit_event!(
+        event_log,
+        EventType::PtyCreate,
+        events::payload_pty_create_stage(
+            client_id,
+            nonce,
+            blit_remote::events::PTY_CREATE_REFUSED,
+            status,
+            0,
+        )
+    );
     if !want_status {
         return;
     }
@@ -9963,7 +10008,11 @@ pub async fn run(config: Config) {
             }),
             Err(error) => {
                 eprintln!("blit-server: event file stream: {error}");
-                blit_event!(event_log, EventType::Error, events::payload_name(&error));
+                blit_event!(
+                    event_log,
+                    EventType::Error,
+                    events::payload_name(&error.to_string())
+                );
             }
         }
     }
@@ -17823,15 +17872,18 @@ fn protocol_event_type(opcode: u8) -> Option<EventType> {
 }
 
 fn events_config_message(state: &AppState, nonce: u16) -> Vec<u8> {
-    let stats = state.events.stats();
+    let (stats, activations) = state.events.configuration();
     blit_remote::events::msg_events_config(
         nonce,
-        stats.capacity as u64,
-        stats.used as u64,
-        stats.records,
-        stats.dropped,
-        stats.next_sequence,
-        state.events.activations(),
+        blit_remote::events::EventConfig {
+            revision: stats.revision,
+            size: stats.capacity as u64,
+            used: stats.used as u64,
+            records: stats.records,
+            dropped: stats.dropped,
+            next_sequence: stats.next_sequence,
+            activations,
+        },
     )
 }
 
@@ -17844,7 +17896,7 @@ async fn handle_events_message(
 ) {
     use blit_remote::events::{
         EVENTS_STREAM_HISTORY, EVENTS_TARGET_CLIENT, EventStreamInfo, EventsRequest,
-        msg_events_dumped, msg_events_record, msg_events_result, msg_events_stream_gap,
+        msg_events_dumped, msg_events_records, msg_events_result, msg_events_stream_gap,
         msg_events_stream_started, msg_events_stream_stopped, msg_events_streams,
         parse_events_request,
     };
@@ -17874,6 +17926,7 @@ async fn handle_events_message(
         }
         EventsRequest::ConfigSet {
             nonce,
+            expected_revision,
             size,
             activations,
         } => {
@@ -17887,20 +17940,45 @@ async fn handle_events_message(
                 return;
             };
             let log = state.events.clone();
-            let result =
-                tokio::task::spawn_blocking(move || log.configure(size, activations)).await;
+            let expected_revision = (expected_revision
+                != blit_remote::events::EVENTS_CONFIG_REVISION_ANY)
+                .then_some(expected_revision);
+            let result = tokio::task::spawn_blocking(move || {
+                log.configure(size, activations, expected_revision)
+            })
+            .await;
             match result {
-                Ok(Ok(_)) => {
+                Ok(Ok(stats)) => {
                     blit_event!(state.events, EventType::ConfigChange, {
                         let mut payload = events::payload_client(client_id);
                         payload.extend_from_slice(&(size as u64).to_le_bytes());
                         payload.extend_from_slice(&activations.to_bytes());
                         payload
                     });
-                    let _ = out.send(events_config_message(state, nonce));
+                    // Reply with the revision produced by this replacement,
+                    // even if another update races with response delivery.
+                    // A temporary capture can then safely use this exact
+                    // revision as the condition for restoring its settings.
+                    let _ = out.send(blit_remote::events::msg_events_config(
+                        nonce,
+                        blit_remote::events::EventConfig {
+                            revision: stats.revision,
+                            size: stats.capacity as u64,
+                            used: stats.used as u64,
+                            records: stats.records,
+                            dropped: stats.dropped,
+                            next_sequence: stats.next_sequence,
+                            activations,
+                        },
+                    ));
                 }
-                Ok(Err(detail)) => {
-                    let _ = out.send(msg_events_result(nonce, STATUS_INVALID, 0, detail));
+                Ok(Err(error)) => {
+                    let status = if error == events::ConfigureError::Conflict {
+                        STATUS_CONFLICT
+                    } else {
+                        STATUS_INVALID
+                    };
+                    let _ = out.send(msg_events_result(nonce, status, 0, &error.to_string()));
                 }
                 Err(_) => {
                     let _ = out.send(msg_events_result(
@@ -17938,6 +18016,16 @@ async fn handle_events_message(
             flags,
             path: _,
         } if target == EVENTS_TARGET_CLIENT => {
+            client_streams.retain(|_, task| !task.is_finished());
+            if client_streams.len() >= events::MAX_CLIENT_STREAMS_PER_CONNECTION {
+                let _ = out.send(msg_events_stream_started(
+                    nonce,
+                    STATUS_BUDGET,
+                    0,
+                    "live event tail capacity exhausted for this connection",
+                ));
+                return;
+            }
             let history = flags & EVENTS_STREAM_HISTORY != 0;
             let (stream_id, dump, mut receiver) = state.events.client_stream(history);
             let _ = out.send(msg_events_stream_started(nonce, STATUS_OK, stream_id, ""));
@@ -17959,19 +18047,53 @@ async fn handle_events_message(
                     );
                     return;
                 }
+                let mut batch = Vec::with_capacity(64);
+                let mut pending = None;
                 loop {
-                    match receiver.recv().await {
-                        Ok(record) => {
-                            if out.send(msg_events_record(stream_id, &record)).is_err() {
-                                break;
-                            }
-                        }
+                    batch.clear();
+                    let first = if let Some(record) = pending.take() {
+                        Ok(record)
+                    } else {
+                        receiver.recv().await
+                    };
+                    match first {
+                        Ok(record) => batch.push(record),
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(lost)) => {
                             if out.send(msg_events_stream_gap(stream_id, lost)).is_err() {
                                 break;
                             }
+                            continue;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                    let mut bytes = batch[0].len();
+                    let mut lost = 0u64;
+                    while batch.len() < u16::MAX as usize {
+                        match receiver.try_recv() {
+                            Ok(record)
+                                if bytes.saturating_add(record.len())
+                                    <= events::LIVE_BATCH_MAX_BYTES =>
+                            {
+                                bytes += record.len();
+                                batch.push(record);
+                            }
+                            Ok(record) => {
+                                pending = Some(record);
+                                break;
+                            }
+                            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(count)) => {
+                                lost = lost.saturating_add(count);
+                                break;
+                            }
+                            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+                            | Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+                        }
+                    }
+                    if out.send(msg_events_records(stream_id, &batch)).is_err() {
+                        break;
+                    }
+                    if lost != 0 && out.send(msg_events_stream_gap(stream_id, lost)).is_err() {
+                        break;
                     }
                 }
                 let _ = out.send(msg_events_stream_stopped(stream_id, STATUS_OK, ""));
@@ -18006,13 +18128,24 @@ async fn handle_events_message(
                 });
             }
             Err(error) => {
-                let _ = out.send(msg_events_stream_started(nonce, STATUS_OTHER, 0, &error));
+                let status = if matches!(error, events::StartFileStreamError::Budget) {
+                    STATUS_BUDGET
+                } else {
+                    STATUS_OTHER
+                };
+                let _ = out.send(msg_events_stream_started(
+                    nonce,
+                    status,
+                    0,
+                    &error.to_string(),
+                ));
             }
         },
         EventsRequest::StreamStop { nonce, stream_id } => {
             let stopped_client = if let Some(task) = client_streams.remove(&stream_id) {
                 let was_running = !task.is_finished();
                 task.abort();
+                let _ = task.await;
                 if was_running {
                     blit_event!(
                         state.events,
@@ -18024,14 +18157,19 @@ async fn handle_events_message(
             } else {
                 false
             };
-            let stopped = stopped_client || state.events.stop_file_stream(stream_id).await;
-            let status = if stopped { STATUS_OK } else { STATUS_NOT_FOUND };
-            let detail = if stopped {
-                ""
+            let file_result = if stopped_client {
+                Ok(false)
             } else {
-                "event stream not found"
+                state.events.stop_file_stream(stream_id).await
             };
-            let _ = out.send(msg_events_result(nonce, status, stream_id, detail));
+            let (stopped, status, detail) = match file_result {
+                Ok(stopped_file) if stopped_client || stopped_file => {
+                    (true, STATUS_OK, String::new())
+                }
+                Ok(_) => (false, STATUS_NOT_FOUND, "event stream not found".to_owned()),
+                Err(error) => (true, STATUS_OTHER, error),
+            };
+            let _ = out.send(msg_events_result(nonce, status, stream_id, &detail));
             if stopped {
                 blit_event!(state.events, EventType::StreamStop, {
                     let mut payload = events::payload_client(client_id);
@@ -18046,9 +18184,13 @@ async fn handle_events_message(
                 .iter()
                 .map(|stream| EventStreamInfo {
                     stream_id: stream.id,
-                    running: stream.running,
+                    state: stream.state,
                     flags: stream.flags,
+                    records: stream.records,
+                    bytes: stream.bytes,
+                    lost: stream.lost,
                     path: &stream.path,
+                    error: &stream.error,
                 })
                 .collect::<Vec<_>>();
             let _ = out.send(msg_events_streams(nonce, &wire));
@@ -18786,10 +18928,7 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
         let features = features | FEATURE_CREATE_EXEC;
         // BLIT_LSP=0 disables the family: the bit is simply not
         // advertised, matching the dispatch gate.
-        let mut features = features;
-        if !extension_origin {
-            features |= blit_remote::events::FEATURE_EVENTS;
-        }
+        let mut features = features | blit_remote::events::FEATURE_EVENTS;
         if lsp_enabled {
             features |= blit_remote::lsp::FEATURE_LSP;
         }
@@ -19152,25 +19291,7 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
         }
 
         if data[0] == blit_remote::events::EVENTS {
-            if extension_origin {
-                if data.len() >= 5 {
-                    let nonce = u16::from_le_bytes([data[3], data[4]]);
-                    let _ = event_out.send(blit_remote::events::msg_events_result(
-                        nonce,
-                        blit_remote::STATUS_PERMISSION,
-                        0,
-                        "event inspection is unavailable to extension endpoints",
-                    ));
-                }
-                blit_event!(
-                    state.events,
-                    EventType::ProtocolError,
-                    events::payload_name("extension attempted event inspection")
-                );
-            } else {
-                handle_events_message(&data, &state, &event_out, &mut event_streams, client_id)
-                    .await;
-            }
+            handle_events_message(&data, &state, &event_out, &mut event_streams, client_id).await;
             continue;
         }
 
@@ -20083,7 +20204,40 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
             break;
         }
 
+        let create2_nonce = if data[0] == C2S_CREATE2 {
+            blit_remote::parse_create2(&data)
+                .ok()
+                .map(|request| request.nonce)
+        } else {
+            None
+        };
+        if let Some(nonce) = create2_nonce {
+            blit_event!(
+                state.events,
+                EventType::PtyCreate,
+                events::payload_pty_create_stage(
+                    client_id,
+                    nonce,
+                    blit_remote::events::PTY_CREATE_REQUEST_RECEIVED,
+                    STATUS_OK,
+                    0,
+                )
+            );
+        }
         let mut sess = state.session.lock().await;
+        if let Some(nonce) = create2_nonce {
+            blit_event!(
+                state.events,
+                EventType::PtyCreate,
+                events::payload_pty_create_stage(
+                    client_id,
+                    nonce,
+                    blit_remote::events::PTY_CREATE_SESSION_ACQUIRED,
+                    STATUS_OK,
+                    0,
+                )
+            );
+        }
         let mut need_nudge = false;
         // Verbose output may be a blocking pipe under a supervisor. Defer
         // potentially hot diagnostics until after the session mutex is
@@ -20968,6 +21122,7 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     Err(err) => {
                         if let Some(nonce) = err.nonce {
                             refuse_create(
+                                &state.events,
                                 &sess,
                                 client_id,
                                 err.want_status,
@@ -20990,6 +21145,7 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                 // no (docs/protocol.md, `FEATURE_CREATE_EXEC`).
                 if !cfg!(unix) && (!req.env.is_empty() || req.argv.is_some()) {
                     refuse_create(
+                        &state.events,
                         &sess,
                         client_id,
                         want_status,
@@ -21018,7 +21174,15 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                 if let Some((status, detail)) =
                     list_refusal(sess.pty_list_bytes(), tag, list_command.as_deref())
                 {
-                    refuse_create(&sess, client_id, want_status, nonce, status, &detail);
+                    refuse_create(
+                        &state.events,
+                        &sess,
+                        client_id,
+                        want_status,
+                        nonce,
+                        status,
+                        &detail,
+                    );
                     continue;
                 }
                 let Some(id) = sess.allocate_pty_id(config.max_ptys) else {
@@ -21028,6 +21192,7 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                         events::payload_name("ptys")
                     );
                     refuse_create(
+                        &state.events,
                         &sess,
                         client_id,
                         want_status,
@@ -21057,7 +21222,18 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                 let pipewire_remote = sess.pipewire_remote_path();
                 #[cfg(not(target_os = "linux"))]
                 let pipewire_remote: Option<String> = None;
-                if let Some(pty) = pty::spawn_pty(
+                blit_event!(
+                    state.events,
+                    EventType::PtyCreate,
+                    events::payload_pty_create_stage(
+                        client_id,
+                        nonce,
+                        blit_remote::events::PTY_CREATE_SPAWN_BEGIN,
+                        STATUS_OK,
+                        id,
+                    )
+                );
+                let spawned = pty::spawn_pty(
                     &config.shell,
                     &config.shell_flags,
                     rows,
@@ -21082,7 +21258,23 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     sess.desktop_bus_address().as_deref(),
                     pulse_server.as_deref(),
                     pipewire_remote.as_deref(),
-                ) {
+                );
+                blit_event!(
+                    state.events,
+                    EventType::PtyCreate,
+                    events::payload_pty_create_stage(
+                        client_id,
+                        nonce,
+                        blit_remote::events::PTY_CREATE_SPAWN_END,
+                        if spawned.is_some() {
+                            STATUS_OK
+                        } else {
+                            STATUS_OTHER
+                        },
+                        id,
+                    )
+                );
+                if let Some(pty) = spawned {
                     let mut pty = pty;
                     // Armed before the terminal is reachable by anyone, so a
                     // client that dies immediately after creating it cannot
@@ -21101,11 +21293,17 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     broadcast_msg.extend_from_slice(&id.to_le_bytes());
                     broadcast_msg.extend_from_slice(tag_bytes);
                     sess.ptys.insert(id, pty);
-                    blit_event!(state.events, EventType::PtyCreate, {
-                        let mut payload = id.to_le_bytes().to_vec();
-                        payload.extend_from_slice(&events::payload_name(tag));
-                        payload
-                    });
+                    blit_event!(
+                        state.events,
+                        EventType::PtyCreate,
+                        events::payload_pty_create_stage(
+                            client_id,
+                            nonce,
+                            blit_remote::events::PTY_CREATE_REGISTERED,
+                            STATUS_OK,
+                            id,
+                        )
+                    );
                     if let Some(c) = sess.clients.get_mut(&client_id) {
                         if subscribe_creator {
                             c.lead = Some(id);
@@ -21128,6 +21326,7 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     // The id was handed out by allocate_pty_id but nothing
                     // was inserted, so it is free again on the next probe.
                     refuse_create(
+                        &state.events,
                         &sess,
                         client_id,
                         want_status,
@@ -22844,16 +23043,18 @@ mod tests {
                     &mut client,
                     &blit_remote::events::msg_events_config_set(
                         51,
+                        blit_remote::events::EVENTS_CONFIG_REVISION_ANY,
                         events::MIN_RING_SIZE as u64,
                         blit_remote::events::ActivationSet::low_throughput(),
                     ),
                 )
                 .await
             );
-            loop {
+            let revision = loop {
                 let frame = next_frame(&mut client).await;
                 if let Ok(blit_remote::events::EventsMessage::Config {
                     nonce: 51,
+                    revision,
                     size,
                     activations,
                     ..
@@ -22864,20 +23065,153 @@ mod tests {
                         activations,
                         blit_remote::events::ActivationSet::low_throughput()
                     );
+                    break revision;
+                }
+            };
+
+            assert!(
+                write_frame(
+                    &mut client,
+                    &blit_remote::events::msg_events_config_set(
+                        52,
+                        revision - 1,
+                        events::MIN_RING_SIZE as u64,
+                        blit_remote::events::ActivationSet::all(),
+                    ),
+                )
+                .await
+            );
+            loop {
+                let frame = next_frame(&mut client).await;
+                if let Ok(blit_remote::events::EventsMessage::Result {
+                    nonce: 52, status, ..
+                }) = blit_remote::events::parse_events_message(&frame)
+                {
+                    assert_eq!(status, STATUS_CONFLICT);
                     break;
                 }
             }
 
-            assert!(write_frame(&mut client, &blit_remote::events::msg_events_dump(52),).await);
+            assert!(write_frame(&mut client, &blit_remote::events::msg_events_dump(53),).await);
             loop {
                 let frame = next_frame(&mut client).await;
-                if let Ok(blit_remote::events::EventsMessage::Dump { nonce: 52, bytes }) =
+                if let Ok(blit_remote::events::EventsMessage::Dump { nonce: 53, bytes }) =
                     blit_remote::events::parse_events_message(&frame)
                 {
                     assert_eq!(
                         &bytes[..blit_remote::events::EVENT_DUMP_MAGIC.len()],
                         blit_remote::events::EVENT_DUMP_MAGIC
                     );
+                    break;
+                }
+            }
+
+            let mut stream_ids = Vec::new();
+            for nonce in 60..60 + events::MAX_CLIENT_STREAMS_PER_CONNECTION as u16 {
+                assert!(
+                    write_frame(
+                        &mut client,
+                        &blit_remote::events::msg_events_stream_start(
+                            nonce,
+                            blit_remote::events::EVENTS_TARGET_CLIENT,
+                            0,
+                            "",
+                        ),
+                    )
+                    .await
+                );
+                loop {
+                    let frame = next_frame(&mut client).await;
+                    if let Ok(blit_remote::events::EventsMessage::StreamStarted {
+                        nonce: reply_nonce,
+                        status,
+                        stream_id,
+                        ..
+                    }) = blit_remote::events::parse_events_message(&frame)
+                        && reply_nonce == nonce
+                    {
+                        assert_eq!(status, STATUS_OK);
+                        stream_ids.push(stream_id);
+                        break;
+                    }
+                }
+            }
+            assert!(
+                write_frame(
+                    &mut client,
+                    &blit_remote::events::msg_events_stream_start(
+                        69,
+                        blit_remote::events::EVENTS_TARGET_CLIENT,
+                        0,
+                        "",
+                    ),
+                )
+                .await
+            );
+            loop {
+                let frame = next_frame(&mut client).await;
+                if let Ok(blit_remote::events::EventsMessage::StreamStarted {
+                    nonce: 69,
+                    status,
+                    ..
+                }) = blit_remote::events::parse_events_message(&frame)
+                {
+                    assert_eq!(status, STATUS_BUDGET);
+                    break;
+                }
+            }
+            assert_eq!(stream_ids.len(), events::MAX_CLIENT_STREAMS_PER_CONNECTION);
+
+            drop(client);
+            timeout(Duration::from_secs(5), connection)
+                .await
+                .expect("connection cleanup timed out")
+                .unwrap();
+            process_server.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn extension_endpoint_advertises_and_reads_events_family() {
+            let process_server = process::Server::new(false, false);
+            let state = test_state(process_server.clone());
+            let init = blit_remote::extension::ExtensionInit {
+                extension_id: 7,
+                definition_revision: 2,
+                attempt: 3,
+                task_id: 4,
+                flags: blit_remote::extension::EXT_FLAG_ENABLED,
+                hash: [5; 32],
+                name: "event-inspector",
+                args: Vec::new(),
+            };
+            let options = ConnectionOptions::extension(&init, ConnectionCancellation::default())
+                .expect("valid extension init");
+            let (mut client, server_stream) = tokio::io::duplex(4 * 1024 * 1024);
+            let connection =
+                tokio::spawn(handle_client_with_options(server_stream, state, options));
+
+            let mut advertised = false;
+            loop {
+                let frame = next_frame(&mut client).await;
+                match frame.first().copied() {
+                    Some(S2C_HELLO) => {
+                        let features = u32::from_le_bytes(frame[3..7].try_into().unwrap());
+                        advertised = features & blit_remote::events::FEATURE_EVENTS != 0;
+                    }
+                    Some(S2C_READY) => break,
+                    _ => {}
+                }
+            }
+            assert!(advertised);
+
+            assert!(
+                write_frame(&mut client, &blit_remote::events::msg_events_config_get(71),).await
+            );
+            loop {
+                let frame = next_frame(&mut client).await;
+                if let Ok(blit_remote::events::EventsMessage::Config { nonce: 71, .. }) =
+                    blit_remote::events::parse_events_message(&frame)
+                {
                     break;
                 }
             }
@@ -22932,6 +23266,14 @@ mod tests {
         async fn create2_subscribes_the_creator_by_default() {
             let process_server = process::Server::new(false, false);
             let state = test_state(process_server.clone());
+            state
+                .events
+                .configure(
+                    events::MIN_RING_SIZE,
+                    blit_remote::events::ActivationSet::low_throughput(),
+                    None,
+                )
+                .unwrap();
             let inspect = state.clone();
             let (mut client, server_stream) = tokio::io::duplex(1024 * 1024);
             let connection = tokio::spawn(handle_client_with_options(
@@ -22960,6 +23302,41 @@ mod tests {
                     break pty_id;
                 }
             };
+            let dump = inspect.events.dump();
+            let mut at = blit_remote::events::EVENT_DUMP_HEADER_LEN;
+            let mut stages = Vec::new();
+            let mut correlation_id = None;
+            while dump.len().saturating_sub(at) >= blit_remote::events::EVENT_RECORD_HEADER_LEN {
+                let len = u32::from_le_bytes(dump[at..at + 4].try_into().unwrap()) as usize;
+                if len < blit_remote::events::EVENT_RECORD_HEADER_LEN
+                    || dump.len().saturating_sub(at) < len
+                {
+                    break;
+                }
+                let kind = u16::from_le_bytes(dump[at + 4..at + 6].try_into().unwrap());
+                let payload = &dump[at + blit_remote::events::EVENT_RECORD_HEADER_LEN..at + len];
+                if kind == EventType::PtyCreate.id()
+                    && payload.len() >= 14
+                    && u16::from_le_bytes(payload[8..10].try_into().unwrap()) == 91
+                {
+                    let connection_id = u64::from_le_bytes(payload[..8].try_into().unwrap());
+                    assert_eq!(*correlation_id.get_or_insert(connection_id), connection_id);
+                    stages.push(payload[10]);
+                }
+                at += len;
+            }
+            assert_ne!(correlation_id, Some(0));
+            assert_eq!(
+                stages,
+                [
+                    blit_remote::events::PTY_CREATE_REQUEST_RECEIVED,
+                    blit_remote::events::PTY_CREATE_SESSION_ACQUIRED,
+                    blit_remote::events::PTY_CREATE_SPAWN_BEGIN,
+                    blit_remote::events::PTY_CREATE_SPAWN_END,
+                    blit_remote::events::PTY_CREATE_REGISTERED,
+                    blit_remote::events::PTY_CREATE_REPLY_WRITTEN,
+                ]
+            );
             let session = inspect.session.lock().await;
             let creator = session.clients.values().next().expect("creating client");
             assert!(creator.subscriptions.contains(&pty_id));

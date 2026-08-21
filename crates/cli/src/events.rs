@@ -1,8 +1,9 @@
 use std::path::Path;
 
 use blit_remote::events::{
-    EVENT_TYPE_CATALOG, EVENTS_STREAM_APPEND, EVENTS_STREAM_HISTORY, EVENTS_TARGET_CLIENT,
-    EVENTS_TARGET_FILE, EventsMessage, FEATURE_EVENTS, msg_events_config_get,
+    EVENT_TYPE_CATALOG, EVENTS_CONFIG_REVISION_ANY, EVENTS_STREAM_APPEND, EVENTS_STREAM_HISTORY,
+    EVENTS_STREAM_STATE_FAILED, EVENTS_STREAM_STATE_RUNNING, EVENTS_STREAM_STATE_STOPPED,
+    EVENTS_TARGET_CLIENT, EVENTS_TARGET_FILE, EventsMessage, FEATURE_EVENTS, msg_events_config_get,
     msg_events_config_set, msg_events_dump, msg_events_stream_list, msg_events_stream_start,
     msg_events_stream_stop, parse_activation_spec, parse_events_message,
 };
@@ -24,7 +25,18 @@ async fn connect(transport: Transport) -> Result<AgentConn, String> {
 
 async fn get_config(
     conn: &mut AgentConn,
-) -> Result<(u64, u64, u64, u64, u64, blit_remote::events::ActivationSet), String> {
+) -> Result<
+    (
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        blit_remote::events::ActivationSet,
+    ),
+    String,
+> {
     conn.send(&msg_events_config_get(NONCE)).await?;
     loop {
         let packet = conn.recv().await?;
@@ -34,13 +46,24 @@ async fn get_config(
         match message {
             EventsMessage::Config {
                 nonce: NONCE,
+                revision,
                 size,
                 used,
                 records,
                 dropped,
                 next_sequence,
                 activations,
-            } => return Ok((size, used, records, dropped, next_sequence, activations)),
+            } => {
+                return Ok((
+                    revision,
+                    size,
+                    used,
+                    records,
+                    dropped,
+                    next_sequence,
+                    activations,
+                ));
+            }
             EventsMessage::Result {
                 nonce: NONCE,
                 status,
@@ -53,6 +76,7 @@ async fn get_config(
 }
 
 fn print_config(
+    revision: u64,
     size: u64,
     used: u64,
     records: u64,
@@ -61,6 +85,7 @@ fn print_config(
     activations: blit_remote::events::ActivationSet,
 ) {
     println!("protocol\t{}", blit_remote::events::EVENTS_PROTOCOL);
+    println!("revision\t{revision}");
     println!("size\t{size}");
     println!("used\t{used}");
     println!("records\t{records}");
@@ -142,20 +167,37 @@ pub(crate) async fn run(transport: Transport, command: EventsCommand) -> Result<
     let mut conn = connect(transport).await?;
     match command {
         EventsCommand::Config => {
-            let (size, used, records, dropped, next_sequence, activations) =
+            let (revision, size, used, records, dropped, next_sequence, activations) =
                 get_config(&mut conn).await?;
-            print_config(size, used, records, dropped, next_sequence, activations);
+            print_config(
+                revision,
+                size,
+                used,
+                records,
+                dropped,
+                next_sequence,
+                activations,
+            );
         }
-        EventsCommand::Set { size, events } => {
-            let (current_size, _, _, _, _, current_activations) = get_config(&mut conn).await?;
+        EventsCommand::Set {
+            size,
+            events,
+            if_revision,
+        } => {
+            let (_, current_size, _, _, _, _, current_activations) = get_config(&mut conn).await?;
             let size = size.unwrap_or(current_size);
             let activations = events
                 .as_deref()
                 .map(parse_activation_spec)
                 .transpose()?
                 .unwrap_or(current_activations);
-            conn.send(&msg_events_config_set(NONCE, size, activations))
-                .await?;
+            conn.send(&msg_events_config_set(
+                NONCE,
+                if_revision.unwrap_or(EVENTS_CONFIG_REVISION_ANY),
+                size,
+                activations,
+            ))
+            .await?;
             loop {
                 let packet = conn.recv().await?;
                 let Ok(message) = parse_events_message(&packet) else {
@@ -164,6 +206,7 @@ pub(crate) async fn run(transport: Transport, command: EventsCommand) -> Result<
                 match message {
                     EventsMessage::Config {
                         nonce: NONCE,
+                        revision,
                         size,
                         used,
                         records,
@@ -171,7 +214,15 @@ pub(crate) async fn run(transport: Transport, command: EventsCommand) -> Result<
                         next_sequence,
                         activations,
                     } => {
-                        print_config(size, used, records, dropped, next_sequence, activations);
+                        print_config(
+                            revision,
+                            size,
+                            used,
+                            records,
+                            dropped,
+                            next_sequence,
+                            activations,
+                        );
                         break;
                     }
                     EventsMessage::Result {
@@ -237,8 +288,9 @@ pub(crate) async fn run(transport: Transport, command: EventsCommand) -> Result<
                             EventsMessage::Dump { nonce: NONCE, bytes } => {
                                 writer.write_all(bytes).await.map_err(|e| e.to_string())?;
                             }
-                            EventsMessage::Record { stream_id: id, record } if id == stream_id => {
-                                writer.write_all(record).await.map_err(|e| e.to_string())?;
+                            EventsMessage::Records { stream_id: id, records, .. }
+                                if id == stream_id => {
+                                writer.write_all(records).await.map_err(|e| e.to_string())?;
                             }
                             EventsMessage::StreamGap { stream_id: id, lost } if id == stream_id => {
                                 eprintln!("blit: event stream lost {lost} records");
@@ -297,10 +349,11 @@ pub(crate) async fn run(transport: Transport, command: EventsCommand) -> Result<
                             streams,
                         } => {
                             for stream in streams {
-                                let state = if stream.running {
-                                    "running"
-                                } else {
-                                    "finished"
+                                let state = match stream.state {
+                                    EVENTS_STREAM_STATE_RUNNING => "running",
+                                    EVENTS_STREAM_STATE_STOPPED => "stopped",
+                                    EVENTS_STREAM_STATE_FAILED => "failed",
+                                    _ => "unknown",
                                 };
                                 let history = if stream.flags & EVENTS_STREAM_HISTORY != 0 {
                                     "history"
@@ -313,8 +366,13 @@ pub(crate) async fn run(transport: Transport, command: EventsCommand) -> Result<
                                     "truncate"
                                 };
                                 println!(
-                                    "{}\t{state}\t{history}\t{mode}\t{}",
-                                    stream.stream_id, stream.path
+                                    "{}\t{state}\t{}\t{}\t{}\t{history}\t{mode}\t{}\t{}",
+                                    stream.stream_id,
+                                    stream.records,
+                                    stream.bytes,
+                                    stream.lost,
+                                    stream.path,
+                                    stream.error,
                                 );
                             }
                             break;

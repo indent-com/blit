@@ -681,7 +681,7 @@ pub enum Command {
 
 #[derive(Subcommand)]
 pub enum EventsCommand {
-    /// Show ring size, use, loss counters, and active event types
+    /// Show config revision, ring use/loss counters, and active event types
     Config,
 
     /// Replace ring size and/or activation bitset
@@ -694,6 +694,10 @@ pub enum EventsCommand {
         /// with optional + or - prefixes
         #[arg(long, value_name = "SPEC")]
         events: Option<String>,
+
+        /// Apply only while the server configuration is still at this revision
+        #[arg(long, value_name = "REVISION")]
+        if_revision: Option<u64>,
     },
 
     /// Write one retained binary snapshot to stdout or a local file
@@ -704,6 +708,9 @@ pub enum EventsCommand {
     },
 
     /// Follow events in the foreground, writing stdout or a local file
+    ///
+    /// The stream ends with this client connection. A connection may own at
+    /// most four concurrent event tails.
     Tail {
         /// Local output path; defaults to stdout. Use - for stdout explicitly.
         #[arg(short, long, value_name = "LOCAL_PATH")]
@@ -728,6 +735,9 @@ pub enum EventsCommand {
 #[derive(Subcommand)]
 pub enum EventsRecordCommand {
     /// Start a detached recording to a path on the server
+    ///
+    /// Returns an ID only after the initial header/history has been flushed.
+    /// The server permits at most eight detached recordings process-wide.
     Start {
         /// Destination path on the server
         #[arg(value_name = "SERVER_PATH")]
@@ -742,10 +752,12 @@ pub enum EventsRecordCommand {
         from_now: bool,
     },
 
-    /// List server recordings as TSV: ID, STATE, HISTORY, MODE, PATH
+    /// List recordings as TSV: ID, STATE, RECORDS, BYTES, LOST, HISTORY, MODE, PATH, ERROR
     List,
 
     /// Stop and flush a server recording
+    ///
+    /// Returns an error if any recording write or final flush failed.
     Stop {
         /// Recording ID from `blit events record start` or `list`
         id: u32,
