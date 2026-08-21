@@ -666,17 +666,17 @@ const PTY_OUTPUT_QUIET: Duration = Duration::from_millis(1);
 /// indefinitely. The effective ceiling is the smaller of this and its fastest
 /// viewer's display interval, so high-refresh displays remain uncapped.
 const PTY_OUTPUT_COALESCE_MAX: Duration = Duration::from_millis(8);
-/// Max bytes of PTY output parsed per PTY per tick.  Parsing happens inside
-/// the tick task while it holds the session mutex, so an unbudgeted drain of
-/// a flooding PTY (`dd if=/dev/random`) starves every input handler, every
-/// other PTY, and new connections — the whole server wedges at 100% CPU.
-/// When the budget runs out the tick finishes its round (snapshots, input,
-/// frame delivery) and resumes immediately; the bounded byte channel then
-/// backs up, the reader thread blocks, the kernel PTY buffer fills, and the
-/// flooding process's write(2) blocks.  That is ordinary terminal flow
-/// control: the producer runs at the speed we can actually parse and render,
-/// instead of the server disappearing under it.
+/// Max bytes of PTY output parsed from one PTY in a delivery tick.
 const PTY_PARSE_BUDGET_PER_TICK: usize = 256 * 1024;
+/// Max bytes parsed across every PTY in one delivery tick.
+///
+/// Parsing holds the session mutex. A per-PTY cap alone lets a broken stack
+/// multiply the critical section by its unit count, delaying browser input,
+/// ACKs, and every other terminal even when the host has idle CPUs. The
+/// session cap bounds that delay; round-robin traversal gives the deferred
+/// terminals the front of the next tick. Bounded reader channels propagate
+/// the backpressure to the producers.
+const PTY_PARSE_BUDGET_PER_SESSION_TICK: usize = 256 * 1024;
 const SYNC_OUTPUT_END: &[u8] = b"\x1b[?2026l";
 
 /// Number of surface frames to send at wire speed after a keyframe request
@@ -5150,6 +5150,19 @@ fn pty_has_visual_update(pty: &Pty) -> bool {
     pty.dirty || !pty.ready_frames.is_empty() || !pty.byte_rx.is_empty()
 }
 
+fn charge_pty_parse_budgets(per_pty: &mut usize, per_session: &mut usize, bytes: usize) {
+    *per_pty = per_pty.saturating_sub(bytes);
+    *per_session = per_session.saturating_sub(bytes);
+}
+
+fn advance_pty_parse_cursor(start: usize, visited: usize, total: usize) -> usize {
+    if total == 0 {
+        return 0;
+    }
+    let advance = if visited == total { 1 } else { visited };
+    (start + advance) % total
+}
+
 /// Find the first `\x1b[?2026l` in `bytes`, handling sequences that span
 /// the `prefix`/`bytes` boundary. Uses SIMD-accelerated memchr for the
 /// initial ESC scan.
@@ -6109,6 +6122,8 @@ struct Session {
     next_client_id: u64,
     next_compositor_id: u16,
     next_pty_id: u16,
+    /// Sorted PTY index that gets first use of the session-wide parse budget.
+    pty_parse_cursor: usize,
     #[cfg(target_os = "linux")]
     next_screencast_id: u32,
     tick_fires: u32,
@@ -6302,6 +6317,7 @@ impl Session {
             next_client_id: 1,
             next_compositor_id: 1,
             next_pty_id: 1,
+            pty_parse_cursor: 0,
             #[cfg(target_os = "linux")]
             next_screencast_id: 1,
             clients: HashMap::new(),
@@ -13316,7 +13332,8 @@ async fn tick(state: &AppState) -> TickOutcome {
         .fold(1.0_f32, f32::max);
     let output_coalesce_cap = pty_output_coalesce_cap(max_display_fps);
     let title_interval = Duration::from_secs_f64(1.0 / max_fps as f64);
-    let ids: SmallVec<[u16; 8]> = sess.ptys.keys().copied().collect();
+    let mut ids: SmallVec<[u16; 8]> = sess.ptys.keys().copied().collect();
+    ids.sort_unstable();
     let mut clipboard_msgs: Vec<Vec<u8>> = Vec::new();
     let mut title_msgs: Vec<Vec<u8>> = Vec::new();
     let mut used_rows_msgs: Vec<Vec<u8>> = Vec::new();
@@ -13378,12 +13395,11 @@ async fn tick(state: &AppState) -> TickOutcome {
     //    `ready_frames` queue is full, stop draining that PTY.
     //    Sync-bracketed frames are never silently dropped; the producer
     //    is slowed instead.
-    // 2. `PTY_PARSE_BUDGET_PER_TICK`, for output that never emits a sync
-    //    boundary (so brake 1 never engages — `ready_frames` only fills
-    //    on SyncBoundary) and for PTYs with no subscriber at all.
-    //    Without it this loop parses a flooding PTY for as long as the
-    //    reader can refill the channel, holding the session mutex the
-    //    whole time.
+    // 2. The per-PTY and per-session parse budgets, for output that never
+    //    emits a sync boundary (so brake 1 never engages — `ready_frames`
+    //    only fills on SyncBoundary) and for PTYs with no subscriber at all.
+    //    Without both, one flooding PTY can run this loop indefinitely, or a
+    //    stack can multiply the mutex hold by its number of flooding units.
     let ptys_with_subscribers: FxHashSet<u16> = sess
         .clients
         .values()
@@ -13392,7 +13408,21 @@ async fn tick(state: &AppState) -> TickOutcome {
     let mut eof_ptys: Vec<(u16, u64, bool)> = Vec::with_capacity(ids.len());
     let mut cwd_msgs: Vec<Vec<u8>> = Vec::new();
     let mut parse_budget_hit = false;
-    for &id in &ids {
+    let parse_start = if ids.is_empty() {
+        0
+    } else {
+        sess.pty_parse_cursor % ids.len()
+    };
+    let mut parse_ids = ids.clone();
+    parse_ids.rotate_left(parse_start);
+    let mut visited = 0usize;
+    let mut session_budget = PTY_PARSE_BUDGET_PER_SESSION_TICK;
+    for &id in &parse_ids {
+        if session_budget == 0 {
+            parse_budget_hit = true;
+            break;
+        }
+        visited += 1;
         let Some(pty) = sess.ptys.get_mut(&id) else {
             continue;
         };
@@ -13402,7 +13432,7 @@ async fn tick(state: &AppState) -> TickOutcome {
             if has_subscriber && pty.ready_frames.len() >= READY_FRAME_QUEUE_CAP {
                 break;
             }
-            if budget == 0 {
+            if budget == 0 || session_budget == 0 {
                 parse_budget_hit = true;
                 break;
             }
@@ -13411,14 +13441,14 @@ async fn tick(state: &AppState) -> TickOutcome {
             };
             match input {
                 PtyInput::Data(data) => {
-                    budget = budget.saturating_sub(data.len());
+                    charge_pty_parse_budgets(&mut budget, &mut session_budget, data.len());
                     if let Some(msg) = feed_pty_chunk(pty, id, &data) {
                         cwd_msgs.push(msg);
                     }
                     pty.mark_output_dirty(now, output_coalesce_cap);
                 }
                 PtyInput::SyncBoundary { before } => {
-                    budget = budget.saturating_sub(before.len());
+                    charge_pty_parse_budgets(&mut budget, &mut session_budget, before.len());
                     if !before.is_empty() {
                         if let Some(msg) = feed_pty_chunk(pty, id, &before) {
                             cwd_msgs.push(msg);
@@ -13441,6 +13471,12 @@ async fn tick(state: &AppState) -> TickOutcome {
                 }
             }
         }
+    }
+    if !ids.is_empty() {
+        // If the aggregate budget stopped the round, resume at the first PTY
+        // not visited. A complete/idle round still rotates by one so a newly
+        // noisy high id does not always sit at the back.
+        sess.pty_parse_cursor = advance_pty_parse_cursor(parse_start, visited, ids.len());
     }
     // Same fan-out as S2C_TITLE / S2C_USED_ROWS above: per-PTY state
     // events broadcast to every connected client, not just subscribers.
@@ -28073,6 +28109,27 @@ mod tests {
         assert_eq!(pty_output_coalesce_cap(60.0), PTY_OUTPUT_COALESCE_MAX);
         assert_eq!(pty_output_coalesce_cap(1_000.0), Duration::from_millis(1),);
         assert!(pty_output_coalesce_cap(2_000.0) < Duration::from_millis(1));
+    }
+
+    #[test]
+    fn pty_parse_budget_is_aggregate_across_terminals() {
+        let half = PTY_PARSE_BUDGET_PER_SESSION_TICK / 2;
+        let mut session = PTY_PARSE_BUDGET_PER_SESSION_TICK;
+        let mut first = PTY_PARSE_BUDGET_PER_TICK;
+        charge_pty_parse_budgets(&mut first, &mut session, half);
+        let mut second = PTY_PARSE_BUDGET_PER_TICK;
+        charge_pty_parse_budgets(&mut second, &mut session, half);
+
+        assert_eq!(session, 0);
+        assert!(first > 0 && second > 0, "neither per-PTY cap was reached");
+    }
+
+    #[test]
+    fn pty_parse_cursor_resumes_after_the_last_visited_terminal() {
+        assert_eq!(advance_pty_parse_cursor(0, 2, 4), 2);
+        assert_eq!(advance_pty_parse_cursor(2, 1, 4), 3);
+        assert_eq!(advance_pty_parse_cursor(2, 4, 4), 3);
+        assert_eq!(advance_pty_parse_cursor(0, 0, 0), 0);
     }
 
     #[test]
