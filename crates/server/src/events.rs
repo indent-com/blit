@@ -1660,6 +1660,7 @@ async fn client_stream_task(
 ) {
     progress.set_state(ClientStreamState::Replaying, "");
     let mut changed = recorder.subscribe();
+    let mut announced_live = false;
     loop {
         if *stop.borrow() {
             progress.set_state(ClientStreamState::Stopped, "");
@@ -1725,6 +1726,19 @@ async fn client_stream_task(
             return;
         }
         progress.set_state(ClientStreamState::Following, "");
+        if !announced_live {
+            let packet = msg_event_stream_status(0, blit_remote::STATUS_OK, stream_id, cursor);
+            if let Err(error) = send_stream_packet(&sender, packet, &mut stop).await {
+                let state = if error == "stream stopped" {
+                    ClientStreamState::Stopped
+                } else {
+                    ClientStreamState::Failed
+                };
+                progress.set_state(state, error);
+                return;
+            }
+            announced_live = true;
+        }
         tokio::select! {
             result = changed.changed() => {
                 if result.is_err() {
@@ -2212,6 +2226,19 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1]
         );
+        let packet = tokio::time::timeout(Duration::from_secs(1), packets.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            parse_event_message(&packet).unwrap(),
+            EventMessage::StreamStatus {
+                request_id: 0,
+                status: blit_remote::STATUS_OK,
+                stream_id: 9,
+                ..
+            }
+        ));
 
         record_value(&recorder, 2);
         let packet = tokio::time::timeout(Duration::from_secs(1), packets.recv())
@@ -2443,6 +2470,22 @@ mod tests {
             .start(2, 20, u64::MAX, STREAM_FOLLOW)
             .await
             .unwrap();
+
+        for (stream_id, packets) in [(10, &mut packets_a), (20, &mut packets_b)] {
+            let packet = tokio::time::timeout(Duration::from_secs(1), packets.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                parse_event_message(&packet).unwrap(),
+                EventMessage::StreamStatus {
+                    request_id: 0,
+                    status: blit_remote::STATUS_OK,
+                    stream_id: reply_stream,
+                    ..
+                } if reply_stream == stream_id
+            ));
+        }
 
         record_value(&recorder, 77);
         for packets in [&mut packets_a, &mut packets_b] {

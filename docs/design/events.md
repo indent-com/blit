@@ -125,12 +125,14 @@ Server-to-client kinds:
                 [count:4][record:64]...
 ```
 
-`STREAM_STATUS` is correlated to start or stop. An asynchronous gap notification uses request id
-zero with `STATUS_BUDGET`, so it cannot be mistaken for a second reply to the completed start
-request. `STREAM_DATA` is also unsolicited, so its envelope request id is zero.
-`server_monotonic_ns` is sampled from the recorder clock when the packet is built,
-allowing a consumer to age replayed records without assuming immediate delivery.
-One data packet carries at most 65,536 records.
+`STREAM_STATUS` is correlated to start or stop. Unsolicited statuses use request
+id zero: `STATUS_BUDGET` reports a gap, while the first `STATUS_OK` marks the
+transition from replay to the live edge. They cannot be mistaken for a second
+reply to the completed start request. `STREAM_DATA` is also unsolicited, so its
+envelope request id is zero. `server_monotonic_ns` is sampled from the recorder
+clock when the packet is built, allowing a consumer to age replayed records
+without assuming immediate delivery. One data packet carries at most 65,536
+records.
 
 ## Server-side file streams
 
