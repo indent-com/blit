@@ -352,6 +352,7 @@ pub enum EventMessage {
     },
     StreamData {
         stream_id: u32,
+        server_monotonic_ns: u64,
         records: Vec<EventRecord>,
     },
     FileStatus {
@@ -626,19 +627,20 @@ pub fn parse_event_message(packet: &[u8]) -> Result<EventMessage, EventCodecErro
             if request_id != 0 {
                 return Err(EventCodecError::invalid(Some(request_id)));
             }
-            if body.len() < 8 {
+            if body.len() < 16 {
                 return Err(EventCodecError::new(
                     EventCodecErrorKind::Truncated,
                     Some(0),
                 ));
             }
-            let count = le_u32(&body[4..8]) as usize;
+            let count = le_u32(&body[12..16]) as usize;
             if count > EVENTS_STREAM_MAX_RECORDS {
                 return Err(EventCodecError::new(EventCodecErrorKind::TooLarge, Some(0)));
             }
             Ok(EventMessage::StreamData {
                 stream_id: le_u32(&body[..4]),
-                records: decode_records(&body[8..], count, 0)?,
+                server_monotonic_ns: le_u64(&body[4..12]),
+                records: decode_records(&body[16..], count, 0)?,
             })
         }
         S2C_FILE_STATUS => {
@@ -833,13 +835,15 @@ pub fn msg_event_stream_status(
 
 pub fn msg_event_stream_data(
     stream_id: u32,
+    server_monotonic_ns: u64,
     records: &[EventRecord],
 ) -> Result<Vec<u8>, EventCodecError> {
     if records.len() > EVENTS_STREAM_MAX_RECORDS {
         return Err(EventCodecError::new(EventCodecErrorKind::TooLarge, None));
     }
-    let mut msg = envelope(S2C_STREAM_DATA, 0, 8 + records.len() * EVENT_RECORD_SIZE);
+    let mut msg = envelope(S2C_STREAM_DATA, 0, 16 + records.len() * EVENT_RECORD_SIZE);
     msg.extend_from_slice(&stream_id.to_le_bytes());
+    msg.extend_from_slice(&server_monotonic_ns.to_le_bytes());
     msg.extend_from_slice(&(records.len() as u32).to_le_bytes());
     push_records(&mut msg, records);
     Ok(msg)
@@ -1138,7 +1142,7 @@ mod tests {
             msg_event_config(2, crate::STATUS_OK, config()).unwrap(),
             msg_event_dump(3, crate::STATUS_OK, 4, 6, &[record()]).unwrap(),
             msg_event_stream_status(4, crate::STATUS_OK, 5, 6),
-            msg_event_stream_data(5, &[record(), record()]).unwrap(),
+            msg_event_stream_data(5, 99, &[record(), record()]).unwrap(),
             msg_event_file_status(6, crate::STATUS_OTHER, 7, 8, 512, "disk full").unwrap(),
         ];
         assert!(matches!(
@@ -1157,7 +1161,7 @@ mod tests {
             Ok(EventMessage::StreamStatus { .. })
         ));
         assert!(
-            matches!(parse_event_message(&cases[4]), Ok(EventMessage::StreamData { records, .. }) if records.len() == 2)
+            matches!(parse_event_message(&cases[4]), Ok(EventMessage::StreamData { server_monotonic_ns: 99, records, .. }) if records.len() == 2)
         );
         assert!(
             matches!(parse_event_message(&cases[5]), Ok(EventMessage::FileStatus { detail, .. }) if detail == "disk full")
@@ -1192,7 +1196,7 @@ mod tests {
             msg_event_config(7, 0, config()).unwrap(),
             msg_event_dump(7, 0, 1, 2, &[record()]).unwrap(),
             msg_event_stream_status(7, 0, 1, 2),
-            msg_event_stream_data(1, &[record()]).unwrap(),
+            msg_event_stream_data(1, 99, &[record()]).unwrap(),
             msg_event_file_status(7, 0, 1, 2, 128, "ok").unwrap(),
         ];
         for packet in replies {
@@ -1284,8 +1288,8 @@ mod tests {
             EventCodecErrorKind::Truncated
         );
 
-        let mut stream = msg_event_stream_data(3, &[record()]).unwrap();
-        stream[12..16].copy_from_slice(&(EVENTS_STREAM_MAX_RECORDS as u32 + 1).to_le_bytes());
+        let mut stream = msg_event_stream_data(3, 99, &[record()]).unwrap();
+        stream[20..24].copy_from_slice(&(EVENTS_STREAM_MAX_RECORDS as u32 + 1).to_le_bytes());
         assert_eq!(
             parse_event_message(&stream).unwrap_err().kind,
             EventCodecErrorKind::TooLarge

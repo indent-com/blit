@@ -486,7 +486,7 @@ pub async fn cmd_stream(
         tokio::select! {
             result = recv_message_unbounded(&mut conn) => {
                 match result? {
-                    EventMessage::StreamData { stream_id: reply_stream, records }
+                    EventMessage::StreamData { stream_id: reply_stream, records, .. }
                         if reply_stream == stream_id =>
                     {
                         if let Err(error) = write_records(&mut output, &records).await {

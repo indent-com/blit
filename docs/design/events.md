@@ -121,13 +121,16 @@ Server-to-client kinds:
 
 ```text
 3 STREAM_STATUS [status:1][stream_id:4][next_sequence:8]
-4 STREAM_DATA   [stream_id:4][count:4][record:64]...
+4 STREAM_DATA   [stream_id:4][server_monotonic_ns:8]
+                [count:4][record:64]...
 ```
 
 `STREAM_STATUS` is correlated to start or stop. An asynchronous gap notification uses request id
 zero with `STATUS_BUDGET`, so it cannot be mistaken for a second reply to the completed start
-request. `STREAM_DATA` is also unsolicited, so its envelope request id is zero. One data packet
-carries at most 65,536 records.
+request. `STREAM_DATA` is also unsolicited, so its envelope request id is zero.
+`server_monotonic_ns` is sampled from the recorder clock when the packet is built,
+allowing a consumer to age replayed records without assuming immediate delivery.
+One data packet carries at most 65,536 records.
 
 ## Server-side file streams
 

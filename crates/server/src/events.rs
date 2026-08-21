@@ -616,7 +616,7 @@ impl EventRecorder {
         };
         let record = EventRecord {
             sequence,
-            monotonic_ns: self.started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+            monotonic_ns: self.monotonic_ns(),
             event_id: event as u32,
             flags,
             source,
@@ -637,6 +637,10 @@ impl EventRecorder {
 
     pub(crate) fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
+    }
+
+    fn monotonic_ns(&self) -> u64 {
+        self.started.elapsed().as_nanos().min(u64::MAX as u128) as u64
     }
 
     pub(crate) fn oldest_sequence(&self) -> u64 {
@@ -1697,8 +1701,9 @@ async fn client_stream_task(
         }
         if !snapshot.records.is_empty() {
             let count = snapshot.records.len() as u64;
-            let packet = msg_event_stream_data(stream_id, &snapshot.records)
-                .expect("stream packet is capped below the codec limit");
+            let packet =
+                msg_event_stream_data(stream_id, recorder.monotonic_ns(), &snapshot.records)
+                    .expect("stream packet is capped below the codec limit");
             if let Err(error) = send_stream_packet(&sender, packet, &mut stop).await {
                 let state = if error == "stream stopped" {
                     ClientStreamState::Stopped
@@ -2193,7 +2198,9 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let EventMessage::StreamData { stream_id, records } = parse_event_message(&packet).unwrap()
+        let EventMessage::StreamData {
+            stream_id, records, ..
+        } = parse_event_message(&packet).unwrap()
         else {
             panic!("expected stream data");
         };
