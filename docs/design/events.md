@@ -219,12 +219,14 @@ low-throughput set.
 | 35–43 | `fs.request`, `git.request`, `lsp.request`, `kv.request`, `net.request`, `process.request`, `extension.request`, `channel.request`, `client.control`       | Protocol-family dispatch                          |
 | 44–47 | `outbox.queue`, `supervisor.event`, `connection.accept`, `server.error`                                                                                    | Delivery and server internals                     |
 
-`pty.create` uses a fixed correlated payload for `CREATE2`:
+`pty.create` uses one fixed payload for every create opcode:
 `[connection_id:8][nonce:2][stage:1][status:1][pty_id:2]`. Stages are valid
 request received (1), session mutex acquired (2), spawn begin (3), spawn end
 (4), PTY registered (5), refused (6), and correlated reply physically written
 (7). `connection_id` and `nonce` are present in every stage; `status` and
-`pty_id` make success/refusal paths distinguishable.
+`pty_id` make success/refusal paths distinguishable. Legacy `CREATE` and
+`CREATE_AT` have no nonce and emit zero; `CREATE_N` preserves its nonce. Legacy
+opcodes currently emit only the PTY-registered stage.
 
 The full names and ids live in `crates/remote/src/events.rs`. Unknown activation
 bits round-trip through the protocol, allowing a new server catalog to be

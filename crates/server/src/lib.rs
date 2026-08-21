@@ -20879,11 +20879,17 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     msg.extend_from_slice(&id.to_le_bytes());
                     msg.extend_from_slice(pty.tag.as_bytes());
                     sess.ptys.insert(id, pty);
-                    blit_event!(state.events, EventType::PtyCreate, {
-                        let mut payload = id.to_le_bytes().to_vec();
-                        payload.extend_from_slice(&events::payload_name(tag));
-                        payload
-                    });
+                    blit_event!(
+                        state.events,
+                        EventType::PtyCreate,
+                        events::payload_pty_create_stage(
+                            client_id,
+                            0,
+                            blit_remote::events::PTY_CREATE_REGISTERED,
+                            STATUS_OK,
+                            id,
+                        )
+                    );
                     if let Some(c) = sess.clients.get_mut(&client_id) {
                         c.lead = Some(id);
                         c.view_sizes.insert(id, (rows, cols));
@@ -20993,11 +20999,17 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     broadcast_msg.extend_from_slice(&id.to_le_bytes());
                     broadcast_msg.extend_from_slice(tag_bytes);
                     sess.ptys.insert(id, pty);
-                    blit_event!(state.events, EventType::PtyCreate, {
-                        let mut payload = id.to_le_bytes().to_vec();
-                        payload.extend_from_slice(&events::payload_name(tag));
-                        payload
-                    });
+                    blit_event!(
+                        state.events,
+                        EventType::PtyCreate,
+                        events::payload_pty_create_stage(
+                            client_id,
+                            nonce,
+                            blit_remote::events::PTY_CREATE_REGISTERED,
+                            STATUS_OK,
+                            id,
+                        )
+                    );
                     if let Some(c) = sess.clients.get_mut(&client_id) {
                         c.lead = Some(id);
                         c.view_sizes.insert(id, (rows, cols));
@@ -21097,11 +21109,17 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     msg.extend_from_slice(&id.to_le_bytes());
                     msg.extend_from_slice(pty.tag.as_bytes());
                     sess.ptys.insert(id, pty);
-                    blit_event!(state.events, EventType::PtyCreate, {
-                        let mut payload = id.to_le_bytes().to_vec();
-                        payload.extend_from_slice(&events::payload_name(tag));
-                        payload
-                    });
+                    blit_event!(
+                        state.events,
+                        EventType::PtyCreate,
+                        events::payload_pty_create_stage(
+                            client_id,
+                            0,
+                            blit_remote::events::PTY_CREATE_REGISTERED,
+                            STATUS_OK,
+                            id,
+                        )
+                    );
                     if let Some(c) = sess.clients.get_mut(&client_id) {
                         c.lead = Some(id);
                         c.view_sizes.insert(id, (rows, cols));
@@ -23360,6 +23378,138 @@ mod tests {
             })
             .await
             .expect("PTY did not exit");
+
+            drop(client);
+            timeout(Duration::from_secs(5), connection)
+                .await
+                .expect("connection cleanup timed out")
+                .unwrap();
+            process_server.shutdown().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn legacy_create_opcodes_use_the_fixed_pty_create_event_payload() {
+            let process_server = process::Server::new(false, false);
+            let state = test_state(process_server.clone());
+            state
+                .events
+                .configure(
+                    events::MIN_RING_SIZE,
+                    blit_remote::events::ActivationSet::low_throughput(),
+                    None,
+                )
+                .unwrap();
+            let inspect = state.clone();
+            let (mut client, server_stream) = tokio::io::duplex(1024 * 1024);
+            let connection = tokio::spawn(handle_client_with_options(
+                server_stream,
+                state,
+                ConnectionOptions::network(),
+            ));
+
+            while next_frame(&mut client).await.first().copied() != Some(S2C_READY) {}
+
+            assert!(
+                write_frame(
+                    &mut client,
+                    &blit_remote::msg_create_tagged_command(24, 80, "legacy", "sleep 30"),
+                )
+                .await
+            );
+            let legacy_id = loop {
+                let frame = next_frame(&mut client).await;
+                if let Some(ServerMsg::Created {
+                    pty_id,
+                    tag: "legacy",
+                }) = blit_remote::parse_server_msg(&frame)
+                {
+                    break pty_id;
+                }
+            };
+
+            assert!(
+                write_frame(
+                    &mut client,
+                    &blit_remote::msg_create_n_command(57, 24, 80, "numbered", "exit 0"),
+                )
+                .await
+            );
+            let numbered_id = loop {
+                let frame = next_frame(&mut client).await;
+                if let Some(ServerMsg::CreatedN {
+                    nonce: 57,
+                    pty_id,
+                    tag: "numbered",
+                }) = blit_remote::parse_server_msg(&frame)
+                {
+                    break pty_id;
+                }
+            };
+
+            assert!(
+                write_frame(
+                    &mut client,
+                    &blit_remote::msg_create_at(24, 80, "at", legacy_id),
+                )
+                .await
+            );
+            let at_id = loop {
+                let frame = next_frame(&mut client).await;
+                if let Some(ServerMsg::Created { pty_id, tag: "at" }) =
+                    blit_remote::parse_server_msg(&frame)
+                {
+                    break pty_id;
+                }
+            };
+
+            let dump = inspect.events.dump();
+            let mut offset = blit_remote::events::EVENT_DUMP_HEADER_LEN;
+            let mut registered = Vec::new();
+            while dump.len().saturating_sub(offset) >= blit_remote::events::EVENT_RECORD_HEADER_LEN
+            {
+                let len = u32::from_le_bytes(dump[offset..offset + 4].try_into().unwrap()) as usize;
+                if len < blit_remote::events::EVENT_RECORD_HEADER_LEN
+                    || dump.len().saturating_sub(offset) < len
+                {
+                    break;
+                }
+                let kind = u16::from_le_bytes(dump[offset + 4..offset + 6].try_into().unwrap());
+                let payload =
+                    &dump[offset + blit_remote::events::EVENT_RECORD_HEADER_LEN..offset + len];
+                if kind == EventType::PtyCreate.id() {
+                    assert_eq!(payload.len(), 14, "pty.create must have one wire layout");
+                    let connection_id = u64::from_le_bytes(payload[..8].try_into().unwrap());
+                    let nonce = u16::from_le_bytes(payload[8..10].try_into().unwrap());
+                    let stage = payload[10];
+                    let status = payload[11];
+                    let pty_id = u16::from_le_bytes(payload[12..14].try_into().unwrap());
+                    assert_ne!(connection_id, 0);
+                    if stage == blit_remote::events::PTY_CREATE_REGISTERED {
+                        assert_eq!(status, STATUS_OK);
+                        registered.push((connection_id, nonce, pty_id));
+                    }
+                }
+                offset += len;
+            }
+
+            assert_eq!(registered.len(), 3);
+            let connection_id = registered[0].0;
+            assert!(registered.contains(&(connection_id, 0, legacy_id)));
+            assert!(registered.contains(&(connection_id, 57, numbered_id)));
+            assert!(registered.contains(&(connection_id, 0, at_id)));
+
+            for pty_id in [legacy_id, numbered_id, at_id] {
+                assert!(write_frame(&mut client, &blit_remote::msg_close(pty_id)).await);
+            }
+            let mut closed = Vec::new();
+            while closed.len() < 3 {
+                let frame = next_frame(&mut client).await;
+                if let Some(ServerMsg::Closed { pty_id }) = blit_remote::parse_server_msg(&frame)
+                    && !closed.contains(&pty_id)
+                {
+                    closed.push(pty_id);
+                }
+            }
 
             drop(client);
             timeout(Duration::from_secs(5), connection)
