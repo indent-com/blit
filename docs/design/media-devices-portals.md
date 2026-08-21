@@ -738,7 +738,9 @@ The bridge calls `GetAll` for `org.mpris.MediaPlayer2` and
 `org.freedesktop.DBus.Properties.PropertiesChanged` and `Seeked`. A missing
 Player interface, loss of required properties, or three consecutive two-second
 D-Bus timeouts removes the player. Optional malformed properties fall back to
-their specified defaults without removing it.
+their specified defaults without removing it. A removed player whose bus name
+remains owned is reconsidered after a five-second cooldown, so a temporarily
+unresponsive application can recover without restarting.
 
 Property signals are invalidations, not trusted replacement records. The
 bridge batches them into at most one refresh per player per 50 ms and permits
@@ -977,7 +979,8 @@ Rate, 0/1 for Shuffle, and 0 None/1 Track/2 Playlist for LoopStatus. It is zero
 for other actions. `track_revision` must match for SetPosition and is zero for
 other kinds. A random nonzero nonce correlates one action result.
 
-Fresh snapshot requests are accepted at most once per connection per second.
+Fresh snapshot requests are accepted at most once per subscribed connection per
+second. A transition from unsubscribed to subscribed is always accepted.
 An excess request is ignored while the existing subscription and state stream
 continue.
 

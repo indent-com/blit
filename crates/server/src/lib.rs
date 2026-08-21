@@ -3872,6 +3872,15 @@ struct ClientState {
 }
 
 #[cfg(target_os = "linux")]
+fn mpris_snapshot_rate_limited(client: &ClientState, enabled: bool, now: Instant) -> bool {
+    enabled
+        && client.mpris_subscribed
+        && client
+            .last_mpris_snapshot
+            .is_some_and(|last| now.duration_since(last) < Duration::from_secs(1))
+}
+
+#[cfg(target_os = "linux")]
 fn consume_mpris_action_token(client: &mut ClientState, now: Instant) -> bool {
     const BURST: f64 = 20.0;
     const REFILL_PER_SECOND: f64 = 10.0;
@@ -19524,12 +19533,9 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     }
                     ClientControl::MprisSubscribe { enabled } => {
                         let now = Instant::now();
-                        let rate_limited = enabled
-                            && sess.clients.get(&client_id).is_some_and(|client| {
-                                client.last_mpris_snapshot.is_some_and(|last| {
-                                    now.duration_since(last) < Duration::from_secs(1)
-                                })
-                            });
+                        let rate_limited = sess.clients.get(&client_id).is_some_and(|client| {
+                            mpris_snapshot_rate_limited(client, enabled, now)
+                        });
                         if rate_limited {
                             continue;
                         }
@@ -23770,6 +23776,24 @@ mod tests {
         assert!(!consume_mpris_action_token(
             &mut client,
             now + Duration::from_millis(100)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mpris_snapshot_limit_never_suppresses_a_new_subscription() {
+        let mut client = test_client();
+        let now = Instant::now();
+        client.last_mpris_snapshot = Some(now);
+
+        assert!(!mpris_snapshot_rate_limited(&client, true, now));
+        client.mpris_subscribed = true;
+        assert!(mpris_snapshot_rate_limited(&client, true, now));
+        assert!(!mpris_snapshot_rate_limited(&client, false, now));
+        assert!(!mpris_snapshot_rate_limited(
+            &client,
+            true,
+            now + Duration::from_secs(1)
         ));
     }
 

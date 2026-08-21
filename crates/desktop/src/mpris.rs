@@ -39,6 +39,7 @@ const ARTWORK_BUDGET: usize = 8 * 1024 * 1024;
 const PROPERTY_CALL_LIMIT: usize = 4;
 const ACTION_CALL_LIMIT: usize = 4;
 const ACTION_QUEUE_LIMIT: usize = 64;
+const MONITOR_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 struct Target {
@@ -50,6 +51,11 @@ struct Target {
     last_active: u64,
     last_artwork: u64,
     position_observed_at: Instant,
+}
+
+struct DeferredTarget {
+    owner: String,
+    retry_at: Option<Instant>,
 }
 
 fn player_at(target: &Target, observed_at: Instant) -> MprisPlayer {
@@ -77,7 +83,7 @@ pub(super) struct State {
     players: HashMap<u32, Target>,
     by_owner: HashMap<String, u32>,
     by_alias: HashMap<String, u32>,
-    deferred: HashMap<String, String>,
+    deferred: HashMap<String, DeferredTarget>,
     active: Option<u32>,
     artwork_bytes: usize,
     property_calls: Arc<Semaphore>,
@@ -178,19 +184,42 @@ impl State {
         records
     }
 
-    fn deferred_candidate(&self, limit: usize) -> Option<(String, String)> {
+    fn remove_player_for_retry(&mut self, player_id: u32, retry_at: Instant) -> Vec<MprisRecord> {
+        let Some(target) = self.players.get(&player_id) else {
+            return Vec::new();
+        };
+        let owner = target.owner.clone();
+        let aliases = target.aliases.iter().cloned().collect::<Vec<_>>();
+        let records = self.remove_player(player_id);
+        for alias in aliases {
+            self.deferred.insert(
+                alias,
+                DeferredTarget {
+                    owner: owner.clone(),
+                    retry_at: Some(retry_at),
+                },
+            );
+        }
+        records
+    }
+
+    fn deferred_candidate(&self, limit: usize, now: Instant) -> Option<(String, String)> {
+        let ready = |target: &&DeferredTarget| target.retry_at.is_none_or(|at| now >= at);
         self.deferred
             .iter()
-            .filter(|(_, owner)| self.by_owner.contains_key(owner.as_str()))
+            .filter(|(_, target)| {
+                ready(target) && self.by_owner.contains_key(target.owner.as_str())
+            })
             .min_by_key(|(alias, _)| alias.as_str())
-            .map(|(alias, owner)| (alias.clone(), owner.clone()))
+            .map(|(alias, target)| (alias.clone(), target.owner.clone()))
             .or_else(|| {
                 (self.players.len() < limit)
                     .then(|| {
                         self.deferred
                             .iter()
+                            .filter(|(_, target)| ready(target))
                             .min_by_key(|(alias, _)| alias.as_str())
-                            .map(|(alias, owner)| (alias.clone(), owner.clone()))
+                            .map(|(alias, target)| (alias.clone(), target.owner.clone()))
                     })
                     .flatten()
             })
@@ -402,7 +431,13 @@ async fn register_alias(
             return;
         }
         if state.players.len() >= player_limit() {
-            state.deferred.insert(alias, owner);
+            state.deferred.insert(
+                alias,
+                DeferredTarget {
+                    owner,
+                    retry_at: None,
+                },
+            );
             return;
         }
         state.deferred.remove(&alias);
@@ -463,7 +498,7 @@ async fn remove_alias(
             if state
                 .deferred
                 .get(alias)
-                .is_some_and(|value| value == owner)
+                .is_some_and(|value| value.owner == owner)
             {
                 state.deferred.remove(alias);
             }
@@ -476,7 +511,7 @@ async fn remove_alias(
 async fn remove_owner(state: &std::sync::Arc<Mutex<State>>, common: &Common, owner: &str) {
     let records = {
         let mut state = state.lock().await;
-        state.deferred.retain(|_, value| value != owner);
+        state.deferred.retain(|_, value| value.owner != owner);
         state
             .by_owner
             .get(owner)
@@ -493,15 +528,23 @@ async fn remove_monitored_player(
     player_id: u32,
     owner: &str,
 ) {
-    let records = {
+    let removed = {
         let mut state = state.lock().await;
         if state.by_owner.get(owner) == Some(&player_id) {
-            state.remove_player(player_id)
+            Some(state.remove_player_for_retry(player_id, Instant::now() + MONITOR_RETRY_DELAY))
         } else {
-            Vec::new()
+            None
         }
     };
+    let Some(records) = removed else {
+        return;
+    };
     send_records(common, records).await;
+    let capacity_changed = state.lock().await.capacity_changed.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(MONITOR_RETRY_DELAY).await;
+        capacity_changed.notify_one();
+    });
 }
 
 async fn retry_deferred(
@@ -510,7 +553,10 @@ async fn retry_deferred(
     common: &Common,
 ) {
     loop {
-        let candidate = state.lock().await.deferred_candidate(player_limit());
+        let candidate = state
+            .lock()
+            .await
+            .deferred_candidate(player_limit(), Instant::now());
         let Some((alias, owner)) = candidate else {
             return;
         };
@@ -1514,15 +1560,43 @@ mod tests {
         let mut state = State::default();
         state.players.insert(1, target(1, now));
         state.by_owner.insert(":1.1".into(), 1);
-        state
-            .deferred
-            .insert("org.mpris.MediaPlayer2.deferred".into(), ":1.2".into());
+        state.deferred.insert(
+            "org.mpris.MediaPlayer2.deferred".into(),
+            DeferredTarget {
+                owner: ":1.2".into(),
+                retry_at: None,
+            },
+        );
 
-        assert_eq!(state.deferred_candidate(1), None);
+        assert_eq!(state.deferred_candidate(1, now), None);
         state.remove_player(1);
         assert_eq!(
-            state.deferred_candidate(1),
+            state.deferred_candidate(1, now),
             Some(("org.mpris.MediaPlayer2.deferred".into(), ":1.2".into()))
+        );
+    }
+
+    #[test]
+    fn failed_monitor_retries_only_after_its_cooldown() {
+        let now = Instant::now();
+        let retry_at = now + MONITOR_RETRY_DELAY;
+        let alias = "org.mpris.MediaPlayer2.retry".to_string();
+        let mut state = State::default();
+        let mut player = target(1, now);
+        player.aliases.insert(alias.clone());
+        state.players.insert(1, player);
+        state.by_owner.insert(":1.1".into(), 1);
+        state.by_alias.insert(alias.clone(), 1);
+
+        let records = state.remove_player_for_retry(1, retry_at);
+        assert!(matches!(
+            records.first(),
+            Some(MprisRecord::Delete { player_id: 1 })
+        ));
+        assert_eq!(state.deferred_candidate(1, now), None);
+        assert_eq!(
+            state.deferred_candidate(1, retry_at),
+            Some((alias, ":1.1".into()))
         );
     }
 
