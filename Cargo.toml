@@ -33,22 +33,22 @@ repository = "https://github.com/indent-com/blit"
 homepage = "https://blit.sh"
 
 [workspace.dependencies]
-blit-guest = { version = "0.55.0", path = "crates/guest" }
-blit-remote = { version = "0.55.0", path = "crates/remote" }
-blit-fssync = { version = "0.55.0", path = "crates/fssync" }
-blit-git = { version = "0.55.0", path = "crates/git" }
-blit-lsp = { version = "0.55.0", path = "crates/lsp" }
-blit-alacritty = { version = "0.55.0", path = "crates/alacritty-driver" }
-blit-fonts = { version = "0.55.0", path = "crates/fonts" }
-blit-webserver = { version = "0.55.0", path = "crates/webserver" }
-blit-server = { version = "0.55.0", path = "crates/server", default-features = false }
-blit-gateway = { version = "0.55.0", path = "crates/gateway" }
-blit-proxy = { version = "0.55.0", path = "crates/proxy" }
-blit-webrtc-forwarder = { version = "0.55.0", path = "crates/webrtc-forwarder" }
-blit-compositor = { version = "0.55.0", path = "crates/compositor" }
-blit-sd-notify = { version = "0.55.0", path = "crates/sd-notify" }
-blit-ssh = { version = "0.55.0", path = "crates/ssh" }
-blit-desktop = { version = "0.55.0", path = "crates/desktop" }
+blit-guest = { version = "0.55.1", path = "crates/guest" }
+blit-remote = { version = "0.55.1", path = "crates/remote" }
+blit-fssync = { version = "0.55.1", path = "crates/fssync" }
+blit-git = { version = "0.55.1", path = "crates/git" }
+blit-lsp = { version = "0.55.1", path = "crates/lsp" }
+blit-alacritty = { version = "0.55.1", path = "crates/alacritty-driver" }
+blit-fonts = { version = "0.55.1", path = "crates/fonts" }
+blit-webserver = { version = "0.55.1", path = "crates/webserver" }
+blit-server = { version = "0.55.1", path = "crates/server", default-features = false }
+blit-gateway = { version = "0.55.1", path = "crates/gateway" }
+blit-proxy = { version = "0.55.1", path = "crates/proxy" }
+blit-webrtc-forwarder = { version = "0.55.1", path = "crates/webrtc-forwarder" }
+blit-compositor = { version = "0.55.1", path = "crates/compositor" }
+blit-sd-notify = { version = "0.55.1", path = "crates/sd-notify" }
+blit-ssh = { version = "0.55.1", path = "crates/ssh" }
+blit-desktop = { version = "0.55.1", path = "crates/desktop" }
 
 [profile.release]
 opt-level = 3
