@@ -10,6 +10,7 @@ export type {
 export {
   enumeratePanes,
   assignSessionsToPanes,
+  carryAssignmentsToPanes,
   assignmentsAfterDrop,
   buildCandidateOrder,
   reconcileAssignments,

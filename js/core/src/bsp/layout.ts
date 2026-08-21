@@ -286,6 +286,41 @@ export function assignSessionsToPanes(
   return { assignments };
 }
 
+/** Carry the occupants of an existing layout into a replacement layout.
+ *
+ * Content migrates in pane traversal order. Live terminal sessions are
+ * deduplicated, while non-session content is kept verbatim. Crucially, this
+ * does not append other live sessions: panes added by the replacement layout
+ * stay empty until the user puts something in them. */
+export function carryAssignmentsToPanes({
+  currentPanes,
+  nextPanes,
+  previous,
+  liveSessionIds,
+}: {
+  currentPanes: readonly BSPPane[];
+  nextPanes: readonly BSPPane[];
+  previous: BSPAssignments;
+  liveSessionIds: readonly string[];
+}): BSPAssignments {
+  const live = new Set(liveSessionIds);
+  const seenSessions = new Set<string>();
+  const carried: string[] = [];
+
+  for (const pane of currentPanes) {
+    const value = previous.assignments[pane.id];
+    if (value == null) continue;
+    if (isContentAssignment(value)) {
+      carried.push(value);
+    } else if (live.has(value) && !seenSessions.has(value)) {
+      seenSessions.add(value);
+      carried.push(value);
+    }
+  }
+
+  return assignSessionsToPanes(nextPanes, carried);
+}
+
 export function buildCandidateOrder({
   liveSessionIds,
   focusedSessionId,

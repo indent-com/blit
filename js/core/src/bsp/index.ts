@@ -11,6 +11,7 @@ export {
   PRESETS,
   enumeratePanes,
   assignSessionsToPanes,
+  carryAssignmentsToPanes,
   buildCandidateOrder,
   assignmentsAfterDrop,
   reconcileAssignments,

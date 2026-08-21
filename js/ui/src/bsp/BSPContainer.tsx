@@ -29,6 +29,7 @@ import {
   assignSessionsToPanes,
   assignmentsAfterDrop,
   buildCandidateOrder,
+  carryAssignmentsToPanes,
   enumeratePanes,
   loadAssignmentsFromHash,
   loadFocusedPaneFromHash,
@@ -270,46 +271,20 @@ export function BSPContainer(props: {
     if (layout === lastLayout) return;
 
     const currentPanes = enumeratePanes(root());
-    const live = new Set(liveSessionIds());
-    const prev = layoutState().assignments;
-    // Carry forward the previous panes' contents in traversal order so
-    // surfaces and sessions migrate positionally into the new layout.
-    const carried: string[] = [];
-    const seenSessions = new Set<string>();
-    for (const pane of currentPanes) {
-      const v = prev[pane.id];
-      if (v == null) continue;
-      if (isSurfaceAssignment(v) || isTileAssignment(v)) {
-        // Surfaces and IDE tiles (editor/diff) are not sessions — carry them
-        // forward positionally so they survive a layout change (the drop the
-        // carry-forward would otherwise cause; docs/ide-plan.md F4).
-        carried.push(v);
-      } else if (live.has(v) && !seenSessions.has(v)) {
-        seenSessions.add(v);
-        carried.push(v);
-      }
-    }
-    // Append remaining live sessions (focus/LRU-ordered) so any new
-    // empty panes still get populated.
-    const extra = buildCandidateOrder({
-      liveSessionIds: liveSessionIds(),
-      focusedSessionId: props.focusedSessionId,
-      currentAssignedInPaneOrder: [...seenSessions],
-      lruSessionIds: props.lruSessionIds,
-    });
-    for (const id of extra) {
-      if (!seenSessions.has(id)) {
-        seenSessions.add(id);
-        carried.push(id);
-      }
-    }
     const nextRoot = layout.root;
     const nextPanes = enumeratePanes(nextRoot);
 
     lastLayout = layout;
     lastDsl = layout.dsl;
     setRoot(nextRoot);
-    setLayoutState(assignSessionsToPanes(nextPanes, carried));
+    setLayoutState(
+      carryAssignmentsToPanes({
+        currentPanes,
+        nextPanes,
+        previous: layoutState(),
+        liveSessionIds: liveSessionIds(),
+      }),
+    );
   });
 
   const knownSessionIds = createMemo(() => sessions().map((s) => s.id));
