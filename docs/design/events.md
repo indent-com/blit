@@ -78,14 +78,18 @@ BLIT_EVENTS_FILE=/path/to/capture.events
 `CONFIG_SET` can change both capacity and the activation bitset. Resizing keeps
 the newest complete records that fit; a producer that collides with resize or
 an in-progress overwrite consumes a sequence and is therefore visible as a
-gap rather than silently disappearing.
+gap rather than silently disappearing. `CONFIG_SET_IF` performs the same change
+only if both current fields still match the expected configuration. A mismatch
+returns `STATUS_CONFLICT` and the current configuration without changing it.
 
 Client-to-server kinds:
 
 ```text
-1 CONFIG_GET    []
-2 CONFIG_SET    [ring_size:4][activation:16]
-3 DUMP          [from_sequence:8][limit:4]
+1 CONFIG_GET      []
+2 CONFIG_SET      [ring_size:4][activation:16]
+3 DUMP            [from_sequence:8][limit:4]
+8 CONFIG_SET_IF   [expected_ring_size:4][expected_activation:16]
+                  [ring_size:4][activation:16]
 ```
 
 Server-to-client kinds:

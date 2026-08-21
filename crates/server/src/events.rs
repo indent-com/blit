@@ -475,6 +475,7 @@ pub(crate) struct EventSnapshot {
 }
 
 pub(crate) struct EventRecorder {
+    config_lock: Mutex<()>,
     activation: [AtomicU64; 2],
     ring: RwLock<Arc<Ring>>,
     next_sequence: AtomicU64,
@@ -498,6 +499,7 @@ impl EventRecorder {
         validate_config(config)?;
         let words = activation_words(config.activation);
         Ok(Self {
+            config_lock: Mutex::new(()),
             activation: [AtomicU64::new(words[0]), AtomicU64::new(words[1])],
             ring: RwLock::new(Arc::new(Ring::new(config.ring_size))),
             next_sequence: AtomicU64::new(1),
@@ -514,6 +516,14 @@ impl EventRecorder {
     }
 
     pub(crate) fn config(&self) -> EventConfig {
+        let _guard = self
+            .config_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.config_unlocked()
+    }
+
+    fn config_unlocked(&self) -> EventConfig {
         let ring_size = self
             .ring
             .read()
@@ -531,7 +541,34 @@ impl EventRecorder {
 
     pub(crate) fn set_config(&self, config: EventConfig) -> Result<(), String> {
         validate_config(config)?;
-        if self.config().ring_size != config.ring_size {
+        let _guard = self
+            .config_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.set_config_unlocked(config);
+        Ok(())
+    }
+
+    pub(crate) fn set_config_if(
+        &self,
+        expected: EventConfig,
+        config: EventConfig,
+    ) -> Result<bool, String> {
+        validate_config(expected)?;
+        validate_config(config)?;
+        let _guard = self
+            .config_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self.config_unlocked() != expected {
+            return Ok(false);
+        }
+        self.set_config_unlocked(config);
+        Ok(true)
+    }
+
+    fn set_config_unlocked(&self, config: EventConfig) {
+        if self.config_unlocked().ring_size != config.ring_size {
             self.resize(config.ring_size);
         }
         let words = activation_words(config.activation);
@@ -539,7 +576,6 @@ impl EventRecorder {
         self.activation[1].store(words[1], Ordering::Release);
         self.changed
             .send_replace(self.next_sequence.load(Ordering::Acquire));
-        Ok(())
     }
 
     fn resize(&self, size: u32) {
@@ -1449,6 +1485,32 @@ pub(crate) async fn dispatch(
                 .expect("recorder always has a valid event config");
             send_protocol(sender, reply).await;
         }
+        EventRequest::ConfigSetIf {
+            request_id,
+            expected,
+            config,
+        } => {
+            let status = match recorder.set_config_if(expected, config) {
+                Ok(true) => blit_remote::STATUS_OK,
+                Ok(false) => blit_remote::STATUS_CONFLICT,
+                Err(_) => blit_remote::STATUS_INVALID,
+            };
+            if status == blit_remote::STATUS_OK {
+                let words = activation_words(config.activation);
+                recorder.record(
+                    EventId::ConfigChanged,
+                    0,
+                    0,
+                    0,
+                    0,
+                    request_id as u64,
+                    [config.ring_size as u64, words[0], words[1]],
+                );
+            }
+            let reply = msg_event_config(request_id, status, recorder.config())
+                .expect("recorder always has a valid event config");
+            send_protocol(sender, reply).await;
+        }
         EventRequest::Dump {
             request_id,
             from_sequence,
@@ -1928,6 +1990,20 @@ mod tests {
     }
 
     #[test]
+    fn conditional_config_set_is_atomic() {
+        let recorder = recorder(4, Activation::NONE);
+        let initial = recorder.config();
+        let replacement = EventConfig {
+            ring_size: 8,
+            activation: Activation::ALL,
+        };
+        assert_eq!(recorder.set_config_if(initial, replacement), Ok(true));
+        assert_eq!(recorder.config(), replacement);
+        assert_eq!(recorder.set_config_if(initial, initial), Ok(false));
+        assert_eq!(recorder.config(), replacement);
+    }
+
+    #[test]
     fn activation_parser_supports_events_families_and_modifiers() {
         let activation = parse_activation("none,pty,+task-failed").unwrap();
         assert!(activation.contains(EventId::PtyCreateRegistered as u8));
@@ -2209,7 +2285,9 @@ mod tests {
 
     #[tokio::test]
     async fn protocol_dispatch_correlates_config_dump_and_errors() {
-        use blit_remote::events::{EventMessage, msg_config_get, msg_dump, parse_event_message};
+        use blit_remote::events::{
+            EventMessage, msg_config_get, msg_config_set_if, msg_dump, parse_event_message,
+        };
 
         let recorder = Arc::new(all_recorder(8));
         record_value(&recorder, 17);
@@ -2236,6 +2314,44 @@ mod tests {
                 status: blit_remote::STATUS_OK,
                 ..
             }
+        ));
+
+        let initial = recorder.config();
+        let replacement = EventConfig {
+            ring_size: 16,
+            activation: Activation::NONE,
+        };
+        dispatch(
+            &msg_config_set_if(44, initial, replacement).unwrap(),
+            &recorder,
+            &client_streams,
+            &file_streams,
+            &sender,
+        )
+        .await;
+        assert!(matches!(
+            parse_event_message(&packets.recv().await.unwrap()).unwrap(),
+            EventMessage::Config {
+                request_id: 44,
+                status: blit_remote::STATUS_OK,
+                config,
+            } if config == replacement
+        ));
+        dispatch(
+            &msg_config_set_if(45, initial, initial).unwrap(),
+            &recorder,
+            &client_streams,
+            &file_streams,
+            &sender,
+        )
+        .await;
+        assert!(matches!(
+            parse_event_message(&packets.recv().await.unwrap()).unwrap(),
+            EventMessage::Config {
+                request_id: 45,
+                status: blit_remote::STATUS_CONFLICT,
+                config,
+            } if config == replacement
         ));
 
         dispatch(

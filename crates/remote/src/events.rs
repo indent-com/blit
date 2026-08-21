@@ -23,6 +23,8 @@ pub const C2S_STREAM_START: u8 = 4;
 pub const C2S_STREAM_STOP: u8 = 5;
 pub const C2S_FILE_START: u8 = 6;
 pub const C2S_FILE_STOP: u8 = 7;
+/// Atomically replace the configuration only when it still matches an expected value.
+pub const C2S_CONFIG_SET_IF: u8 = 8;
 
 pub const S2C_STATUS: u8 = 0;
 pub const S2C_CONFIG: u8 = 1;
@@ -276,6 +278,11 @@ pub enum EventRequest<'a> {
         request_id: u32,
         config: EventConfig,
     },
+    ConfigSetIf {
+        request_id: u32,
+        expected: EventConfig,
+        config: EventConfig,
+    },
     Dump {
         request_id: u32,
         from_sequence: u64,
@@ -308,6 +315,7 @@ impl EventRequest<'_> {
         match self {
             Self::ConfigGet { request_id }
             | Self::ConfigSet { request_id, .. }
+            | Self::ConfigSetIf { request_id, .. }
             | Self::Dump { request_id, .. }
             | Self::StreamStart { request_id, .. }
             | Self::StreamStop { request_id, .. }
@@ -449,15 +457,16 @@ pub fn parse_event_request(packet: &[u8]) -> Result<EventRequest<'_>, EventCodec
         C2S_CONFIG_GET => Err(invalid()),
         C2S_CONFIG_SET => {
             exact(body, 20, request_id)?;
-            let config = EventConfig::new(
-                le_u32(&body[..4]),
-                Activation(body[4..20].try_into().expect("checked length")),
-            )
-            .map_err(|mut error| {
-                error.request_id = Some(request_id);
-                error
-            })?;
+            let config = parse_config(body, request_id)?;
             Ok(EventRequest::ConfigSet { request_id, config })
+        }
+        C2S_CONFIG_SET_IF => {
+            exact(body, 40, request_id)?;
+            Ok(EventRequest::ConfigSetIf {
+                request_id,
+                expected: parse_config(&body[..20], request_id)?,
+                config: parse_config(&body[20..], request_id)?,
+            })
         }
         C2S_DUMP => {
             exact(body, 12, request_id)?;
@@ -683,8 +692,20 @@ pub fn msg_config_get(request_id: u32) -> Vec<u8> {
 pub fn msg_config_set(request_id: u32, config: EventConfig) -> Result<Vec<u8>, EventCodecError> {
     validate_ring_size(config.ring_size)?;
     let mut msg = envelope(C2S_CONFIG_SET, request_id, 20);
-    msg.extend_from_slice(&config.ring_size.to_le_bytes());
-    msg.extend_from_slice(&config.activation.0);
+    push_config(&mut msg, config);
+    Ok(msg)
+}
+
+pub fn msg_config_set_if(
+    request_id: u32,
+    expected: EventConfig,
+    config: EventConfig,
+) -> Result<Vec<u8>, EventCodecError> {
+    validate_ring_size(expected.ring_size)?;
+    validate_ring_size(config.ring_size)?;
+    let mut msg = envelope(C2S_CONFIG_SET_IF, request_id, 40);
+    push_config(&mut msg, expected);
+    push_config(&mut msg, config);
     Ok(msg)
 }
 
@@ -861,6 +882,17 @@ fn id_request(kind: u8, request_id: u32, stream_id: u32) -> Vec<u8> {
     msg
 }
 
+fn parse_config(body: &[u8], request_id: u32) -> Result<EventConfig, EventCodecError> {
+    EventConfig::new(
+        le_u32(&body[..4]),
+        Activation(body[4..20].try_into().expect("checked config length")),
+    )
+    .map_err(|mut error| {
+        error.request_id = Some(request_id);
+        error
+    })
+}
+
 fn validate_ring_size(ring_size: u32) -> Result<(), EventCodecError> {
     if !(EVENTS_RING_MIN..=EVENTS_RING_MAX).contains(&ring_size) {
         return Err(EventCodecError::new(EventCodecErrorKind::TooLarge, None));
@@ -912,6 +944,11 @@ fn decode_records(
         .chunks_exact(EVENT_RECORD_SIZE)
         .map(EventRecord::decode)
         .collect()
+}
+
+fn push_config(out: &mut Vec<u8>, config: EventConfig) {
+    out.extend_from_slice(&config.ring_size.to_le_bytes());
+    out.extend_from_slice(&config.activation.0);
 }
 
 fn push_records(out: &mut Vec<u8>, records: &[EventRecord]) {
@@ -1035,6 +1072,20 @@ mod tests {
                 config: config()
             })
         );
+        let conditional = msg_config_set_if(
+            8,
+            config(),
+            EventConfig::new(8192, Activation::ALL).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            parse_event_request(&conditional),
+            Ok(EventRequest::ConfigSetIf {
+                request_id: 8,
+                expected: config(),
+                config: EventConfig::new(8192, Activation::ALL).unwrap(),
+            })
+        );
         let dump = msg_dump(8, 99, 12).unwrap();
         assert_eq!(
             parse_event_request(&dump),
@@ -1117,6 +1168,12 @@ mod tests {
     fn every_truncated_known_packet_is_rejected() {
         let requests = [
             msg_config_set(7, config()).unwrap(),
+            msg_config_set_if(
+                7,
+                config(),
+                EventConfig::new(8192, Activation::ALL).unwrap(),
+            )
+            .unwrap(),
             msg_dump(7, 1, 1).unwrap(),
             msg_stream_start(7, 1, 1, 0).unwrap(),
             msg_stream_stop(7, 1),
