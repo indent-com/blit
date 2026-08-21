@@ -11,14 +11,12 @@ use blit_remote::events::{
     EventType, parse_activation_spec,
 };
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, oneshot};
+use tokio::sync::{broadcast, oneshot};
 
 pub(crate) const DEFAULT_RING_SIZE: usize = 1024 * 1024;
 pub(crate) const MIN_RING_SIZE: usize = 4 * 1024;
 pub(crate) const MAX_RING_SIZE: usize = blit_remote::MAX_LOGICAL_MESSAGE - 4096;
 const LIVE_CHANNEL_RECORDS: usize = 4096;
-pub(crate) const MAX_CLIENT_STREAMS_PER_CONNECTION: usize = 4;
-pub(crate) const MAX_FILE_STREAMS: usize = 8;
 pub(crate) const LIVE_BATCH_MAX_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Debug)]
@@ -180,7 +178,6 @@ pub(crate) struct EventLog {
     started_unix_ns: u64,
     live_tx: broadcast::Sender<Arc<[u8]>>,
     file_streams: Mutex<HashMap<u32, FileStreamTask>>,
-    file_stream_budget: Arc<Semaphore>,
 }
 
 struct FileStreamTask {
@@ -189,7 +186,6 @@ struct FileStreamTask {
     path: String,
     flags: u8,
     progress: Arc<FileStreamProgress>,
-    _permit: OwnedSemaphorePermit,
 }
 
 type ClientEventStream = (u32, Option<Vec<u8>>, broadcast::Receiver<Arc<[u8]>>);
@@ -248,17 +244,12 @@ impl std::fmt::Display for ConfigureError {
 
 #[derive(Debug)]
 pub(crate) enum StartFileStreamError {
-    Budget,
     Io(String),
 }
 
 impl std::fmt::Display for StartFileStreamError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Budget => write!(
-                f,
-                "detached event recording capacity exhausted ({MAX_FILE_STREAMS})"
-            ),
             Self::Io(error) => f.write_str(error),
         }
     }
@@ -321,7 +312,6 @@ impl EventLog {
             started_unix_ns,
             live_tx,
             file_streams: Mutex::new(HashMap::new()),
-            file_stream_budget: Arc::new(Semaphore::new(MAX_FILE_STREAMS)),
         });
         (log, file)
     }
@@ -339,7 +329,6 @@ impl EventLog {
             started_unix_ns: 0,
             live_tx,
             file_streams: Mutex::new(HashMap::new()),
-            file_stream_budget: Arc::new(Semaphore::new(MAX_FILE_STREAMS)),
         })
     }
 
@@ -511,11 +500,6 @@ impl EventLog {
         path: &str,
         flags: u8,
     ) -> Result<u32, StartFileStreamError> {
-        let permit = self
-            .file_stream_budget
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| StartFileStreamError::Budget)?;
         let append = flags & EVENTS_STREAM_APPEND != 0;
         let history = flags & EVENTS_STREAM_HISTORY != 0;
         let mut options = tokio::fs::OpenOptions::new();
@@ -618,7 +602,6 @@ impl EventLog {
                     path: path.to_owned(),
                     flags,
                     progress,
-                    _permit: permit,
                 },
             );
         Ok(id)
@@ -887,7 +870,6 @@ mod tests {
     #[tokio::test]
     async fn file_stream_status_and_stop_preserve_write_failure() {
         let log = EventLog::new(MIN_RING_SIZE, ActivationSet::all());
-        let permit = log.file_stream_budget.clone().try_acquire_owned().unwrap();
         let (stop, stopped) = oneshot::channel();
         drop(stopped);
         let progress = FileStreamProgress::new(7, 99);
@@ -902,7 +884,6 @@ mod tests {
                 path: "/tmp/failed.bin".into(),
                 flags: EVENTS_STREAM_HISTORY,
                 progress,
-                _permit: permit,
             },
         );
 
@@ -921,15 +902,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_stream_budget_is_process_wide_and_bounded() {
+    async fn file_streams_have_no_process_wide_admission_cap() {
         let log = EventLog::new(MIN_RING_SIZE, ActivationSet::all());
-        let permits = (0..MAX_FILE_STREAMS)
-            .map(|_| log.file_stream_budget.clone().try_acquire_owned().unwrap())
-            .collect::<Vec<_>>();
-        assert!(matches!(
-            log.start_file_stream("unused", 0).await,
-            Err(StartFileStreamError::Budget)
-        ));
-        drop(permits);
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let mut streams = Vec::new();
+        for index in 0..9 {
+            let path = std::env::temp_dir().join(format!(
+                "blit-events-uncapped-{}-{unique}-{index}.bin",
+                std::process::id()
+            ));
+            let id = log
+                .start_file_stream(path.to_str().unwrap(), 0)
+                .await
+                .unwrap();
+            streams.push((id, path));
+        }
+        assert_eq!(log.file_streams().len(), 9);
+        for (id, path) in streams {
+            assert!(log.stop_file_stream(id).await.unwrap());
+            tokio::fs::remove_file(path).await.unwrap();
+        }
     }
 }

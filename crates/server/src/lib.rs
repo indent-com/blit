@@ -18017,15 +18017,6 @@ async fn handle_events_message(
             path: _,
         } if target == EVENTS_TARGET_CLIENT => {
             client_streams.retain(|_, task| !task.is_finished());
-            if client_streams.len() >= events::MAX_CLIENT_STREAMS_PER_CONNECTION {
-                let _ = out.send(msg_events_stream_started(
-                    nonce,
-                    STATUS_BUDGET,
-                    0,
-                    "live event tail capacity exhausted for this connection",
-                ));
-                return;
-            }
             let history = flags & EVENTS_STREAM_HISTORY != 0;
             let (stream_id, dump, mut receiver) = state.events.client_stream(history);
             let _ = out.send(msg_events_stream_started(nonce, STATUS_OK, stream_id, ""));
@@ -18128,14 +18119,9 @@ async fn handle_events_message(
                 });
             }
             Err(error) => {
-                let status = if matches!(error, events::StartFileStreamError::Budget) {
-                    STATUS_BUDGET
-                } else {
-                    STATUS_OTHER
-                };
                 let _ = out.send(msg_events_stream_started(
                     nonce,
-                    status,
+                    STATUS_OTHER,
                     0,
                     &error.to_string(),
                 ));
@@ -23125,7 +23111,7 @@ mod tests {
             }
 
             let mut stream_ids = Vec::new();
-            for nonce in 60..60 + events::MAX_CLIENT_STREAMS_PER_CONNECTION as u16 {
+            for nonce in 60..65 {
                 assert!(
                     write_frame(
                         &mut client,
@@ -23154,31 +23140,7 @@ mod tests {
                     }
                 }
             }
-            assert!(
-                write_frame(
-                    &mut client,
-                    &blit_remote::events::msg_events_stream_start(
-                        69,
-                        blit_remote::events::EVENTS_TARGET_CLIENT,
-                        0,
-                        "",
-                    ),
-                )
-                .await
-            );
-            loop {
-                let frame = next_frame(&mut client).await;
-                if let Ok(blit_remote::events::EventsMessage::StreamStarted {
-                    nonce: 69,
-                    status,
-                    ..
-                }) = blit_remote::events::parse_events_message(&frame)
-                {
-                    assert_eq!(status, STATUS_BUDGET);
-                    break;
-                }
-            }
-            assert_eq!(stream_ids.len(), events::MAX_CLIENT_STREAMS_PER_CONNECTION);
+            assert_eq!(stream_ids.len(), 5);
 
             drop(client);
             timeout(Duration::from_secs(5), connection)

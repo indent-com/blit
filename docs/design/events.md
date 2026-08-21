@@ -77,10 +77,10 @@ flowchart LR
 
 `EventLog` is process-wide and stored in `AppState`. It owns four independent
 activation words, the ring, a monotonic sequence allocator, one bounded Tokio
-broadcast channel, and the registry of persistent file tasks. At most eight
-detached file recordings run process-wide. Connection-local client stream tasks
-remain in the connection handler and are capped at four per connection, so
-disconnect cleanup cannot leave a task holding a dead outbox.
+broadcast channel, and the registry of persistent file tasks. Detached file
+recordings and connection-local client stream tasks have no arbitrary admission
+cap. Client tasks remain owned by the connection handler, which aborts all of
+them on disconnect so none can retain a dead outbox.
 
 ### Storage model
 
@@ -162,8 +162,6 @@ shutdown returns.
 7. Live `EVENTS_RECORD` delivery is not itself logged, preventing recursive
    record generation. Other event-control replies remain inspectable.
 8. Stable event ids are never renumbered or reused with a different meaning.
-9. Live tails and detached recordings have explicit admission budgets; budget
-   exhaustion is a correlated error, never an unbounded task or descriptor.
 
 ## Configuration
 
@@ -240,7 +238,7 @@ data, paths, environment values, and other secrets. The event family has the
 same authority model as the rest of a direct server connection; read-only
 share forwarders do not allow opcode `0xD0`. In-process extension endpoints
 already have filesystem and process authority, so they advertise and accept the
-event family under the same stream budgets instead of pretending the recorder
+event family under the same stream machinery instead of pretending the recorder
 is an additional sandbox boundary.
 
 ## Dump format
@@ -319,10 +317,9 @@ server recordings, including a task that failed after start but has not yet
 been stopped and removed.
 
 Standalone `DUMP` requests run outside the connection reader; every live
-client/file stream has its own dedicated Tokio task and broadcast receiver. A
-connection may own four client tails and the process may own eight detached
-file recordings. A slow stream can lag and report loss, but never blocks the
-producer or the ring.
+client/file stream has its own dedicated Tokio task and broadcast receiver,
+without a fixed per-connection or process-wide admission count. A slow stream
+can lag and report loss, but never blocks the producer or the ring.
 
 ## Failure behavior
 
@@ -336,7 +333,6 @@ producer or the ring.
 | Invalid protocol request                                       | A correlated common-status error is returned when a nonce can be recovered.                                                                      |
 | Invalid startup size                                           | Capacity falls back to 1 MiB.                                                                                                                    |
 | Invalid startup activation expression                          | The error is written to stderr and activation falls back to `default`.                                                                           |
-| Client-tail or server-file budget is exhausted                 | Start returns `BUDGET`; no task, receiver, or file descriptor is created.                                                                        |
 | Server-file open, header/history write, or initial flush fails | Protocol start returns an error and no recording id; startup configuration reports stderr and records `server.error` when enabled.               |
 | File write or final flush fails after start                    | `record list` reports `failed`, successful record/byte counters, live loss, and the error; `record stop` removes the task but returns the error. |
 | Client disconnects                                             | Its stream tasks are aborted and removed; process-scoped file streams continue.                                                                  |
@@ -400,7 +396,8 @@ without requiring wide atomic support.
 
 Tests cover ring wrapping, shrink preservation, disabled-event gating,
 oversized live delivery, conditional configuration conflicts, client/file
-admission budgets, file initialization and delayed-write status, activation
+streams beyond the former admission counts, file initialization and
+delayed-write status, activation
 selectors, strict batched-record codecs, extension-endpoint access, and
 correlated `CREATE2` stages through physical reply write. Framed connections
 negotiate the feature, change configuration, and retrieve dumps. The full
