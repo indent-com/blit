@@ -6,6 +6,7 @@ const en: Messages = {
   "auth.busy":
     "Too many recent connection attempts — wait a minute and try again",
 
+  "status.connected": "Connected",
   "status.connecting": "Connecting…",
   "status.authenticating": "Authenticating…",
   "status.connectionFailed": "Connection failed",
@@ -233,6 +234,8 @@ const en: Messages = {
   "switcher.appOn": "on {name}",
 
   "statusbar.menuTitle": "Menu",
+  "statusbar.connectionStatus": "Connection status",
+  "statusbar.manageServer": "Manage server",
   "statusbar.terminals": "{count}T",
   "statusbar.exited": "({count}x)",
   "statusbar.surfaces": "{count}S",
@@ -428,6 +431,7 @@ const es: Messages = {
   "auth.placeholder": "contraseña",
   "auth.failed": "Error de autenticación",
 
+  "status.connected": "Conectado",
   "status.connecting": "Conectando…",
   "status.authenticating": "Autenticando…",
   "status.connectionFailed": "Conexión fallida",
@@ -536,6 +540,8 @@ const es: Messages = {
   "switcher.runInlineCmd": 'Ejecutar "{command}"',
 
   "statusbar.menuTitle": "Menú",
+  "statusbar.connectionStatus": "Estado de la conexión",
+  "statusbar.manageServer": "Administrar servidor",
   "statusbar.terminals": "{count}T",
   "statusbar.exited": "({count}x)",
   "statusbar.surfaces": "{count}S",
@@ -660,6 +666,7 @@ const fr: Messages = {
   "auth.placeholder": "mot de passe",
   "auth.failed": "Échec de l’authentification",
 
+  "status.connected": "Connecté",
   "status.connecting": "Connexion…",
   "status.authenticating": "Authentification…",
   "status.connectionFailed": "Échec de connexion",
@@ -761,6 +768,8 @@ const fr: Messages = {
   "switcher.runInlineCmd": "Exécuter « {command} »",
 
   "statusbar.menuTitle": "Menu",
+  "statusbar.connectionStatus": "État de la connexion",
+  "statusbar.manageServer": "Gérer le serveur",
   "statusbar.terminals": "{count}T",
   "statusbar.exited": "({count}x)",
   "statusbar.surfaces": "{count}S",
@@ -886,6 +895,7 @@ const de: Messages = {
   "auth.placeholder": "Passwort",
   "auth.failed": "Authentifizierung fehlgeschlagen",
 
+  "status.connected": "Verbunden",
   "status.connecting": "Verbinde…",
   "status.authenticating": "Authentifiziere…",
   "status.connectionFailed": "Verbindung fehlgeschlagen",
@@ -988,6 +998,8 @@ const de: Messages = {
   "switcher.runInlineCmd": "„{command}\u201c ausführen",
 
   "statusbar.menuTitle": "Menü",
+  "statusbar.connectionStatus": "Verbindungsstatus",
+  "statusbar.manageServer": "Server verwalten",
   "statusbar.terminals": "{count}T",
   "statusbar.exited": "({count}x)",
   "statusbar.surfaces": "{count}S",
@@ -1113,6 +1125,7 @@ const ja: Messages = {
   "auth.placeholder": "パスワード",
   "auth.failed": "認証に失敗しました",
 
+  "status.connected": "接続済み",
   "status.connecting": "接続中…",
   "status.authenticating": "認証中…",
   "status.connectionFailed": "接続に失敗しました",
@@ -1214,6 +1227,8 @@ const ja: Messages = {
   "switcher.runInlineCmd": "「{command}」を実行",
 
   "statusbar.menuTitle": "メニュー",
+  "statusbar.connectionStatus": "接続状態",
+  "statusbar.manageServer": "サーバーを管理",
   "statusbar.terminals": "{count}T",
   "statusbar.exited": "({count}x)",
   "statusbar.surfaces": "{count}S",
@@ -1331,6 +1346,7 @@ const zh: Messages = {
   "auth.placeholder": "密码",
   "auth.failed": "认证失败",
 
+  "status.connected": "已连接",
   "status.connecting": "连接中…",
   "status.authenticating": "认证中…",
   "status.connectionFailed": "连接失败",
@@ -1432,6 +1448,8 @@ const zh: Messages = {
   "switcher.runInlineCmd": "运行\u201c{command}\u201d",
 
   "statusbar.menuTitle": "菜单",
+  "statusbar.connectionStatus": "连接状态",
+  "statusbar.manageServer": "管理服务器",
   "statusbar.terminals": "{count}T",
   "statusbar.exited": "({count}x)",
   "statusbar.surfaces": "{count}S",

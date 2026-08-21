@@ -5,7 +5,7 @@
 //! RESULT straight to stdout, so sending both prints the answer twice.
 
 use super::{Muster, describe_ready};
-use blit_ext_muster::config::{self, InstanceFile};
+use blit_ext_muster::config::{self, InstanceFile, StackFile};
 use blit_ext_muster::journal::{Cause, Record};
 use blit_ext_muster::supervisor::{self, Phase, Unit};
 use blit_guest::Client;
@@ -818,9 +818,23 @@ impl Muster {
     }
 
     fn render_stacks(&self, json: bool) -> String {
+        // `self.stacks` contains definitions under the configuration
+        // directory. Instances may instead point at a watched directory
+        // anywhere (and worktree sources always do), so include each distinct
+        // active path as well. An active instance has already expanded from
+        // this declaration; failure here can only mean its watch changed
+        // between the load and this command, in which case the next load will
+        // either restore it or report the error through `doctor`.
+        let stacks = stack_catalog(
+            &self.stacks,
+            self.instances
+                .values()
+                .map(|instance| instance.stack.as_str()),
+            |name| self.declarations_of(name).ok(),
+        );
         if json {
             return line(json!(
-                self.stacks
+                stacks
                     .iter()
                     .map(|(name, stack)| json!({
                         "name": name,
@@ -838,7 +852,7 @@ impl Muster {
             ));
         }
         let mut out = String::from("STACK\tPARAMETER\tREQUIRED\tKIND\n");
-        for (name, stack) in &self.stacks {
+        for (name, stack) in &stacks {
             if stack.vars.is_empty() {
                 out.push_str(&format!("{name}\t-\t-\t-\n"));
             }
@@ -910,7 +924,55 @@ impl Muster {
     }
 }
 
+/// Merge configuration-local stacks with declarations used by active
+/// instances. The latter are paths for external and generated worktree stacks.
+fn stack_catalog<'a>(
+    local: &BTreeMap<String, StackFile>,
+    active: impl Iterator<Item = &'a str>,
+    mut declaration: impl FnMut(&str) -> Option<StackFile>,
+) -> BTreeMap<String, StackFile> {
+    let mut catalog = local.clone();
+    for name in active {
+        if catalog.contains_key(name) {
+            continue;
+        }
+        if let Some(stack) = declaration(name) {
+            catalog.insert(name.to_string(), stack);
+        }
+    }
+    catalog
+}
+
 /// One JSON value as a line, which is what both the CLI and the journal emit.
 fn line(value: Value) -> String {
     format!("{value}\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stack(json: &str) -> StackFile {
+        serde_json::from_str(json).expect("valid stack")
+    }
+
+    #[test]
+    fn stack_catalog_includes_distinct_active_external_stacks() {
+        let local = BTreeMap::from([("api".into(), stack(r#"{"vars":{}}"#))]);
+        let external = stack(r#"{"vars":{"PORTS":{"kind":"ports","span":4}}}"#);
+        let catalog = stack_catalog(
+            &local,
+            ["api", "/src/blit/.blit/muster", "/src/blit/.blit/muster"].into_iter(),
+            |name| (name == "/src/blit/.blit/muster").then(|| external.clone()),
+        );
+
+        assert_eq!(catalog.len(), 2);
+        assert!(catalog.contains_key("api"));
+        assert_eq!(
+            catalog["/src/blit/.blit/muster"].vars["PORTS"]
+                .kind
+                .as_deref(),
+            Some("ports")
+        );
+    }
 }

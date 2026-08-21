@@ -246,9 +246,7 @@ export interface IdeSession {
    *  merged like `git rev-list` args (`base..a b ^c`); empty = HEAD
    *  (docs/design/git.md `GIT_RESOLVE`). */
   logSpec: Accessor<string>;
-  /** Set the spec and persist it per repo workdir in the server KV store
-   *  (`log/spec/<workdir>`), so a reload restores the range being studied.
-   *  Empty (or plain HEAD) deletes the stored spec. */
+  /** Set the spec for this live IDE session. A fresh session starts at HEAD. */
   setLogSpec(spec: string): void;
   /** The last spec's resolution failure, cleared on success. */
   logSpecError: Accessor<string | null>;
@@ -950,45 +948,6 @@ function buildSession(
     });
   });
 
-  // Restore the persisted log spec once per workdir (the key setLogSpec
-  // writes below). A spec the user typed before the repo settled wins —
-  // and gets stored once the workdir lands, instead of being dropped.
-  let logSpecLoadedFor: string | null = null;
-  let pendingSpecStore: string | null = null;
-  function storeLogSpec(workdir: string, spec: string): void {
-    const key = `log/spec/${workdir}`;
-    const trimmed = spec.trim();
-    if (trimmed && trimmed !== "HEAD")
-      workspace
-        .kvPut(connectionId, key, new TextEncoder().encode(trimmed))
-        .catch(() => {});
-    else workspace.kvDelete(connectionId, key).catch(() => {});
-  }
-  createEffect(() => {
-    const workdir = gitWorkdir();
-    if (!workdir || logSpecLoadedFor === workdir) return;
-    logSpecLoadedFor = workdir;
-    if (pendingSpecStore !== null) {
-      storeLogSpec(workdir, pendingSpecStore);
-      pendingSpecStore = null;
-      return;
-    }
-    workspace
-      .kvFetch(connectionId, `log/spec/${workdir}`)
-      .then((res) => {
-        if (disposed || !res) return;
-        const spec = new TextDecoder().decode(res.value).trim();
-        if (spec && logSpec() === "") setLogSpec(spec);
-      })
-      .catch(() => {});
-  });
-  function setAndStoreLogSpec(spec: string): void {
-    setLogSpec(spec);
-    const workdir = gitWorkdir();
-    if (workdir) storeLogSpec(workdir, spec);
-    else pendingSpecStore = spec;
-  }
-
   // Log watch — its own effect so changing the spec re-subscribes without
   // reopening the repo. The subscription streams the head page and re-walks
   // whenever the resolved endpoints move. Cached rows are cleared only on
@@ -1229,7 +1188,7 @@ function buildSession(
     hasMoreLog,
     loadMoreLog,
     logSpec,
-    setLogSpec: setAndStoreLogSpec,
+    setLogSpec,
     logSpecError,
     logLoaded,
     ensureLog,

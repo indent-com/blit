@@ -8,6 +8,7 @@ import {
   groupMusterPreviewResources,
   isMusterSession,
   musterAppIdForUnit,
+  musterStackKey,
   musterSessionLabel,
   previewSessionsToWatch,
 } from "../musterPreview";
@@ -81,6 +82,23 @@ describe("Muster preview grouping", () => {
     expect(previewSessionsToWatch(sessions, false)).toEqual([shell]);
   });
 
+  it("only watches terminals in expanded Muster stacks", () => {
+    const shell = session("shell", "shell");
+    const main = session("main", "muster/main/api/7");
+    const other = session("other", "muster/other/api/8");
+    const standalone = session("standalone", "muster/api/9");
+    const sessions = [shell, main, other, standalone];
+
+    expect(previewSessionsToWatch(sessions, true, new Set())).toEqual([shell]);
+    expect(
+      previewSessionsToWatch(
+        sessions,
+        true,
+        new Set([musterStackKey("local", "main")]),
+      ),
+    ).toEqual([shell, main]);
+  });
+
   it("moves owned terminals and stamped surfaces into bottom hierarchy groups", () => {
     const shell = session("shell1", "shell");
     const api = session("api2", "muster/api/7");
@@ -104,15 +122,106 @@ describe("Muster preview grouping", () => {
     expect(grouped.sessions.map((item) => item.id)).toEqual(["shell1"]);
     expect(grouped.surfaces.map((item) => item.surfaceId)).toEqual([1, 3, 5]);
     expect(
-      grouped.muster.map((group) => ({
-        id: group.session.id,
-        showTerminal: group.showTerminal,
-        surfaces: group.surfaces.map((item) => item.surfaceId),
+      grouped.muster.map((instance) => ({
+        connectionId: instance.connectionId,
+        instance: instance.instance,
+        units: instance.units.map((unit) => ({
+          name: unit.name,
+          runs: unit.runs.map((run) => ({
+            id: run.session.id,
+            label: run.label,
+            showTerminal: run.showTerminal,
+            surfaces: run.surfaces.map((item) => item.surfaceId),
+          })),
+        })),
       })),
     ).toEqual([
-      { id: "api2", showTerminal: true, surfaces: [2] },
-      { id: "stop3", showTerminal: true, surfaces: [] },
-      { id: "worker4", showTerminal: false, surfaces: [4] },
+      {
+        connectionId: "local",
+        instance: null,
+        units: [
+          {
+            name: "api",
+            runs: [
+              {
+                id: "api2",
+                label: "7",
+                showTerminal: true,
+                surfaces: [2],
+              },
+              {
+                id: "stop3",
+                label: "stop",
+                showTerminal: true,
+                surfaces: [],
+              },
+            ],
+          },
+        ],
+      },
+      {
+        connectionId: "local",
+        instance: "main",
+        units: [
+          {
+            name: "worker",
+            runs: [
+              {
+                id: "worker4",
+                label: "3",
+                showTerminal: false,
+                surfaces: [4],
+              },
+            ],
+          },
+        ],
+      },
+    ]);
+  });
+
+  it("nests an instance run under its stack and unit", () => {
+    const server = session("server4", "muster/blit/server/4");
+    const grouped = groupMusterPreviewResources([server], [server], []);
+
+    expect(grouped.muster).toEqual([
+      {
+        connectionId: "local",
+        instance: "blit",
+        units: [
+          {
+            name: "server",
+            runs: [
+              {
+                session: server,
+                label: "4",
+                showTerminal: true,
+                surfaces: [],
+              },
+            ],
+          },
+        ],
+      },
+    ]);
+  });
+
+  it("keeps equal instance and unit names on separate connections", () => {
+    const local = session("local4", "muster/blit/server/4", "local");
+    const prod = session("prod4", "muster/blit/server/4", "prod");
+    const grouped = groupMusterPreviewResources(
+      [local, prod],
+      [local, prod],
+      [],
+    );
+
+    expect(
+      grouped.muster.map((instance) => ({
+        connectionId: instance.connectionId,
+        instance: instance.instance,
+        runs: instance.units[0]?.runs.map((run) => run.session.id),
+      })),
+    ).toEqual([
+      { connectionId: "local", instance: "blit", runs: ["local4"] },
+      { connectionId: "prod", instance: "blit", runs: ["prod4"] },
     ]);
   });
 
@@ -123,7 +232,7 @@ describe("Muster preview grouping", () => {
       appId: musterAppIdForUnit("api"),
     };
     const grouped = groupMusterPreviewResources([api], [api], [lookalike]);
-    expect(grouped.muster[0]?.surfaces).toEqual([]);
+    expect(grouped.muster[0]?.units[0]?.runs[0]?.surfaces).toEqual([]);
     expect(grouped.surfaces).toEqual([lookalike]);
   });
 });

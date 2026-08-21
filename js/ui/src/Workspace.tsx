@@ -139,7 +139,7 @@ import { settleAttention } from "./surfaceAttention";
 import {
   groupMusterPreviewResources,
   isMusterSession,
-  musterSessionLabel,
+  musterStackKey,
   previewSessionsToWatch,
 } from "./musterPreview";
 import {
@@ -762,6 +762,9 @@ function WorkspaceScreen(props: {
   const [musterPreviewExpanded, setMusterPreviewExpanded] = createSignal(
     parseMusterExpandedHash(initHash.get("m")) ?? false,
   );
+  const [expandedMusterStacks, setExpandedMusterStacks] = createSignal<
+    ReadonlySet<string>
+  >(new Set());
   const [previewPanelWidth, setPreviewPanelWidth] = createSignal(
     preferredPreviewPanelWidth(),
   );
@@ -2313,8 +2316,21 @@ function WorkspaceScreen(props: {
     );
   });
   const watchedPreviewSessions = createMemo(() =>
-    previewSessionsToWatch(offScreenSessions(), musterPreviewExpanded()),
+    previewSessionsToWatch(
+      offScreenSessions(),
+      musterPreviewExpanded(),
+      expandedMusterStacks(),
+    ),
   );
+
+  function toggleMusterStack(key: string) {
+    setExpandedMusterStacks((current) => {
+      const next = new Set(current);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }
 
   function toggleDebug() {
     setDebugPanel((v) => !v);
@@ -3258,10 +3274,9 @@ function WorkspaceScreen(props: {
     // the core's focus fallback. Do not let that special case keep a folded
     // off-screen Muster terminal subscribed.
     const focusedMusterIsFolded =
-      !musterPreviewExpanded() &&
       offScreenSessions().some(
         (session) => session.id === fid && isMusterSession(session),
-      );
+      ) && !watchedPreviewSessions().some((session) => session.id === fid);
     if (fid && !focusedMusterIsFolded) desired.add(fid);
     // Parked terminals are watched only while their thumbnails are rendered.
     if (previewPanelVisible()) {
@@ -4900,9 +4915,11 @@ function WorkspaceScreen(props: {
               onResize={persistPreviewPanelWidth}
               onClose={togglePreviewPanel}
               musterExpanded={musterPreviewExpanded()}
+              expandedMusterStacks={expandedMusterStacks()}
               onToggleMuster={() =>
                 setMusterPreviewExpanded((expanded) => !expanded)
               }
+              onToggleMusterStack={toggleMusterStack}
               backgroundEditors={
                 <For each={backgroundTiles()}>
                   {(assignment, index) => {
@@ -5499,6 +5516,16 @@ function WorkspaceScreen(props: {
                 ? () => toggleOverlay("remotes")
                 : undefined
             }
+            onManageConnection={
+              shellCapabilities().remotes
+                ? undefined
+                : (connectionId) => openTile(manageAssignment(connectionId))
+            }
+            onReconnectConnection={
+              shellCapabilities().remotes
+                ? undefined
+                : (connectionId) => workspace.reconnectConnection(connectionId)
+            }
             metrics={metrics()}
             palette={palette()}
             fontSize={fontSize()}
@@ -5593,7 +5620,9 @@ function PreviewPanel(props: {
   onResize: (width: number) => void;
   onClose: () => void;
   musterExpanded: boolean;
+  expandedMusterStacks: ReadonlySet<string>;
   onToggleMuster: () => void;
+  onToggleMusterStack: (key: string) => void;
   /** Live background-editor cards (rendered by WorkspaceScreen, which owns the
    *  tile assignments), shown above the terminal/surface thumbnails. */
   backgroundEditors?: JSX.Element;
@@ -5614,6 +5643,8 @@ function PreviewPanel(props: {
       props.surfaces,
     ),
   );
+  const musterStackExpanded = (connectionId: string, instance: string | null) =>
+    props.expandedMusterStacks.has(musterStackKey(connectionId, instance));
 
   function handleResizePointerDown(e: PointerEvent) {
     e.preventDefault();
@@ -5867,21 +5898,50 @@ function PreviewPanel(props: {
               >
                 <Show when={props.musterExpanded}>
                   <Index each={resources().muster}>
-                    {(group) => (
-                      <div
-                        data-blit-muster-terminal={group().session.id}
-                        data-blit-muster-tag={group().session.tag}
+                    {(instance) => (
+                      <section
+                        data-blit-muster-instance={
+                          instance().instance ?? "standalone"
+                        }
+                        data-blit-muster-connection={instance().connectionId}
                       >
-                        <div
-                          style={{
+                        <button
+                          type="button"
+                          data-blit-muster-stack-toggle=""
+                          aria-expanded={musterStackExpanded(
+                            instance().connectionId,
+                            instance().instance,
+                          )}
+                          onClick={() =>
+                            props.onToggleMusterStack(
+                              musterStackKey(
+                                instance().connectionId,
+                                instance().instance,
+                              ),
+                            )
+                          }
+                          style={mergeStyle(ui.btn, {
+                            width: "100%",
                             display: "flex",
                             "align-items": "center",
                             gap: `${props.scale.tightGap}px`,
                             padding: `${props.scale.controlY}px ${props.scale.tightGap}px`,
                             "border-top": `1px solid ${props.theme.subtleBorder}`,
-                            "font-size": `${props.scale.xs}px`,
-                          }}
+                            color: props.theme.fg,
+                            "font-size": `${props.scale.sm}px`,
+                            "font-weight": 600,
+                            "text-align": "left",
+                            opacity: 1,
+                          })}
                         >
+                          <span aria-hidden="true">
+                            {musterStackExpanded(
+                              instance().connectionId,
+                              instance().instance,
+                            )
+                              ? "▾"
+                              : "▸"}
+                          </span>
                           <span
                             style={{
                               flex: 1,
@@ -5890,82 +5950,200 @@ function PreviewPanel(props: {
                               "white-space": "nowrap",
                             }}
                           >
-                            {musterSessionLabel(group().session)}
+                            {instance().instance ?? "Standalone"}
                           </span>
-                          <Show when={!group().showTerminal}>
-                            <span style={{ color: props.theme.dimFg }}>
-                              on screen
-                            </span>
+                        </button>
+                        <div
+                          data-blit-muster-stack-body=""
+                          hidden={
+                            !musterStackExpanded(
+                              instance().connectionId,
+                              instance().instance,
+                            )
+                          }
+                        >
+                          <Show
+                            when={musterStackExpanded(
+                              instance().connectionId,
+                              instance().instance,
+                            )}
+                          >
+                            <div
+                              style={{
+                                "margin-left": `${props.scale.gap}px`,
+                                "border-left": `1px solid ${props.theme.subtleBorder}`,
+                              }}
+                            >
+                              <Index each={instance().units}>
+                                {(unit) => (
+                                  <section data-blit-muster-unit={unit().name}>
+                                    <div
+                                      style={{
+                                        padding: `${props.scale.controlY}px ${props.scale.tightGap}px`,
+                                        "border-top": `1px solid ${props.theme.subtleBorder}`,
+                                        color: props.theme.dimFg,
+                                        "font-size": `${props.scale.xs}px`,
+                                        "font-weight": 600,
+                                        overflow: "hidden",
+                                        "text-overflow": "ellipsis",
+                                        "white-space": "nowrap",
+                                      }}
+                                    >
+                                      {unit().name}
+                                    </div>
+                                    <div
+                                      style={{
+                                        "margin-left": `${props.scale.gap}px`,
+                                        "border-left": `1px solid ${props.theme.subtleBorder}`,
+                                      }}
+                                    >
+                                      <Index each={unit().runs}>
+                                        {(run) => (
+                                          <div
+                                            data-blit-muster-terminal={
+                                              run().session.id
+                                            }
+                                            data-blit-muster-tag={
+                                              run().session.tag
+                                            }
+                                          >
+                                            <Show
+                                              when={
+                                                !/^[0-9]+$/.test(run().label) ||
+                                                !run().showTerminal
+                                              }
+                                            >
+                                              <div
+                                                style={{
+                                                  display: "flex",
+                                                  "align-items": "center",
+                                                  gap: `${props.scale.tightGap}px`,
+                                                  padding: `${props.scale.controlY}px ${props.scale.tightGap}px`,
+                                                  "border-top": `1px solid ${props.theme.subtleBorder}`,
+                                                  "font-size": `${props.scale.xs}px`,
+                                                }}
+                                              >
+                                                <span
+                                                  style={{
+                                                    flex: 1,
+                                                    overflow: "hidden",
+                                                    "text-overflow": "ellipsis",
+                                                    "white-space": "nowrap",
+                                                  }}
+                                                >
+                                                  {/^[0-9]+$/.test(run().label)
+                                                    ? `#${run().label}`
+                                                    : run().label}
+                                                </span>
+                                                <Show
+                                                  when={!run().showTerminal}
+                                                >
+                                                  <span
+                                                    style={{
+                                                      color: props.theme.dimFg,
+                                                    }}
+                                                  >
+                                                    on screen
+                                                  </span>
+                                                </Show>
+                                              </div>
+                                            </Show>
+                                            <Show when={run().showTerminal}>
+                                              <SessionThumbnail
+                                                session={run().session}
+                                                titlePrefix={
+                                                  /^[0-9]+$/.test(run().label)
+                                                    ? `#${run().label}`
+                                                    : undefined
+                                                }
+                                                connectionLabel={props.connectionLabels?.get(
+                                                  run().session.connectionId,
+                                                )}
+                                                theme={props.theme}
+                                                scale={props.scale}
+                                                palette={props.palette}
+                                                fontFamily={props.fontFamily}
+                                                fontSize={props.fontSize}
+                                                isMobileTouch={
+                                                  props.isMobileTouch
+                                                }
+                                                onFocus={() =>
+                                                  props.onFocusSession(
+                                                    run().session.id,
+                                                  )
+                                                }
+                                                onClose={() =>
+                                                  props.onCloseSession(
+                                                    run().session.id,
+                                                  )
+                                                }
+                                              />
+                                            </Show>
+                                            <Show
+                                              when={run().surfaces.length > 0}
+                                            >
+                                              <div
+                                                data-blit-muster-surfaces=""
+                                                style={{
+                                                  "margin-left": `${props.scale.gap}px`,
+                                                  "border-left": `1px solid ${props.theme.subtleBorder}`,
+                                                }}
+                                              >
+                                                <Index each={run().surfaces}>
+                                                  {(s) => (
+                                                    <SurfaceThumbnail
+                                                      surface={s()}
+                                                      connectionId={
+                                                        s().connectionId
+                                                      }
+                                                      connectionLabel={props.connectionLabels?.get(
+                                                        s().connectionId,
+                                                      )}
+                                                      theme={props.theme}
+                                                      scale={props.scale}
+                                                      focused={
+                                                        s().surfaceId ===
+                                                          props.focusedSurfaceId &&
+                                                        s().connectionId ===
+                                                          props.focusedSurfaceConnId
+                                                      }
+                                                      attention={props.hasAttention(
+                                                        surfaceAssignment(
+                                                          s().connectionId,
+                                                          s().surfaceId,
+                                                        ),
+                                                      )}
+                                                      isMobileTouch={
+                                                        props.isMobileTouch
+                                                      }
+                                                      onFocus={() =>
+                                                        props.onFocusSurface(
+                                                          s().connectionId,
+                                                          s().surfaceId,
+                                                        )
+                                                      }
+                                                      onClose={() =>
+                                                        props.onCloseSurface(
+                                                          s().connectionId,
+                                                          s().surfaceId,
+                                                        )
+                                                      }
+                                                    />
+                                                  )}
+                                                </Index>
+                                              </div>
+                                            </Show>
+                                          </div>
+                                        )}
+                                      </Index>
+                                    </div>
+                                  </section>
+                                )}
+                              </Index>
+                            </div>
                           </Show>
                         </div>
-                        <Show when={group().showTerminal}>
-                          <SessionThumbnail
-                            session={group().session}
-                            connectionLabel={props.connectionLabels?.get(
-                              group().session.connectionId,
-                            )}
-                            theme={props.theme}
-                            scale={props.scale}
-                            palette={props.palette}
-                            fontFamily={props.fontFamily}
-                            fontSize={props.fontSize}
-                            isMobileTouch={props.isMobileTouch}
-                            onFocus={() =>
-                              props.onFocusSession(group().session.id)
-                            }
-                            onClose={() =>
-                              props.onCloseSession(group().session.id)
-                            }
-                          />
-                        </Show>
-                        <Show when={group().surfaces.length > 0}>
-                          <div
-                            data-blit-muster-surfaces=""
-                            style={{
-                              "margin-left": `${props.scale.gap}px`,
-                              "border-left": `1px solid ${props.theme.subtleBorder}`,
-                            }}
-                          >
-                            <Index each={group().surfaces}>
-                              {(s) => (
-                                <SurfaceThumbnail
-                                  surface={s()}
-                                  connectionId={s().connectionId}
-                                  connectionLabel={props.connectionLabels?.get(
-                                    s().connectionId,
-                                  )}
-                                  theme={props.theme}
-                                  scale={props.scale}
-                                  focused={
-                                    s().surfaceId === props.focusedSurfaceId &&
-                                    s().connectionId ===
-                                      props.focusedSurfaceConnId
-                                  }
-                                  attention={props.hasAttention(
-                                    surfaceAssignment(
-                                      s().connectionId,
-                                      s().surfaceId,
-                                    ),
-                                  )}
-                                  isMobileTouch={props.isMobileTouch}
-                                  onFocus={() =>
-                                    props.onFocusSurface(
-                                      s().connectionId,
-                                      s().surfaceId,
-                                    )
-                                  }
-                                  onClose={() =>
-                                    props.onCloseSurface(
-                                      s().connectionId,
-                                      s().surfaceId,
-                                    )
-                                  }
-                                />
-                              )}
-                            </Index>
-                          </div>
-                        </Show>
-                      </div>
+                      </section>
                     )}
                   </Index>
                 </Show>
@@ -6208,6 +6386,7 @@ function Thumbnail(props: {
 
 function SessionThumbnail(props: {
   session: BlitSession;
+  titlePrefix?: string;
   connectionLabel?: string;
   theme: Theme;
   scale: UIScale;
@@ -6238,6 +6417,10 @@ function SessionThumbnail(props: {
               "white-space": "nowrap",
             }}
           >
+            <Show when={props.titlePrefix}>
+              <span style={{ "font-weight": 600 }}>{props.titlePrefix}</span>
+              {" \u203A "}
+            </Show>
             <span style={{ opacity: 0.5 }}>
               {sessionPrefix(props.session, props.connectionLabel)}
             </span>
