@@ -309,7 +309,7 @@ fn run(mut client: Client, initial: &[Vec<u8>]) -> Result<(), String> {
     let adoptable = adoptable_tags(initial);
     let environment = read_environment(&mut client)?;
     let get = |key: &str| environment_string(&environment, key);
-    let dir = resolve_dir_from(&get)?;
+    let dir = resolve_dir_from(get)?;
     let local_sockets = LocalSockets::from_environment(&get);
     // The configuration directory is derived from HOME, so it carries it.
     let home = match dir.find("/.config/") {
