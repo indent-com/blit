@@ -250,6 +250,38 @@ Writes are compare-and-swap when you ask: `--if-hash H` writes only if the
 current value still hashes to H, exiting 1 on conflict. Without it a put is
 an unconditional overwrite. `--durable` waits for disk.
 
+## Structured events
+
+Configure the bounded server event ring and export its fixed binary records.
+Every dump and stream output is a canonical `blit.events.v1` file: a 32-byte
+header followed by 64-byte records.
+
+```bash
+blit events config
+blit events config --json
+blit events config set --bytes 4MiB
+blit events config set --active pty,process,+task-failed
+blit events config set --active 1f000000001000000000000000003f00 --json
+blit events dump --since 42 --limit 1000 --output events.blit
+blit events stream --since now --output - >events.blit
+blit events stream --since oldest --output events.blit
+blit events file start /tmp/server-events.blit --append --sync --json
+blit events file stop ID --json
+```
+
+`config set` preserves the current field when only `--bytes` or `--active` is
+supplied. Byte sizes must be multiples of 64 and may use `KiB`, `MiB`, or
+`GiB`. Activation accepts named event ids, numeric ids, or families such as
+`server`, `client`, `request`, `writer`, `pty`, `process`, `compositor`,
+`surface`, `protocol`, `task`, and `recorder`; comma-separated `+` and `-`
+selectors add and remove ids. A hexadecimal activation is exactly 16 bytes
+(32 hexadecimal digits, optional `0x`).
+
+`stream` follows until Ctrl-C. `--since now` starts at the live edge,
+`--since oldest` replays retained records first, and a sequence resumes a
+saved cursor. `file start` writes on the server, so its path is server-local;
+the returned id is passed to `file stop`.
+
 ## Wasmi extensions
 
 ```bash

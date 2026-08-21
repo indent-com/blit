@@ -2,6 +2,7 @@ mod agent;
 mod attach;
 mod cli;
 mod completion;
+mod events;
 mod extension;
 mod forward;
 mod fs;
@@ -20,8 +21,9 @@ mod uplink;
 
 use clap::Parser;
 use cli::{
-    Cli, ClientCommand, ClipboardCommand, Command, FsCommand, GitCommand, KvCommand, LspCommand,
-    RemoteCommand, SurfaceCommand, TerminalCommand,
+    Cli, ClientCommand, ClipboardCommand, Command, EventsCommand, EventsConfigCommand,
+    EventsFileCommand, FsCommand, GitCommand, KvCommand, LspCommand, RemoteCommand, SurfaceCommand,
+    TerminalCommand,
 };
 
 // glibc malloc retains freed memory in per-thread arenas (up to 8 per core);
@@ -861,6 +863,48 @@ async fn async_main() {
                     eprintln!("blit: {e}");
                     std::process::exit(1);
                 }
+            }
+        }
+        Command::Events { command } => {
+            let conn = &cli.connect;
+            let transport = match transport::connect(&conn.on, &conn.hub).await {
+                Ok(transport) => transport,
+                Err(error) => {
+                    eprintln!("blit: {error}");
+                    std::process::exit(1);
+                }
+            };
+            let result = match command {
+                EventsCommand::Config { command, json } => match command {
+                    None => events::cmd_config(transport, json).await,
+                    Some(EventsConfigCommand::Set { bytes, active }) => {
+                        events::cmd_config_set(transport, bytes, active, json).await
+                    }
+                },
+                EventsCommand::Dump {
+                    since,
+                    limit,
+                    output,
+                } => events::cmd_dump(transport, since, limit, output).await,
+                EventsCommand::Stream { since, output } => {
+                    events::cmd_stream(transport, since, output).await
+                }
+                EventsCommand::File { command } => match command {
+                    EventsFileCommand::Start {
+                        path,
+                        append,
+                        sync,
+                        id,
+                        json,
+                    } => events::cmd_file_start(transport, path, append, sync, id, json).await,
+                    EventsFileCommand::Stop { id, json } => {
+                        events::cmd_file_stop(transport, id, json).await
+                    }
+                },
+            };
+            if let Err(error) = result {
+                eprintln!("blit: {error}");
+                std::process::exit(1);
             }
         }
         Command::Lsp { command } => {

@@ -24,6 +24,11 @@ Maximum frame size: **16 MiB**.
 
 Every message begins with a **1-byte opcode**. All multi-byte fields are little-endian. Fields are tightly packed with no padding or alignment. PTY identifiers are 2-byte unsigned integers.
 
+Opcode `0x96` in both directions is the internally versioned `blit.events.v1`
+family, advertised by feature bit 31. Its config, dump, client-stream,
+server-file-stream, event-record, and file-header layouts are specified in
+[`design/events.md`](design/events.md). The global protocol version remains 1.
+
 Any per-request reply guarantee is conditional on the logical connection
 remaining live through that reply. A transport failure or a documented fatal
 framing, protocol, or endpoint-resource violation closes the connection and

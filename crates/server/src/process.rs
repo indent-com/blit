@@ -29,6 +29,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::{Notify, Semaphore, mpsc};
 use tokio::task::AbortHandle;
 
+use crate::events::{EventId, blit_event};
 #[cfg(unix)]
 use crate::pty;
 
@@ -1029,6 +1030,14 @@ impl Manager {
             return;
         }
         let req = parse_process_spawn(&request).expect("retained validated spawn");
+        blit_event!(
+            EventId::ProcessSpawn,
+            0,
+            req.process_id as u64,
+            req.nonce as u64,
+            0,
+            0
+        );
         let merged = req.flags & PROCESS_SPAWN_MERGE_STDERR != 0;
         let streams = if merged { 2 } else { 3 };
         let buffer_bytes =
@@ -1069,6 +1078,14 @@ impl Manager {
                     io::ErrorKind::InvalidInput => STATUS_INVALID,
                     _ => STATUS_OTHER,
                 };
+                blit_event!(
+                    EventId::ProcessResult,
+                    0,
+                    req.process_id as u64,
+                    status as u64,
+                    0,
+                    0
+                );
                 complete_spawn_failure(&pending, req.nonce, status, &error.to_string());
                 return;
             }
@@ -1079,6 +1096,14 @@ impl Manager {
             #[cfg(windows)]
             job,
         } = spawned;
+        blit_event!(
+            EventId::ProcessResult,
+            0,
+            req.process_id as u64,
+            STATUS_OK as u64,
+            pid as u64,
+            0
+        );
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = (!merged).then(|| child.stdout.take().expect("piped stdout"));
         let stderr = (!merged).then(|| child.stderr.take().expect("piped stderr"));
@@ -3030,6 +3055,14 @@ fn try_queue_terminal(record: &Arc<Record>) {
     };
     record.terminal_notify.notify_waiters();
     let (bindings, final_record) = terminal;
+    blit_event!(
+        EventId::ProcessExit,
+        0,
+        record.generation,
+        final_record.reason as u64,
+        final_record.code as u64,
+        final_record.pid as u64
+    );
     if bindings.is_empty() {
         finish_terminal(record.clone(), final_record);
         return;

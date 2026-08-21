@@ -44,6 +44,10 @@ pub mod media;
 /// cursor a client feeds back to read only what is new.
 pub mod journal;
 
+/// Structured server events (`blit.events.v1`): configuration, ring dumps,
+/// live streams, server-side file streams, and the fixed binary record codec.
+pub mod events;
+
 /// Cap on any single LZ4-decompressed payload, protocol-wide
 /// (docs/protocol.md "Compressed payloads"). Receivers check the prepended
 /// size against it *before* allocating, so a hostile or corrupt length

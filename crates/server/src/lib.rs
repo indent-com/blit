@@ -12,6 +12,7 @@ use blit_remote::desktop::{
     msg_notification_update, msg_tray_menu, msg_tray_snapshot, msg_tray_update,
     parse_desktop_subscribe, parse_notification_event, parse_tray_event,
 };
+use blit_remote::events::{EVENTS, FEATURE_EVENTS};
 #[cfg(target_os = "linux")]
 use blit_remote::media::{
     ACTIVE_CAMERA, ACTIVE_MICROPHONE, ACTIVE_SCREENCAST, C2S_MEDIA_CONTROL, C2S_MEDIA_DATA,
@@ -78,6 +79,7 @@ mod capacity_diagnostics;
 mod channel;
 #[cfg(target_os = "linux")]
 mod desktop_bus;
+mod events;
 mod extension;
 pub mod extension_catalog;
 mod extension_jobs;
@@ -3556,6 +3558,7 @@ struct VulkanVideoSurfaceState {
 enum QueuedMessage {
     Bulk(ConnectionBulk),
     Channel(channel::Delivery),
+    Event(Vec<u8>),
 }
 
 impl QueuedMessage {
@@ -3563,6 +3566,7 @@ impl QueuedMessage {
         match self {
             Self::Bulk(packet) => packet.packet(),
             Self::Channel(delivery) => &delivery.packet,
+            Self::Event(packet) => packet,
         }
     }
 }
@@ -6353,6 +6357,7 @@ impl Session {
             #[cfg(target_os = "linux")]
             let desktop_notify = event_notify.clone();
             let handle = blit_compositor::spawn_compositor(verbose, event_notify, gpu_device);
+            events::blit_event!(events::EventId::CompositorStarted);
             // Ahead of the desktop bus and of every PTY, because both export
             // DISPLAY at spawn and an app that starts without it has no X at
             // all.  The compositor is told whose connection to expect, so the
@@ -8148,6 +8153,10 @@ impl Session {
 
 struct AppStateInner {
     config: Config,
+    #[cfg(not(test))]
+    events: Arc<events::EventRecorder>,
+    #[cfg(not(test))]
+    event_files: Arc<events::FileStreamManager>,
     #[cfg(any(unix, windows))]
     process_server: process::Server,
     /// Opaque identifier shared by every connection to this server process.
@@ -8174,12 +8183,37 @@ struct AppStateInner {
 
 type AppState = Arc<AppStateInner>;
 
+impl AppStateInner {
+    fn event_recorder(&self) -> Arc<events::EventRecorder> {
+        #[cfg(not(test))]
+        {
+            self.events.clone()
+        }
+        #[cfg(test)]
+        {
+            events::global_arc()
+        }
+    }
+
+    fn event_files(&self) -> Arc<events::FileStreamManager> {
+        #[cfg(not(test))]
+        {
+            self.event_files.clone()
+        }
+        #[cfg(test)]
+        {
+            events::global_file_streams()
+        }
+    }
+}
+
 /// Enter the common shutdown path used by signals, C2S_QUIT, fd-channel EOF,
 /// and ordinary listener teardown. Admission is sealed before any await.
 async fn begin_server_shutdown(state: &AppState) {
     if !state.connections.seal_shutdown() {
         return;
     }
+    events::blit_event!(events::EventId::ServerStopping);
     // Attribute every attempt cancellation to shutdown before cancelling any
     // logical connection. This also seals extension restart admission.
     state.extensions.begin_shutdown().await;
@@ -8217,6 +8251,16 @@ async fn begin_server_shutdown(state: &AppState) {
     // select yet; `notify_waiters` would lose that edge. It comes last so an
     // awakened main task observes the complete broadcast/cancellation step.
     state.shutdown_notify.notify_one();
+}
+
+async fn finish_server_shutdown(state: &AppState) {
+    #[cfg(any(unix, windows))]
+    state.process_server.shutdown().await;
+    state.extensions.shutdown().await;
+    state.connections.wait_empty().await;
+    events::blit_event!(events::EventId::CompositorStopped);
+    events::blit_event!(events::EventId::ServerStopped);
+    state.event_files().shutdown().await;
 }
 
 fn new_boot_generation() -> u64 {
@@ -9092,6 +9136,14 @@ fn refuse_create(
     status: u8,
     detail: &str,
 ) {
+    events::blit_event!(
+        events::EventId::PtyCreateError,
+        client_id,
+        nonce as u64,
+        status as u64,
+        want_status as u64,
+        0
+    );
     if !want_status {
         return;
     }
@@ -9399,6 +9451,7 @@ async fn evict_exited(state: &AppState) {
         let Some(pty) = sess.ptys.remove(&id) else {
             continue;
         };
+        events::blit_event!(events::EventId::PtyEvict, 0, id as u64, 0, 0, 0);
         // Already exited by construction, so the fd and the child are gone;
         // this is only dropping the retained terminal state.
         drop(pty);
@@ -9698,6 +9751,14 @@ async fn cleanup_pty_internal(pty_id: u16, generation: Option<u64>, state: &AppS
         pty.stop_deadline = None;
         pty::close_pty(&pty.handle);
         pty.exit_status = pty::collect_exit_status(&pty.handle);
+        events::blit_event!(
+            events::EventId::PtyExit,
+            0,
+            pty_id as u64,
+            pty.exit_status as u64,
+            pty.exit_reason as u64,
+            0
+        );
         pty.mark_dirty();
         // A command still running when the shell dies never gets its `D`
         // marker; closing it here is what stops a waiter hanging until its
@@ -9810,6 +9871,26 @@ fn try_send_update(
 }
 
 pub async fn run(config: Config) {
+    let event_startup =
+        events::EventStartupConfig::resolve(events::EventConfigOverrides::default())
+            .unwrap_or_else(|error| panic!("invalid server event configuration: {error}"));
+    if let Err(error) = events::initialize(event_startup.clone()) {
+        if error != "event recorder is already initialized" {
+            panic!("invalid server event configuration: {error}");
+        }
+        events::global()
+            .set_config(event_startup.config)
+            .unwrap_or_else(|error| panic!("invalid server event configuration: {error}"));
+    }
+    #[cfg(not(test))]
+    let event_recorder = events::global_arc();
+    #[cfg(not(test))]
+    let event_files = Arc::new(events::FileStreamManager::with_startup_file(
+        event_recorder.clone(),
+        events::MAX_FILE_STREAMS,
+        event_startup.file,
+    ));
+    events::blit_event!(events::EventId::ServerStarting);
     // Embedders may not call `configure_deployment`; in that case freeze the
     // environment now, before any feature mask or service is constructed.
     let _ = ensure_deployment_settings();
@@ -9836,6 +9917,10 @@ pub async fn run(config: Config) {
         extension::ExtensionService::from_env(config.allow_persistent_extensions, &config.name);
     let state: AppState = Arc::new(AppStateInner {
         config,
+        #[cfg(not(test))]
+        events: event_recorder,
+        #[cfg(not(test))]
+        event_files,
         #[cfg(any(unix, windows))]
         process_server,
         boot_generation,
@@ -9849,6 +9934,10 @@ pub async fn run(config: Config) {
         extension_jobs: extension_jobs::GlobalTracker::from_env(),
         extensions: extensions.clone(),
     });
+    if let Err(error) = state.event_files().start_startup_file().await {
+        events::blit_event!(events::EventId::ServerError, 0, 0, 0, 0, 0);
+        eprintln!("failed to start BLIT_EVENTS_FILE: {error}");
+    }
     extensions.restore(state.clone()).await;
 
     // Start the compositor eagerly so it is ready before any client
@@ -9959,15 +10048,14 @@ pub async fn run(config: Config) {
     #[cfg(unix)]
     if let Some(channel_fd) = state.config.fd_channel {
         blit_sd_notify::notify_ready(state.config.verbose);
+        events::blit_event!(events::EventId::ServerStarted);
         let shutdown = state.shutdown_notify.clone();
         tokio::select! {
             _ = ipc::run_fd_channel(channel_fd, state.clone()) => {}
             _ = shutdown.notified() => {}
         }
         begin_server_shutdown(&state).await;
-        state.extensions.shutdown().await;
-        state.process_server.shutdown().await;
-        state.connections.wait_empty().await;
+        finish_server_shutdown(&state).await;
         return;
     }
 
@@ -9983,6 +10071,7 @@ pub async fn run(config: Config) {
     let mut listener = IpcListener::bind(&state.config.ipc_path, state.config.verbose).await;
 
     blit_sd_notify::notify_ready(state.config.verbose);
+    events::blit_event!(events::EventId::ServerStarted);
 
     let shutdown = state.shutdown_notify.clone();
     loop {
@@ -10000,10 +10089,7 @@ pub async fn run(config: Config) {
         spawn_network_client(stream, state.clone());
     }
     begin_server_shutdown(&state).await;
-    #[cfg(any(unix, windows))]
-    state.process_server.shutdown().await;
-    state.extensions.shutdown().await;
-    state.connections.wait_empty().await;
+    finish_server_shutdown(&state).await;
 }
 
 /// Minimum interval between blanket RequestFrame rounds.  Keeps video
@@ -10152,6 +10238,14 @@ async fn tick(state: &AppState) -> TickOutcome {
                     width,
                     height,
                 } => {
+                    events::blit_event!(
+                        events::EventId::SurfaceCreated,
+                        0,
+                        surface_id as u64,
+                        width as u64,
+                        height as u64,
+                        parent_id as u64
+                    );
                     broadcast.push(msg_surface_created(
                         surface_id, parent_id, width, height, &title, &app_id,
                     ));
@@ -10180,6 +10274,14 @@ async fn tick(state: &AppState) -> TickOutcome {
                     invalidate_client_encoders.push(surface_id);
                 }
                 CompositorEvent::SurfaceDestroyed { surface_id } => {
+                    events::blit_event!(
+                        events::EventId::SurfaceDestroyed,
+                        0,
+                        surface_id as u64,
+                        0,
+                        0,
+                        0
+                    );
                     #[cfg(target_os = "linux")]
                     {
                         let retired = retire_screencast_surface(cs, surface_id);
@@ -10213,6 +10315,14 @@ async fn tick(state: &AppState) -> TickOutcome {
                     timestamp_sub_us,
                     encoder_skip,
                 } => {
+                    events::blit_event!(
+                        events::EventId::SurfaceFrameQueued,
+                        0,
+                        surface_id as u64,
+                        width as u64,
+                        height as u64,
+                        0
+                    );
                     surface_commit_count += 1;
                     #[cfg(target_os = "linux")]
                     let screencast_frame = {
@@ -13411,6 +13521,14 @@ async fn tick(state: &AppState) -> TickOutcome {
             };
             match input {
                 PtyInput::Data(data) => {
+                    events::blit_event!(
+                        events::EventId::PtyDrain,
+                        0,
+                        id as u64,
+                        data.len() as u64,
+                        budget as u64,
+                        0
+                    );
                     budget = budget.saturating_sub(data.len());
                     if let Some(msg) = feed_pty_chunk(pty, id, &data) {
                         cwd_msgs.push(msg);
@@ -13432,6 +13550,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                     }
                 }
                 PtyInput::Eof => {
+                    events::blit_event!(events::EventId::PtyExit, 0, id as u64, 0, 0, 0);
                     let child_exited =
                         pty.exit_drain_deadline.is_some() || pty::poll_child_exited(&pty.handle);
                     if child_exited && pty.exit_drain_deadline.is_none() {
@@ -17690,6 +17809,11 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
 
     let (raw_out_tx, mut out_rx) = mpsc::unbounded_channel::<OutboxPacket>();
     let (raw_channel_tx, mut channel_rx) = mpsc::unbounded_channel::<channel::Delivery>();
+    // Event traffic is diagnostic and must never amplify an unbounded ordinary
+    // outbox. The writer polls this bounded lane only after user-facing lanes.
+    let (event_tx, mut event_rx) = mpsc::channel::<Vec<u8>>(32);
+    let writer_connection = Arc::new(AtomicU64::new(0));
+    let sender_connection = writer_connection.clone();
     let outbox_frame_counter = Arc::new(AtomicUsize::new(0));
     let outbox_byte_counter = Arc::new(AtomicUsize::new(0));
     let extension_outbox_config = extension_outbox_config();
@@ -17978,6 +18102,7 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                 msg = async {
                     loop {
                         tokio::select! {
+                            biased;
                             msg = next_connection_bulk(
                                 &mut process_out_rx,
                                 &mut out_rx,
@@ -17988,6 +18113,9 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                                     Some(delivery) => break Some(QueuedMessage::Channel(delivery)),
                                     None => channel_open = false,
                                 }
+                            }
+                            packet = event_rx.recv() => {
+                                break packet.map(QueuedMessage::Event);
                             }
                         }
                     }
@@ -18002,6 +18130,15 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                 Some(m) => {
                     let packet = m.packet();
                     let bytes = packet.len();
+                    let connection = sender_connection.load(Ordering::Relaxed);
+                    events::blit_event!(
+                        events::EventId::WriterDequeue,
+                        connection,
+                        packet.first().copied().unwrap_or_default() as u64,
+                        bytes as u64,
+                        0,
+                        0
+                    );
                     let ordinary = matches!(
                         &m,
                         QueuedMessage::Bulk(ConnectionBulk::Ordinary(_))
@@ -18021,9 +18158,17 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                         }),
                         #[cfg(any(unix, windows))]
                         QueuedMessage::Bulk(ConnectionBulk::Process(_)) => None,
-                        QueuedMessage::Channel(_) => None,
+                        QueuedMessage::Channel(_) | QueuedMessage::Event(_) => None,
                     };
                     let write_start = Instant::now();
+                    events::blit_event!(
+                        events::EventId::WriterWriteBegin,
+                        connection,
+                        packet.first().copied().unwrap_or_default() as u64,
+                        bytes as u64,
+                        0,
+                        0
+                    );
                     let wrote = write_frame_interleaved(
                         &mut writer,
                         packet,
@@ -18045,6 +18190,14 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     // block audio delivery for longer than the 20 ms
                     // Opus frame cadence) show up in the log.
                     if write_elapsed.as_millis() > 30 {
+                        events::blit_event!(
+                            events::EventId::WriterBackpressure,
+                            connection,
+                            packet.first().copied().unwrap_or_default() as u64,
+                            bytes as u64,
+                            write_elapsed.as_micros().min(u64::MAX as u128) as u64,
+                            0
+                        );
                         eprintln!(
                             "[sender] slow write: bytes={bytes} elapsed={}ms wrote={}",
                             write_elapsed.as_millis(),
@@ -18052,11 +18205,27 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                         );
                     }
                     if let Err(error) = wrote {
+                        events::blit_event!(
+                            events::EventId::WriterError,
+                            connection,
+                            packet.first().copied().unwrap_or_default() as u64,
+                            bytes as u64,
+                            write_elapsed.as_micros().min(u64::MAX as u128) as u64,
+                            0
+                        );
                         if error == FrameWriteError::NoProgress {
                             write_cancellation.cancel_slow_consumer();
                         }
                         break;
                     }
+                    events::blit_event!(
+                        events::EventId::WriterWriteEnd,
+                        connection,
+                        packet.first().copied().unwrap_or_default() as u64,
+                        bytes as u64,
+                        write_elapsed.as_micros().min(u64::MAX as u128) as u64,
+                        0
+                    );
                 }
                 None => break,
             }
@@ -18235,6 +18404,7 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
             | FEATURE_SCROLL_BY
             | FEATURE_CLIENT_CONTROL
             | FEATURE_CLIENT_ORIGIN
+            | FEATURE_EVENTS
             | blit_remote::fs::FEATURE_FS
             | blit_remote::git::FEATURE_GIT;
         #[cfg(target_os = "linux")]
@@ -18496,6 +18666,14 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
         let _ = sender.await;
         return;
     };
+    writer_connection.store(client_id, Ordering::Release);
+    let client_event_streams = Arc::new(events::ClientStreamManager::new(
+        client_id,
+        state.event_recorder(),
+        event_tx.clone(),
+    ));
+    events::blit_event!(events::EventId::ClientConnected, client_id, 0, 0, 0, 0);
+    events::blit_event!(events::EventId::ClientReady, client_id, 0, 0, 0, 0);
 
     state
         .extensions
@@ -18571,18 +18749,56 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
         let Some(data) = next else {
             break;
         };
+        events::blit_event!(
+            events::EventId::RawRequestRead,
+            client_id,
+            data.first().copied().unwrap_or_default() as u64,
+            data.len() as u64,
+            0,
+            0
+        );
         // Symmetric with the writer's accounting (`+4` for the length prefix),
         // and counted before the empty-frame skip below: an empty frame still
         // cost its prefix on the wire.
         reader_inbound_bytes.fetch_add((data.len() as u64).saturating_add(4), Ordering::Relaxed);
         if data.is_empty() {
+            events::blit_event!(events::EventId::RawRequestReject, client_id, 0, 0, 0, 0);
             continue;
         }
         // The process-wide latch is the admission linearization point. A
         // packet already being applied when it flips may finish; no packet
         // read afterward may start an extension or channel operation.
         if state.connections.is_shutting_down() {
+            events::blit_event!(
+                events::EventId::RawRequestReject,
+                client_id,
+                data[0] as u64,
+                data.len() as u64,
+                0,
+                0
+            );
             break;
+        }
+        let _dispatch_event = events::DispatchGuard::new(client_id, data[0], data.len());
+
+        if data[0] == EVENTS {
+            events::blit_event!(
+                events::EventId::ProtocolEvents,
+                client_id,
+                data.get(2).copied().unwrap_or_default() as u64,
+                data.len() as u64,
+                0,
+                0
+            );
+            events::dispatch(
+                &data,
+                &state.event_recorder(),
+                &client_event_streams,
+                &state.event_files(),
+                &event_tx,
+            )
+            .await;
+            continue;
         }
 
         if data[0] == C2S_ACK {
@@ -18620,6 +18836,14 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
         }
 
         if blit_remote::process::is_c2s_process(data[0]) {
+            events::blit_event!(
+                events::EventId::ProcessRequest,
+                client_id,
+                data[0] as u64,
+                data.len() as u64,
+                0,
+                0
+            );
             #[cfg(any(unix, windows))]
             if process_enabled {
                 if data[0] == blit_remote::process::C2S_PROCESS_SPAWN {
@@ -18681,6 +18905,14 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                             }
                             Err(_) => (None, None),
                         };
+                    events::blit_event!(
+                        events::EventId::ProcessSpawn,
+                        client_id,
+                        data[0] as u64,
+                        data.len() as u64,
+                        0,
+                        0
+                    );
                     processes.spawn(&data, pty_cwd.as_deref(), session_env);
                 } else {
                     processes.handle(&data);
@@ -19217,6 +19449,14 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
 
         if data[0] == C2S_INPUT && data.len() >= 3 {
             let pid = u16::from_le_bytes([data[1], data[2]]);
+            events::blit_event!(
+                events::EventId::PtyInput,
+                client_id,
+                pid as u64,
+                data.len().saturating_sub(3) as u64,
+                0,
+                0
+            );
             let mut need_nudge = false;
             {
                 let mut sess = state.session.lock().await;
@@ -19469,7 +19709,31 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
             break;
         }
 
+        let is_pty_create = matches!(
+            data[0],
+            C2S_CREATE | C2S_CREATE_N | C2S_CREATE_AT | C2S_CREATE2
+        );
+        if is_pty_create {
+            events::blit_event!(
+                events::EventId::PtyCreateRequest,
+                client_id,
+                data[0] as u64,
+                data.len() as u64,
+                0,
+                0
+            );
+        }
         let mut sess = state.session.lock().await;
+        if is_pty_create {
+            events::blit_event!(
+                events::EventId::PtyCreateMutexAcquired,
+                client_id,
+                data[0] as u64,
+                0,
+                0,
+                0
+            );
+        }
         let mut need_nudge = false;
         // Verbose output may be a blocking pipe under a supervisor. Defer
         // potentially hot diagnostics until after the session mutex is
@@ -20001,6 +20265,14 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     }
                     let rows = u16::from_le_bytes([entry[2], entry[3]]);
                     let cols = u16::from_le_bytes([entry[4], entry[5]]);
+                    events::blit_event!(
+                        events::EventId::PtyResize,
+                        client_id,
+                        pid as u64,
+                        rows as u64,
+                        cols as u64,
+                        0
+                    );
                     if let Some(c) = sess.clients.get_mut(&client_id) {
                         if is_unset_view_size(rows, cols) {
                             if c.view_sizes.remove(&pid).is_some() {
@@ -20053,10 +20325,26 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                 if let Some((_, detail)) =
                     list_refusal(sess.pty_list_bytes(), tag, list_command.as_deref())
                 {
+                    events::blit_event!(
+                        events::EventId::PtyCreateError,
+                        client_id,
+                        data[0] as u64,
+                        STATUS_TOO_LARGE as u64,
+                        0,
+                        0
+                    );
                     eprintln!("blit-server: refusing CREATE, {detail}");
                     continue;
                 }
                 let Some(id) = sess.allocate_pty_id(config.max_ptys) else {
+                    events::blit_event!(
+                        events::EventId::PtyCreateError,
+                        client_id,
+                        data[0] as u64,
+                        STATUS_BUDGET as u64,
+                        0,
+                        0
+                    );
                     continue;
                 };
                 let socket_name = sess
@@ -20074,7 +20362,15 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                 let pipewire_remote = sess.pipewire_remote_path();
                 #[cfg(not(target_os = "linux"))]
                 let pipewire_remote: Option<String> = None;
-                if let Some(pty) = pty::spawn_pty(
+                events::blit_event!(
+                    events::EventId::PtyCreateSpawnBegin,
+                    client_id,
+                    data[0] as u64,
+                    id as u64,
+                    rows as u64,
+                    cols as u64
+                );
+                let spawned_pty = pty::spawn_pty(
                     &config.shell,
                     &config.shell_flags,
                     rows,
@@ -20095,12 +20391,39 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     sess.desktop_bus_address().as_deref(),
                     pulse_server.as_deref(),
                     pipewire_remote.as_deref(),
-                ) {
+                );
+                events::blit_event!(
+                    events::EventId::PtyCreateSpawnEnd,
+                    client_id,
+                    id as u64,
+                    spawned_pty.is_some() as u64,
+                    0,
+                    0
+                );
+                if spawned_pty.is_none() {
+                    events::blit_event!(
+                        events::EventId::PtyCreateError,
+                        client_id,
+                        id as u64,
+                        data[0] as u64,
+                        0,
+                        0
+                    );
+                }
+                if let Some(pty) = spawned_pty {
                     let mut msg = Vec::with_capacity(3 + pty.tag.len());
                     msg.push(S2C_CREATED);
                     msg.extend_from_slice(&id.to_le_bytes());
                     msg.extend_from_slice(pty.tag.as_bytes());
                     sess.ptys.insert(id, pty);
+                    events::blit_event!(
+                        events::EventId::PtyCreateRegistered,
+                        client_id,
+                        id as u64,
+                        data[0] as u64,
+                        0,
+                        0
+                    );
                     if let Some(c) = sess.clients.get_mut(&client_id) {
                         c.lead = Some(id);
                         c.view_sizes.insert(id, (rows, cols));
@@ -20109,6 +20432,14 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     }
                     sess.send_to_all(&msg);
                     need_nudge = true;
+                    events::blit_event!(
+                        events::EventId::PtyCreateReplyQueued,
+                        client_id,
+                        id as u64,
+                        data[0] as u64,
+                        0,
+                        0
+                    );
                 }
             }
             C2S_CREATE_N => {
@@ -20151,10 +20482,26 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                 if let Some((_, detail)) =
                     list_refusal(sess.pty_list_bytes(), tag, list_command.as_deref())
                 {
+                    events::blit_event!(
+                        events::EventId::PtyCreateError,
+                        client_id,
+                        data[0] as u64,
+                        STATUS_TOO_LARGE as u64,
+                        0,
+                        0
+                    );
                     eprintln!("blit-server: refusing CREATE, {detail}");
                     continue;
                 }
                 let Some(id) = sess.allocate_pty_id(config.max_ptys) else {
+                    events::blit_event!(
+                        events::EventId::PtyCreateError,
+                        client_id,
+                        data[0] as u64,
+                        STATUS_BUDGET as u64,
+                        0,
+                        0
+                    );
                     continue;
                 };
                 let socket_name = sess
@@ -20172,7 +20519,15 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                 let pipewire_remote = sess.pipewire_remote_path();
                 #[cfg(not(target_os = "linux"))]
                 let pipewire_remote: Option<String> = None;
-                if let Some(pty) = pty::spawn_pty(
+                events::blit_event!(
+                    events::EventId::PtyCreateSpawnBegin,
+                    client_id,
+                    data[0] as u64,
+                    id as u64,
+                    rows as u64,
+                    cols as u64
+                );
+                let spawned_pty = pty::spawn_pty(
                     &config.shell,
                     &config.shell_flags,
                     rows,
@@ -20193,7 +20548,26 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     sess.desktop_bus_address().as_deref(),
                     pulse_server.as_deref(),
                     pipewire_remote.as_deref(),
-                ) {
+                );
+                events::blit_event!(
+                    events::EventId::PtyCreateSpawnEnd,
+                    client_id,
+                    id as u64,
+                    spawned_pty.is_some() as u64,
+                    0,
+                    0
+                );
+                if spawned_pty.is_none() {
+                    events::blit_event!(
+                        events::EventId::PtyCreateError,
+                        client_id,
+                        id as u64,
+                        data[0] as u64,
+                        0,
+                        0
+                    );
+                }
+                if let Some(pty) = spawned_pty {
                     let tag_bytes = pty.tag.as_bytes();
                     let mut nonce_msg = Vec::with_capacity(5 + tag_bytes.len());
                     nonce_msg.push(S2C_CREATED_N);
@@ -20205,6 +20579,14 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     broadcast_msg.extend_from_slice(&id.to_le_bytes());
                     broadcast_msg.extend_from_slice(tag_bytes);
                     sess.ptys.insert(id, pty);
+                    events::blit_event!(
+                        events::EventId::PtyCreateRegistered,
+                        client_id,
+                        id as u64,
+                        data[0] as u64,
+                        0,
+                        0
+                    );
                     if let Some(c) = sess.clients.get_mut(&client_id) {
                         c.lead = Some(id);
                         c.view_sizes.insert(id, (rows, cols));
@@ -20218,6 +20600,14 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                         }
                     }
                     need_nudge = true;
+                    events::blit_event!(
+                        events::EventId::PtyCreateReplyQueued,
+                        client_id,
+                        id as u64,
+                        data[0] as u64,
+                        0,
+                        0
+                    );
                 }
             }
             C2S_CREATE_AT => {
@@ -20253,10 +20643,26 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                 // applies, and like the other legacy opcodes CREATE_AT has no
                 // failure reply to carry a refusal.
                 if let Some((_, detail)) = list_refusal(sess.pty_list_bytes(), tag, None) {
+                    events::blit_event!(
+                        events::EventId::PtyCreateError,
+                        client_id,
+                        data[0] as u64,
+                        STATUS_TOO_LARGE as u64,
+                        0,
+                        0
+                    );
                     eprintln!("blit-server: refusing CREATE, {detail}");
                     continue;
                 }
                 let Some(id) = sess.allocate_pty_id(config.max_ptys) else {
+                    events::blit_event!(
+                        events::EventId::PtyCreateError,
+                        client_id,
+                        data[0] as u64,
+                        STATUS_BUDGET as u64,
+                        0,
+                        0
+                    );
                     continue;
                 };
                 let socket_name = sess
@@ -20274,7 +20680,15 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                 let pipewire_remote = sess.pipewire_remote_path();
                 #[cfg(not(target_os = "linux"))]
                 let pipewire_remote: Option<String> = None;
-                if let Some(pty) = pty::spawn_pty(
+                events::blit_event!(
+                    events::EventId::PtyCreateSpawnBegin,
+                    client_id,
+                    data[0] as u64,
+                    id as u64,
+                    rows as u64,
+                    cols as u64
+                );
+                let spawned_pty = pty::spawn_pty(
                     &config.shell,
                     &config.shell_flags,
                     rows,
@@ -20293,12 +20707,39 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     sess.desktop_bus_address().as_deref(),
                     pulse_server.as_deref(),
                     pipewire_remote.as_deref(),
-                ) {
+                );
+                events::blit_event!(
+                    events::EventId::PtyCreateSpawnEnd,
+                    client_id,
+                    id as u64,
+                    spawned_pty.is_some() as u64,
+                    0,
+                    0
+                );
+                if spawned_pty.is_none() {
+                    events::blit_event!(
+                        events::EventId::PtyCreateError,
+                        client_id,
+                        id as u64,
+                        data[0] as u64,
+                        0,
+                        0
+                    );
+                }
+                if let Some(pty) = spawned_pty {
                     let mut msg = Vec::with_capacity(3 + pty.tag.len());
                     msg.push(S2C_CREATED);
                     msg.extend_from_slice(&id.to_le_bytes());
                     msg.extend_from_slice(pty.tag.as_bytes());
                     sess.ptys.insert(id, pty);
+                    events::blit_event!(
+                        events::EventId::PtyCreateRegistered,
+                        client_id,
+                        id as u64,
+                        data[0] as u64,
+                        0,
+                        0
+                    );
                     if let Some(c) = sess.clients.get_mut(&client_id) {
                         c.lead = Some(id);
                         c.view_sizes.insert(id, (rows, cols));
@@ -20307,6 +20748,14 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     }
                     sess.send_to_all(&msg);
                     need_nudge = true;
+                    events::blit_event!(
+                        events::EventId::PtyCreateReplyQueued,
+                        client_id,
+                        id as u64,
+                        data[0] as u64,
+                        0,
+                        0
+                    );
                 }
             }
             C2S_CREATE2 => {
@@ -20403,7 +20852,15 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                 let pipewire_remote = sess.pipewire_remote_path();
                 #[cfg(not(target_os = "linux"))]
                 let pipewire_remote: Option<String> = None;
-                if let Some(pty) = pty::spawn_pty(
+                events::blit_event!(
+                    events::EventId::PtyCreateSpawnBegin,
+                    client_id,
+                    data[0] as u64,
+                    id as u64,
+                    rows as u64,
+                    cols as u64
+                );
+                let spawned_pty = pty::spawn_pty(
                     &config.shell,
                     &config.shell_flags,
                     rows,
@@ -20428,7 +20885,26 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     sess.desktop_bus_address().as_deref(),
                     pulse_server.as_deref(),
                     pipewire_remote.as_deref(),
-                ) {
+                );
+                events::blit_event!(
+                    events::EventId::PtyCreateSpawnEnd,
+                    client_id,
+                    id as u64,
+                    spawned_pty.is_some() as u64,
+                    0,
+                    0
+                );
+                if spawned_pty.is_none() {
+                    events::blit_event!(
+                        events::EventId::PtyCreateError,
+                        client_id,
+                        id as u64,
+                        data[0] as u64,
+                        0,
+                        0
+                    );
+                }
+                if let Some(pty) = spawned_pty {
                     let mut pty = pty;
                     // Armed before the terminal is reachable by anyone, so a
                     // client that dies immediately after creating it cannot
@@ -20447,6 +20923,14 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     broadcast_msg.extend_from_slice(&id.to_le_bytes());
                     broadcast_msg.extend_from_slice(tag_bytes);
                     sess.ptys.insert(id, pty);
+                    events::blit_event!(
+                        events::EventId::PtyCreateRegistered,
+                        client_id,
+                        id as u64,
+                        data[0] as u64,
+                        0,
+                        0
+                    );
                     if let Some(c) = sess.clients.get_mut(&client_id) {
                         if subscribe_creator {
                             c.lead = Some(id);
@@ -20465,6 +20949,14 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                         state.supervisor_notify.notify_one();
                     }
                     need_nudge = true;
+                    events::blit_event!(
+                        events::EventId::PtyCreateReplyQueued,
+                        client_id,
+                        id as u64,
+                        data[0] as u64,
+                        0,
+                        0
+                    );
                 } else {
                     // The id was handed out by allocate_pty_id but nothing
                     // was inserted, so it is free again on the next probe.
@@ -21727,7 +22219,16 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     sess.send_to_all(&msg);
                 }
             }
-            _ => {}
+            _ => {
+                events::blit_event!(
+                    events::EventId::RawRequestReject,
+                    client_id,
+                    data[0] as u64,
+                    data.len() as u64,
+                    0,
+                    0
+                );
+            }
         }
         drop(sess);
         if let Some(line) = deferred_verbose_log {
@@ -21737,6 +22238,9 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
             nudge_delivery(&state);
         }
     }
+
+    events::blit_event!(events::EventId::ClientDisconnecting, client_id, 0, 0, 0, 0);
+    client_event_streams.shutdown().await;
 
     {
         let mut sess = state.session.lock().await;
@@ -21956,6 +22460,7 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
     if state.config.verbose {
         eprintln!("{} disconnected", options.origin.label());
     }
+    events::blit_event!(events::EventId::ClientDisconnected, client_id, 0, 0, 0, 0);
 }
 
 #[cfg(test)]

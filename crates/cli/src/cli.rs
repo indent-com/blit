@@ -358,6 +358,12 @@ pub enum Command {
         command: KvCommand,
     },
 
+    /// Configure and export structured server events (docs/design/events.md)
+    Events {
+        #[command(subcommand)]
+        command: EventsCommand,
+    },
+
     /// Query language servers on the server (docs/design/lsp.md)
     ///
     /// Language servers are discovered by project markers (Cargo.toml,
@@ -2091,6 +2097,108 @@ pub enum GitCommand {
     },
 }
 
+// ── Events subcommands ───────────────────────────────────────────────────
+
+#[derive(Subcommand, Debug)]
+pub enum EventsCommand {
+    /// Show or change ring configuration
+    Config {
+        #[command(subcommand)]
+        command: Option<EventsConfigCommand>,
+
+        /// JSON output
+        #[arg(long, global = true)]
+        json: bool,
+    },
+
+    /// Write a bounded ring snapshot as a canonical event file
+    Dump {
+        /// First sequence to include (default: oldest retained)
+        #[arg(long, value_name = "SEQ", default_value_t = 0)]
+        since: u64,
+
+        /// Maximum records to write
+        #[arg(long, value_name = "N", default_value_t = blit_remote::events::EVENTS_DUMP_MAX_RECORDS)]
+        limit: u32,
+
+        /// Destination file, or - for stdout
+        #[arg(long, value_name = "PATH", default_value = "-")]
+        output: String,
+    },
+
+    /// Follow events and write a canonical event file
+    Stream {
+        /// Start cursor: now, oldest, or a sequence
+        #[arg(long, value_name = "now|oldest|SEQ", default_value = "now")]
+        since: String,
+
+        /// Destination file, or - for stdout
+        #[arg(long, value_name = "PATH", default_value = "-")]
+        output: String,
+    },
+
+    /// Manage event files written by the server
+    File {
+        #[command(subcommand)]
+        command: EventsFileCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum EventsConfigCommand {
+    /// Change ring capacity and/or active event ids
+    #[command(group(
+        clap::ArgGroup::new("change")
+            .required(true)
+            .multiple(true)
+            .args(["bytes", "active"])
+    ))]
+    Set {
+        /// Ring capacity in bytes (supports KiB, MiB, GiB)
+        #[arg(long, value_name = "SIZE")]
+        bytes: Option<String>,
+
+        /// Comma-separated selectors, or a 128-bit hexadecimal mask
+        #[arg(long, value_name = "SELECTORS|HEX")]
+        active: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum EventsFileCommand {
+    /// Start a server-side canonical event file
+    Start {
+        /// Path on the server
+        path: String,
+
+        /// Append to an existing canonical file
+        #[arg(long)]
+        append: bool,
+
+        /// Synchronize records durably as they are written
+        #[arg(long)]
+        sync: bool,
+
+        /// Stream id (random when omitted)
+        #[arg(long)]
+        id: Option<u32>,
+
+        /// JSON output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Stop a server-side event file
+    Stop {
+        /// Stream id returned by start
+        id: u32,
+
+        /// JSON output
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 // ── Kv subcommands ───────────────────────────────────────────────────────
 
 #[derive(Subcommand)]
@@ -2471,6 +2579,43 @@ mod tests {
             panic!("expected server command");
         };
         deployment.into_overrides().unwrap();
+    }
+
+    #[test]
+    fn events_surface_parses() {
+        let cli = Cli::try_parse_from([
+            "blit",
+            "events",
+            "config",
+            "set",
+            "--bytes",
+            "1MiB",
+            "--active",
+            "pty,+task-failed",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Events {
+                command: EventsCommand::Config {
+                    command: Some(EventsConfigCommand::Set { .. }),
+                    json: true,
+                }
+            }
+        ));
+
+        for args in [
+            vec!["blit", "events", "dump", "--since", "42", "--output", "-"],
+            vec!["blit", "events", "stream", "--since", "oldest"],
+            vec![
+                "blit", "events", "file", "start", "/tmp/e", "--append", "--sync",
+            ],
+            vec!["blit", "events", "file", "stop", "7", "--json"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_ok());
+        }
+        assert!(Cli::try_parse_from(["blit", "events", "config", "set"]).is_err());
     }
 
     #[test]
