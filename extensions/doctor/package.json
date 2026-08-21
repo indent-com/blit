@@ -1,0 +1,11 @@
+{
+  "name": "@blit-sh/extension-doctor",
+  "private": true,
+  "type": "module",
+  "description": "Check a Blit server, the extension runtime, and advertised capabilities",
+  "scripts": {
+    "build": "bun build src/main.ts --target=browser --format=esm --minify --outfile=../dist/doctor.js",
+    "typecheck": "tsc --project ../tsconfig.json",
+    "test": "bun test src ../typescript"
+  }
+}

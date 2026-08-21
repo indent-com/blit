@@ -616,7 +616,9 @@ in
       pkgs.binaryen
       pkgs.b3sum
       pkgs.brotli
+      pkgs.bun
       pkgs.jq
+      pkgs.typescript
     ];
     text = ''
       cd extensions
@@ -652,6 +654,30 @@ in
           | { key: .name, value: ($package.description // "") }
         ] | from_entries' <<<"$metadata")
       entries=()
+
+      # TypeScript extensions are authored against the native QuickJS host,
+      # then published as one dependency-free ECMAScript module. QuickJS does
+      # not need (and deliberately does not contain) a TypeScript toolchain or
+      # module resolver at runtime.
+      tsc --project tsconfig.json
+      bun test doctor/src typescript
+      doctor="$dist/doctor.js"
+      bun build doctor/src/main.ts \
+        --target=browser --format=esm --minify --outfile="$doctor"
+      brotli -f -q 11 -c "$doctor" >"$doctor.br"
+      digest=$(b3sum --no-names "$doctor")
+      bytes=$(wc -c <"$doctor")
+      compressed=$(wc -c <"$doctor.br")
+      description=$(jq -r '.description // ""' doctor/package.json)
+      entries+=("$(jq -n \
+        --arg name "doctor" \
+        --arg description "$description" \
+        --arg file "doctor.js" \
+        --arg digest "$digest" \
+        --argjson bytes "$bytes" \
+        --argjson compressed "$compressed" \
+        '{name: $name, description: $description, file: $file, blake3: $digest, bytes: $bytes, brotli_bytes: $compressed}')")
+      printf '%-12s %8s bytes  %8s brotli  %s\n' "doctor" "$bytes" "$compressed" "$digest"
 
       for wasm in "target/$target/release"/*.wasm; do
         name=$(basename "$wasm" .wasm)
@@ -870,6 +896,7 @@ in
       pkgs.wasm-bindgen-cli
       pkgs.python3
       pkgs.bun
+      pkgs.typescript
       # The hub's tests drive a real redis: the outage they pin (registration
       # awaiting a dead socket) is invisible to anything that stubs it out.
       pkgs.valkey
@@ -935,6 +962,10 @@ in
       # it for wasm.
       echo "=== Rust tests: extensions ==="
       cargo test --manifest-path extensions/Cargo.toml
+      echo ""
+
+      echo "=== TypeScript extension tests ==="
+      (cd extensions && tsc --project tsconfig.json && bun test doctor/src typescript)
       echo ""
     ''
     + pkgs.lib.optionalString pkgs.stdenv.isLinux ''

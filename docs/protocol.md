@@ -389,7 +389,7 @@ shared sizing input without a `SURFACE_RESIZE` entry.
 | 8   | `LSP`                 | Server supports the `LSP_*` language intelligence family        |
 | 9   | `KV`                  | Server supports the `KV_*` key-value family                     |
 | 10  | `NET`                 | Server supports the `NET_*` network-relay family                |
-| 11  | `EXTENSION`           | Proposed: Wasmi extension lifecycle, events, and commands       |
+| 11  | `EXTENSION`           | Proposed: extension lifecycle, events, and commands             |
 | 12  | `CHANNEL`             | Proposed: server supports bidirectional named channels          |
 | 13  | `PROCESS`             | Server supports native non-PTY child processes                  |
 | 14  | `CREATE_STATUS`       | `CREATE2(WANT_STATUS)` receives an explicit failure             |

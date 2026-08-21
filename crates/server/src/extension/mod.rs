@@ -1,11 +1,13 @@
-//! Server-side Wasmi extension service and supervisor.
+//! Server-side extension service and supervisor.
 
 mod command_directory;
+pub(crate) mod quickjs_host;
 pub(crate) mod wasmi_host;
 
 use self::command_directory::{CommandDirectory, CommandListener, CommandOwner, DiscoveryPage};
 use self::wasmi_host::{
-    AttemptCancellation, AttemptFailure, AttemptOutcome, AttemptSpec, FailureKind, WasmiHostConfig,
+    AttemptCancellation, AttemptFailure, AttemptOutcome, AttemptSpec as WasmiAttemptSpec,
+    FailureKind, WasmiHostConfig,
 };
 use crate::extension_catalog::{
     BlockedState, CatalogError, ExtensionCatalog, PersistentDefinition,
@@ -56,6 +58,22 @@ const DEFAULT_PENDING_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_TERMINAL_RETAIN: Duration = Duration::from_secs(30);
 const BACKOFF_BASE: Duration = Duration::from_millis(250);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
+const WASM_MAGIC: &[u8; 4] = b"\0asm";
+
+fn is_wasm_module(object: &[u8]) -> bool {
+    object.starts_with(WASM_MAGIC)
+}
+
+fn validate_extension_object(
+    object: &[u8],
+    config: &WasmiHostConfig,
+) -> Result<(), AttemptFailure> {
+    if is_wasm_module(object) {
+        wasmi_host::validate_module(object, config)
+    } else {
+        quickjs_host::validate_source(object, config)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DispatchOutcome {
@@ -498,7 +516,8 @@ impl ExtensionService {
                         } else if let Err(error) = opened_store.finish_startup_gc() {
                             diagnostic = Some(error.to_string());
                         } else if host_config.validate().is_err() {
-                            diagnostic = Some("invalid Wasmi extension containment limits".into());
+                            diagnostic =
+                                Some("invalid extension runtime containment limits".into());
                         } else {
                             store = Some(opened_store);
                             catalog = Some(opened_catalog);
@@ -820,7 +839,7 @@ impl ExtensionService {
         {
             hook();
         }
-        wasmi_host::validate_module(module, &self.host_config).map_err(|error| error.to_string())
+        validate_extension_object(module, &self.host_config).map_err(|error| error.to_string())
     }
 
     fn before_storage_io(&self) {
@@ -1091,7 +1110,7 @@ impl ExtensionService {
             control.connection.cancel();
             control.host.cancel();
         }
-        // A child supervisor completes only after its Wasmi attempt, logical
+        // A child supervisor completes only after its runtime attempt, logical
         // connection, native jobs, and that connection's own attached
         // children have drained. Waiting outside the service lock therefore
         // forms a recursive cleanup barrier without serializing unrelated
@@ -3728,17 +3747,36 @@ impl ExtensionService {
         drop(inner);
         drop(_catalog_io);
 
-        let spec = AttemptSpec {
-            module: Arc::<[u8]>::from(module),
-            module_hash: snapshot.hash,
-            extension_id,
-            label: (!snapshot.name.is_empty()).then_some(snapshot.name.clone()),
-            config: self.host_config.clone(),
+        let label = (!snapshot.name.is_empty()).then_some(snapshot.name.clone());
+        let attempt = if is_wasm_module(&module) {
+            RuntimeAttempt::Wasmi(
+                wasmi_host::spawn_attempt(WasmiAttemptSpec {
+                    module: Arc::<[u8]>::from(module),
+                    module_hash: snapshot.hash,
+                    extension_id,
+                    label,
+                    config: self.host_config.clone(),
+                })
+                .map_err(|error| AttemptFailure {
+                    kind: FailureKind::HostFailure,
+                    detail: error.to_string(),
+                })?,
+            )
+        } else {
+            RuntimeAttempt::QuickJs(
+                quickjs_host::spawn_attempt(quickjs_host::AttemptSpec {
+                    source: Arc::<[u8]>::from(module),
+                    module_hash: snapshot.hash,
+                    extension_id,
+                    label,
+                    config: self.host_config.clone(),
+                })
+                .map_err(|error| AttemptFailure {
+                    kind: FailureKind::HostFailure,
+                    detail: error.to_string(),
+                })?,
+            )
         };
-        let attempt = wasmi_host::spawn_attempt(spec).map_err(|error| AttemptFailure {
-            kind: FailureKind::HostFailure,
-            detail: error.to_string(),
-        })?;
         if std::env::var_os("BLIT_EXT_THREAD_DEBUG").is_some() {
             eprintln!(
                 "blit-server: prepared extension thread {} ({})",
@@ -4093,7 +4131,7 @@ impl ExtensionService {
 }
 
 type PreparedAttempt = (
-    wasmi_host::WasmiAttempt,
+    RuntimeAttempt,
     u64,
     u64,
     String,
@@ -4103,6 +4141,63 @@ type PreparedAttempt = (
     ObjectHash,
     Option<Arc<ArgumentReservation>>,
 );
+
+#[derive(Debug)]
+enum RuntimeAttempt {
+    Wasmi(wasmi_host::WasmiAttempt),
+    QuickJs(quickjs_host::QuickJsAttempt),
+}
+
+impl RuntimeAttempt {
+    fn thread_names(&self) -> &crate::thread_name::ThreadNames {
+        match self {
+            Self::Wasmi(attempt) => attempt.thread_names(),
+            Self::QuickJs(attempt) => attempt.thread_names(),
+        }
+    }
+
+    fn cancellation(&self) -> AttemptCancellation {
+        match self {
+            Self::Wasmi(attempt) => attempt.cancellation(),
+            Self::QuickJs(attempt) => attempt.cancellation(),
+        }
+    }
+
+    fn bridge(&self) -> wasmi_host::HostBridge {
+        match self {
+            Self::Wasmi(attempt) => attempt.bridge(),
+            Self::QuickJs(attempt) => attempt.bridge(),
+        }
+    }
+
+    async fn wait_prepared(&mut self) -> Result<(), AttemptFailure> {
+        match self {
+            Self::Wasmi(attempt) => attempt.wait_prepared().await,
+            Self::QuickJs(attempt) => attempt.wait_prepared().await,
+        }
+    }
+
+    fn start(&mut self) -> Result<(), wasmi_host::LifecycleError> {
+        match self {
+            Self::Wasmi(attempt) => attempt.start(),
+            Self::QuickJs(attempt) => attempt.start(),
+        }
+    }
+
+    fn cancel(&self) {
+        match self {
+            Self::Wasmi(attempt) => attempt.cancel(),
+            Self::QuickJs(attempt) => attempt.cancel(),
+        }
+    }
+
+    async fn join(self) -> Result<AttemptOutcome, wasmi_host::LifecycleError> {
+        match self {
+            Self::Wasmi(attempt) => attempt.join().await,
+            Self::QuickJs(attempt) => attempt.join().await,
+        }
+    }
+}
 
 enum PrepareAttemptError {
     ArgumentBudget(Arc<Notify>),
@@ -4245,7 +4340,7 @@ async fn drive_attempt(
     options: Option<super::ConnectionOptions>,
     init_reserved_rx: oneshot::Receiver<()>,
     commit_init_tx: oneshot::Sender<()>,
-    mut attempt: wasmi_host::WasmiAttempt,
+    mut attempt: RuntimeAttempt,
     connection: super::ConnectionCancellation,
     publication: AttemptPublication,
 ) -> DrivenAttempt {
@@ -6206,7 +6301,7 @@ mod tests {
                     true,
                     Instant::now(),
                     |bytes| {
-                        wasmi_host::validate_module(bytes, &WasmiHostConfig::default())
+                        validate_extension_object(bytes, &WasmiHostConfig::default())
                             .map_err(|error| error.to_string())
                     },
                 )
@@ -6302,6 +6397,39 @@ mod tests {
         let exit = wait_for_exit(&mut receiver).await;
         assert_eq!(exit.reason, EXT_EXIT_RETURNED);
         assert_eq!(exit.code, 7);
+        assert_ne!(exit.task_id, 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quickjs_source_runs_through_generic_handler() {
+        let root = temporary_root("quickjs-hit");
+        let service = test_service(&root);
+        let source = b"export default function () { return 17; }";
+        let hash = tokio::task::block_in_place(|| insert_module(&service, source));
+        let state = test_state(service.clone());
+        let endpoint = 411;
+        let mut receiver = register_test_endpoint(&service, endpoint).await;
+        assert_eq!(
+            service
+                .dispatch(
+                    state,
+                    endpoint,
+                    &super::super::ConnectionOrigin::Network,
+                    &run_packet(101, hash),
+                )
+                .await,
+            DispatchOutcome::Continue
+        );
+        let first = receiver.recv().await.unwrap();
+        let Some(ExtensionMessage::Status(status)) = wire::parse_extension_message(&first).unwrap()
+        else {
+            panic!("run did not receive its correlated status")
+        };
+        assert_eq!(status.status, EXT_STATUS_OK);
+        let exit = wait_for_exit(&mut receiver).await;
+        assert_eq!(exit.reason, EXT_EXIT_RETURNED);
+        assert_eq!(exit.code, 17);
         assert_ne!(exit.task_id, 0);
         let _ = std::fs::remove_dir_all(root);
     }

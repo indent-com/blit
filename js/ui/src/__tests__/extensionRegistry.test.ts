@@ -25,6 +25,14 @@ const manifest = {
   version: "0.53.2",
   extensions: [
     {
+      name: "doctor",
+      description: "Check the server and extension runtime",
+      file: "doctor.js",
+      blake3: DIGEST,
+      bytes: 13397,
+      brotli_bytes: 4479,
+    },
+    {
       name: "systemd",
       description: "Live systemd system and user unit state",
       file: "systemd.wasm",
@@ -51,15 +59,17 @@ describe("extension registry", () => {
       { mode: "cors" },
     );
     expect(registry.extensions.map((entry) => entry.name)).toEqual([
+      "doctor",
       "systemd",
       "session",
     ]);
-    expect(registry.extensions[0]!.brotliBytes).toBe(36950);
+    expect(registry.extensions[0]!.file).toBe("doctor.js");
+    expect(registry.extensions[1]!.brotliBytes).toBe(36950);
     // The sentence the panel shows under the name, and its absence.
-    expect(registry.extensions[0]!.description).toBe(
+    expect(registry.extensions[1]!.description).toBe(
       "Live systemd system and user unit state",
     );
-    expect(registry.extensions[1]!.description).toBe("");
+    expect(registry.extensions[2]!.description).toBe("");
   });
 
   // A dev page is often reached over a tunnel (https://host/, no port) and

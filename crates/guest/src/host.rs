@@ -60,6 +60,7 @@ pub enum Error {
     InvalidSendResult(i32),
     InvalidRecvResult(i32),
     InvalidWaitResult(i32),
+    EntropyUnavailable,
 }
 
 impl fmt::Display for Error {
@@ -73,6 +74,7 @@ impl fmt::Display for Error {
             Self::InvalidSendResult(value) => write!(f, "invalid blit_v1.send result {value}"),
             Self::InvalidRecvResult(value) => write!(f, "invalid blit_v1.recv result {value}"),
             Self::InvalidWaitResult(value) => write!(f, "invalid blit_v1.wait result {value}"),
+            Self::EntropyUnavailable => f.write_str("host entropy source is unavailable"),
         }
     }
 }
@@ -143,7 +145,9 @@ pub fn clock(kind: ClockKind) -> i64 {
 pub fn random(destination: &mut [u8]) -> Result<(), Error> {
     for chunk in destination.chunks_mut(MAX_RANDOM_CHUNK) {
         validate_range(chunk.as_ptr(), chunk.len())?;
-        raw::random(chunk);
+        if !raw::random(chunk) {
+            return Err(Error::EntropyUnavailable);
+        }
     }
     Ok(())
 }
@@ -197,9 +201,10 @@ mod raw {
         unsafe { import_clock(kind) }
     }
 
-    pub(super) fn random(destination: &mut [u8]) {
+    pub(super) fn random(destination: &mut [u8]) -> bool {
         // The public wrapper checked the entire range against signed i32.
         unsafe { import_random(destination.as_mut_ptr() as i32, destination.len() as i32) }
+        true
     }
 }
 
@@ -221,7 +226,7 @@ mod raw {
         crate::native_host::with(|host| host.clock(kind))
     }
 
-    pub(super) fn random(destination: &mut [u8]) {
-        crate::native_host::with(|host| host.random(destination));
+    pub(super) fn random(destination: &mut [u8]) -> bool {
+        crate::native_host::with(|host| host.try_random(destination))
     }
 }

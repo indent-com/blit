@@ -40,8 +40,8 @@ jobs:
     with:
       upload: true
 
-  # Wasm is architecture-independent, so one leg builds the extension modules
-  # every platform's release points at.
+  # Wasm and bundled QuickJS modules are architecture-independent, so one leg
+  # builds the extension objects every platform's release points at.
   build-extensions:
     needs: [verify-tag]
     runs-on: blacksmith-8vcpu-ubuntu-2404
@@ -55,6 +55,7 @@ jobs:
           name: extensions
           path: |
             extensions/dist/*.wasm
+            extensions/dist/*.js
             extensions/dist/manifest.json
 
   release:
@@ -101,6 +102,7 @@ jobs:
             tarballs/*.tar.gz
             windows/*.zip
             extensions/*.wasm
+            extensions/*.js
             extensions/manifest.json
           generate_release_notes: true
 
@@ -229,6 +231,7 @@ jobs:
           # pin needs and what the GitHub Release keeps forever.
           mkdir -p repo/ext
           cp extensions/*.wasm repo/ext/
+          cp extensions/*.js repo/ext/
           cp extensions/manifest.json repo/ext/manifest.json
 
           # Write version to /latest

@@ -1,4 +1,4 @@
-//! Native host shim for unit-testing guest code without Wasmi.
+//! Native host shim for tests and in-process runtime adapters.
 
 use std::{boxed::Box, cell::RefCell};
 
@@ -12,6 +12,14 @@ pub trait Host {
     fn wait(&mut self, monotonic_deadline_ns: i64) -> i32;
     fn clock(&mut self, kind: i32) -> i64;
     fn random(&mut self, destination: &mut [u8]);
+
+    /// Fallible entropy hook used by native runtime adapters.
+    ///
+    /// Existing test hosts only need to implement [`Host::random`].
+    fn try_random(&mut self, destination: &mut [u8]) -> bool {
+        self.random(destination);
+        true
+    }
 }
 
 std::thread_local! {

@@ -124,7 +124,7 @@ in
         type = types.bool;
         default = true;
         description = ''
-          Permit durable Wasmi extensions (<literal>blit ext run
+          Permit durable Wasm and JavaScript extensions (<literal>blit ext run
           --persist</literal>) and start the ones that should be running again
           after a restart. This is also what makes an extension's
           <literal>@name</literal> command namespace exist. Setting it false
@@ -147,10 +147,10 @@ in
         example = lib.literalExpression "[ pkgs.glib.bin ]";
         description = ''
           Extra packages on the blit server's PATH, for the processes
-          extensions spawn. A Wasm guest reaches the machine only by starting
-          a child process, and a server started from this unit has little more
-          than coreutils and systemd on its PATH — so whatever an extension
-          shells out to belongs here.
+          extensions spawn. An extension reaches the machine only through
+          protocol operations such as starting a child process, and a server
+          started from this unit has little more than coreutils and systemd on
+          its PATH — so whatever an extension shells out to belongs here.
 
           <literal>pkgs.glib.bin</literal> supplies <literal>gdbus</literal>,
           which lets the systemd extension react to unit changes as they

@@ -59,9 +59,9 @@ no RPC API beyond the binary protocol described in
 
 Every server has a name. `blit server` uses `default`; `blit server --name NAME`
 or `BLIT_SERVER_NAME=NAME` selects another. State always lives under
-`blit/instances/NAME/`, including `kv.redb`, `extensions.redb`, the Wasm object
-cache, and the default `@muster` directory; `@session` state is isolated because
-it lives in KV. The socket is suffixed with `-NAME`. Clients address it as
+`blit/instances/NAME/`, including `kv.redb`, `extensions.redb`, the extension
+object cache, and the default `@muster` directory; `@session` state is isolated
+because it lives in KV. The socket is suffixed with `-NAME`. Clients address it as
 `local:NAME`, for example
 `blit --on local:work terminal list`. Explicit path environment variables
 remain authoritative and may intentionally make instances share a resource.

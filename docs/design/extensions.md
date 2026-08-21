@@ -1,4 +1,4 @@
-# RFC: Wasmi extensions and native channels
+# RFC: Wasmi and QuickJS extensions and native channels
 
 - **Status:** Proposed
 - **Date:** 2026-08-05
@@ -7,20 +7,25 @@
 
 ## Summary
 
-Blit should execute Rust extensions compiled to WebAssembly inside the server:
+Blit executes WebAssembly and JavaScript extensions inside the server:
 
 ```bash
 blit ext run --on prod builder extension.wasm arg1 arg2
+blit ext run --on prod builder extension.js arg1 arg2
 ```
 
-The client addresses the module by its full BLAKE3 digest. The server admits it
-without an upload when that digest is cached and asks for the module bytes only
-on a cache miss. Uploaded modules are verified, validated, and stored in an
+Objects beginning with the WebAssembly magic bytes execute in Wasmi. Other
+objects are UTF-8 ECMAScript modules and execute in native QuickJS; JavaScript
+is not compiled to a nested Wasm runtime.
+
+The client addresses the object by its full BLAKE3 digest. The server admits it
+without an upload when that digest is cached and asks for the object bytes only
+on a cache miss. Uploaded objects are verified, validated, and stored in an
 immutable persistent content-addressed cache; execution remains subject to the
 server-wide running cap.
 
 An extension may have a restart policy. The server supervises successive
-Wasm attempts with bounded exponential backoff. With `--persist`, the desired
+runtime attempts with bounded exponential backoff. With `--persist`, the desired
 extension definition is durable and an attempt which was meant to be running
 is launched again after a blit server restart.
 
@@ -42,7 +47,7 @@ CLI exposes it under an unambiguous `@name` namespace and carries each command
 invocation over a normal channel.
 
 These are blit packet families, not Wasm-specific host functions. Browser,
-CLI, native, and Wasmi clients all see the same semantics. RPC, streamed
+CLI, native, Wasmi, and QuickJS clients all see the same semantics. RPC, streamed
 results, notifications, and actor mailboxes are libraries over channels.
 
 ## Motivation
@@ -73,7 +78,8 @@ PTYs.
 
 ## Goals
 
-- Run Rust-produced core Wasm modules using Wasmi in the blit server.
+- Run core Wasm modules using Wasmi and ECMAScript modules using native
+  QuickJS in the blit server.
 - Upload a module only when the selected server lacks its BLAKE3 object.
 - Supervise failed or completed attempts under an explicit restart policy.
 - Optionally persist desired extension state across blit server restarts.
@@ -91,15 +97,16 @@ PTYs.
 
 ## Non-goals
 
-- **No conventional guest operating-system environment.** Version 1 targets
-  `wasm32-unknown-unknown` and exposes only `blit_v1`. It provides no filesystem
-  preopens, sockets, standard streams, or second runtime ABI. Arguments arrive
-  in `INIT`; output and channels are packet operations. Pipe-oriented process
-  execution is deferred to a separate client-protocol RFC.
+- **No conventional guest operating-system environment.** Wasm targets
+  `wasm32-unknown-unknown` and exposes only `blit_v1`; QuickJS receives native
+  bindings over the same packet endpoint. Neither runtime receives filesystem
+  preopens, sockets, or standard streams. Arguments arrive in `INIT`; output
+  and channels are packet operations. Pipe-oriented process execution is
+  deferred to a separate client-protocol RFC.
 - **No Component Model requirement.** The first Rust SDK targets a small core
   Wasm ABI. A future component adapter may wrap the same packet endpoint.
 - **No live-instance checkpointing.** Persistent extensions start a fresh
-  Wasmi instance after a server restart. Linear memory, stacks, open handles,
+  runtime instance after a server restart. Runtime memory, stacks, open handles,
   channels, and in-flight requests are not snapshotted.
 - **No server-native state or pubsub.** Retained shared data remains KV's job;
   live protocols and fan-out are libraries over channels.
@@ -233,7 +240,7 @@ without requiring a new CLI release.
 ```mermaid
 flowchart LR
     Network["Network client"] -->|socket or forwarded stream| Handler["Generic connection handler"]
-    Extension["Wasmi extension thread"] -->|complete packets| Adapter["Bounded host adapter"]
+    Extension["Wasmi or QuickJS extension thread"] -->|complete packets| Adapter["Bounded host adapter"]
     Adapter -->|private in-memory duplex| Handler
     Handler --> Existing["Terminal / FS / Git / LSP / …"]
     Handler --> Fabric["Native channel fabric"]
@@ -442,7 +449,7 @@ server restarts. Allocation collision-checks the complete durable catalog and
 live transient registry; zero remains the wire sentinel for unresolved/new/list
 operations and is never assigned.
 
-An **attempt** is one Wasmi instantiation of that extension. Attempts are
+An **attempt** is one runtime instantiation of that extension. Attempts are
 numbered monotonically from one. A running attempt has its own 32-bit
 process-local, non-zero `task_id` and logical client endpoint. Task allocation
 does not reuse an ID while it is live; zero is reserved for every non-`RUNNING`
@@ -725,7 +732,7 @@ task ID, module hash, invocation name when present, attachment and persistence
 flags, and the exact UTF-8 argument vector from `EXT_RUN`. No synthetic module
 path or `argv[0]` is inserted. For a transient extension, revision is always 1
 and the ID lasts for this server process. For a persistent extension, ID and
-revision survive server restarts. Attempt increases on every Wasmi
+revision survive server restarts. Attempt increases on every runtime
 instantiation; task ID is meaningful only in the current server process.
 
 The `blit-guest` entry-point wrapper consumes the handshake and `INIT` before
@@ -792,6 +799,52 @@ the same; otherwise the terminal frame window eventually stops producing
 updates. Channel wrappers likewise advance their family ACKs only after
 application consumption.
 
+### QuickJS contract
+
+A JavaScript extension is a UTF-8 ECMAScript module. The host evaluates its
+top-level code after the ordinary client bootstrap and `INIT` have completed.
+If the module exports a default function, the host calls it with no arguments,
+runs pending promise jobs to completion, and uses an i32 result as the attempt
+exit code. A missing default export or an `undefined` result returns zero. Any
+other result or an uncaught exception fails the attempt.
+
+The host installs one global object:
+
+```javascript
+globalThis.blit = {
+  context,                    // frozen bootstrap identity and arguments
+  send(packet),               // Uint8Array containing one complete C2S packet
+  recv(),                     // blocking Uint8Array; undefined when closed
+  wait(),                     // 1 packet, 2 closed
+  waitUntil(deadlineNanos),   // absolute monotonic BigInt; same return codes
+  realtimeNow(),              // signed Unix nanoseconds as BigInt
+  monotonicNow(),             // opaque signed nanoseconds as BigInt
+  random(length),             // Uint8Array; at most 16 MiB
+  sleep(milliseconds),
+  log(message),
+};
+```
+
+`context` includes the camel-case equivalents of the Rust context fields plus
+`protocolVersion`, `features`, `bootGeneration`, and `serverVersion`.
+`console.log` and `console.error` join their arguments and forward to
+`blit.log`. Packet codecs remain JavaScript libraries over `send` and `recv`;
+there is no runtime-specific copy of the Blit protocol.
+
+TypeScript is an authoring format, not a third runtime. The repository's
+[`extensions/typescript`](../../extensions/typescript) library types this host
+surface and implements the small synchronous `blit.cli.v1` provider used by
+[`@doctor`](../../extensions/doctor). The extension build tests the TypeScript
+and bundles each entry point with its imports into one ECMAScript module;
+QuickJS never resolves packages or transpiles types.
+
+QuickJS runs natively on the attempt's dedicated thread, not as Javy output
+inside Wasmi. The server applies the same attempt memory setting to the
+QuickJS allocator, applies the interpreter stack setting to its runtime stack,
+and uses an interrupt handler for cancellation of compute-bound code. Blocking
+host calls observe the same cancellation flag and bounded packet handoffs as
+Wasmi.
+
 ### Dedicated execution thread
 
 Each admitted extension attempt owns exactly one OS thread from per-attempt
@@ -802,16 +855,16 @@ An extension in `QUEUED`, `BACKOFF`, terminal `STOPPED`, or `BLOCKED`, or one
 which is disabled or removed, owns no thread. At most one attempt and thread
 exist for an extension at a time.
 
-Wasmi execution never occurs on a server async executor thread and never
+Runtime execution never occurs on a server async executor thread and never
 occurs under a server lock. The synchronous host adapter and the async duplex
 connection bridge that dedicated thread to `handle_client`:
 
 1. the supervisor privately reserves a non-zero `task_id`; the extension thread
-   translates and instantiates the no-start module, then waits on a bootstrap
-   latch without running guest code;
+   translates and instantiates Wasm or compiles QuickJS source, then waits on a
+   bootstrap latch without running guest code;
 2. after instantiation succeeds, the supervisor starts `handle_client`, installs
    the exclusive bootstrap pump, arms the no-progress timer, and releases the
-   latch so `blit_main` enters the SDK's handshake receiver; lifecycle remains
+   latch so the runtime enters the SDK's handshake receiver; lifecycle remains
    `VALIDATING`, `task_id` remains externally zero, and ordinary user code and
    endpoint producers are still gated;
 3. the shared generic initial-burst builder and pump stream the complete normal
@@ -864,7 +917,7 @@ does not block a Tokio worker while joining a still-running OS thread.
 
 An empty receive parks the dedicated thread without consuming CPU; restart
 backoff uses the async supervisor and consumes no extension thread. The server
-reserves the thread and Wasmi resources before marking an attempt running. A
+reserves the thread and runtime resources before marking an attempt running. A
 reservation or thread-spawn failure reports a structured host failure and never
 panics the server.
 
@@ -1632,9 +1685,9 @@ Three identifiers answer different questions:
 
 | Identifier                | Identifies                                     | Lifetime                 |
 | ------------------------- | ---------------------------------------------- | ------------------------ |
-| module hash               | exact Wasm bytes                               | immutable CAS object     |
+| module hash               | exact Wasm or ECMAScript bytes                 | immutable CAS object     |
 | `extension_id`            | one supervised extension and its configuration | stable for the extension |
-| `(extension_id, attempt)` | one Wasmi instance                             | one execution attempt    |
+| `(extension_id, attempt)` | one runtime instance                           | one execution attempt    |
 
 Every non-`UPDATE` `EXT_RUN` creates a distinct extension and ID, even when
 the hash, arguments, and descriptive name are identical. The same module
@@ -1946,7 +1999,7 @@ The control and data paths are deliberately separate:
 
 ```mermaid
 sequenceDiagram
-    participant E as "Wasmi extension"
+    participant E as "Extension"
     participant S as "Blit server"
     participant C as "CLI client"
     E->>S: "CHANNEL LISTEN (fresh listener name)"
@@ -2081,13 +2134,13 @@ Normal channel windows provide backpressure in both directions. Closing the
 client side is cancellation even if `CANCEL` could not be delivered. If the
 extension attempt or listener disappears, the invocation fails and is never
 automatically retried against a restarted attempt. One attempt may accept many
-invocation channels, but it still has one Wasmi thread; its SDK event loop must
+invocation channels, but it still has one runtime thread; its event loop must
 multiplex them or deliberately serialize work.
 
 ## Deferred process execution
 
 Pipe-oriented non-PTY child processes are a useful client facility, but they
-are independent of Wasmi extensions and native channels. They are specified by
+are independent of extensions and native channels. They are specified by
 the [native process RFC](processes.md). This proposal adds no subprocess host
 imports and does not reserve a process packet family. An extension can use
 existing `CREATE2(HAS_COMMAND)` PTYs when terminal semantics are appropriate;
@@ -2109,15 +2162,15 @@ feature gates below, are sampled once at server startup. Initial defaults are:
 | Followed extensions per logical endpoint              |                              128 | `BLIT_EXT_FOLLOW_MAX_PER_CLIENT`              |
 | Follower cursors server-wide                          |                            4,096 | `BLIT_EXT_FOLLOW_MAX`                         |
 | Retained argument bytes across supervisors            |                          256 MiB | `BLIT_EXT_ARGUMENT_STORE_MAX`                 |
-| Raw module object/upload                              |                           64 MiB | `BLIT_EXT_MODULE_MAX`                         |
-| Raw module objects on disk, including reservations    |                            2 GiB | `BLIT_EXT_OBJECT_CACHE_MAX`                   |
+| Raw extension object/upload                           |                           64 MiB | `BLIT_EXT_MODULE_MAX`                         |
+| Raw extension objects on disk, including reservations |                            2 GiB | `BLIT_EXT_OBJECT_CACHE_MAX`                   |
 | Raw CAS entries, including temp/quarantine            |                            4,096 | `BLIT_EXT_OBJECT_CACHE_MAX_ENTRIES`           |
 | Active uploads per logical endpoint                   |                                4 | `BLIT_EXT_UPLOAD_MAX_PER_CLIENT`              |
 | Active uploads server-wide                            |                               32 | `BLIT_EXT_UPLOAD_MAX_ACTIVE`                  |
 | Active-upload idle timeout                            |                            5 min | `BLIT_EXT_UPLOAD_TIMEOUT`                     |
 | Pending-creation absolute timeout                     |                            5 min | `BLIT_EXT_PENDING_TIMEOUT`                    |
 | Concurrent module validations and translations        |                                2 | `BLIT_EXT_MAX_VALIDATING`                     |
-| Wasm linear memory per attempt                        |                          128 MiB | `BLIT_EXT_MEMORY_MAX`                         |
+| Wasm linear memory or QuickJS heap per attempt        |                          128 MiB | `BLIT_EXT_MEMORY_MAX`                         |
 | In-process duplex capacity, each direction            |                     16 MiB + 4 B | fixed by packet cap                           |
 | Host-adapter packet handoffs, both directions         |                           32 MiB | fixed by packet cap                           |
 | Queued extension egress ceiling                       |                           64 MiB | `BLIT_EXT_OUTBOX_MAX`                         |
@@ -2139,7 +2192,7 @@ feature gates below, are sampled once at server startup. Initial defaults are:
 | Tables per attempt                                    |                                1 | fixed by the module model                     |
 | Aggregate table elements per attempt                  |                           65,536 | `BLIT_EXT_TABLE_ELEMENTS_MAX`                 |
 | Wasm instances per attempt                            |                                1 | fixed by the module model                     |
-| Wasmi value-stack bytes per attempt                   |                          128 KiB | `BLIT_EXT_VALUE_STACK_MAX`                    |
+| Interpreter value/runtime-stack bytes per attempt     |                          128 KiB | `BLIT_EXT_VALUE_STACK_MAX`                    |
 | Wasmi call depth per attempt                          |                            1,024 | `BLIT_EXT_CALL_DEPTH_MAX`                     |
 | Native stack per extension thread                     |                            2 MiB | `BLIT_EXT_STACK_SIZE`                         |
 | Fuel per driver slice                                 |                        1,000,000 | `BLIT_EXT_FUEL_SLICE`                         |
@@ -2371,13 +2424,16 @@ network packets. In-process origin is not trusted origin.
 
 ## Security posture and deployment controls
 
-Wasmi is a memory- and fault-containment boundary, not a least-authority
-sandbox. A running extension has the authority of a normal Blit endpoint: it
+Wasmi is a memory- and fault-containment boundary. QuickJS applies heap and
+stack limits and isolates JavaScript values, but its native C implementation
+is part of the server process's trusted computing base. Neither runtime is a
+least-authority sandbox. A running extension has the authority of a normal
+Blit endpoint: it
 may send any valid C2S packet. Feature-gated families are available when
 advertised, while ungated administrative packets such as `C2S_QUIT` remain
 available. An ordinary endpoint can already use `CREATE2(HAS_COMMAND)` to
 execute an arbitrary command in a PTY; persistence makes that existing endpoint
-authority durably restartable. Wasmi does not add privilege separation.
+authority durably restartable. The runtime does not add privilege separation.
 
 Anyone allowed to connect to Blit or install an extension must therefore be
 trusted with the server's existing endpoint authority. Deployments needing a
@@ -2708,11 +2764,15 @@ extension thread at all.
    packet-or-deadline waits, timer dispatch, and entropy, atomically ordered
    bootstrap/RUNNING latch, attempt lifecycle, and
    retained-output log/replay.
-7. **Command directory.** Implement `EXT_COMMAND` registration and discovery,
+7. **QuickJS host.** Detect UTF-8 ECMAScript objects, compile and run them in a
+   native QuickJS runtime on the same named attempt threads, expose the
+   initialized packet endpoint and context through the `blit` global, apply
+   heap/stack limits, and interrupt compute-bound code on cancellation.
+8. **Command directory.** Implement `EXT_COMMAND` registration and discovery,
    descriptor validation, generation-fenced live-listener ownership,
    server-global command/snapshot budgets, token-checked invocation, and the
    `blit.cli.v1` channel protocol.
-8. **Rust SDK and CLI.** Add `blit-guest`, a Rust example extension,
+9. **Rust SDK and CLI.** Add `blit-guest`, a Rust example extension,
    `blit ext run`,
    channel and command-provider wrappers, extension control and update commands,
    `@name` dispatch, help, listing, and static completion.

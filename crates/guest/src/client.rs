@@ -90,6 +90,11 @@ impl MonotonicInstant {
         self.0
     }
 
+    /// Construct an instant from the current attempt's raw host clock domain.
+    pub const fn from_raw_nanos(nanos: i64) -> Self {
+        Self(nanos)
+    }
+
     pub fn checked_duration_since(self, earlier: Self) -> Option<Duration> {
         let nanos = self.0.checked_sub(earlier.0)?;
         (nanos >= 0).then(|| Duration::from_nanos(nanos as u64))

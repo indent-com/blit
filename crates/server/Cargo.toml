@@ -23,6 +23,7 @@ x264 = ["dep:x264-sys"]
 openh264 = ["dep:openh264"]
 
 [dependencies]
+blit-guest = { workspace = true }
 blit-remote = { workspace = true }
 blit-fssync = { workspace = true }
 blit-git = { workspace = true }
@@ -49,6 +50,7 @@ getrandom = "0.3"
 blake3 = { version = "1", default-features = false, features = ["std"] }
 wasmi = { version = "1.1", default-features = false, features = ["std"] }
 wasmparser = { version = "0.239", default-features = false, features = ["std"] }
+rquickjs = { version = "0.12", default-features = false, features = ["std"] }
 redb = "2"
 rav1e = { version = "0.8", default-features = false }
 ravif = { version = "0.13", default-features = false }
