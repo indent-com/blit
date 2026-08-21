@@ -38,7 +38,7 @@ async function authenticate(page: Page) {
   // Terminal creation goes over the mux; wait for it, not just the UI shell.
   await expect(page.getByRole("status")).toHaveAttribute(
     "aria-label",
-    "connected",
+    "Connected",
     { timeout: 15_000 },
   );
   await page.waitForTimeout(500);
