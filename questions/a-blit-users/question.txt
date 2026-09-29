@@ -1,0 +1,1 @@
+Question: How many sandboxes successfully established a connection to blit in the last 24 hours
