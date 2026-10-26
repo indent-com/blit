@@ -34,7 +34,9 @@ pub fn session_env(
     let mut env = SessionEnv::default();
     let mut set = |key: &str, value: String| env.set.push((key.to_string(), value));
 
-    if let Some(wd) = wayland_display {
+    // Off Linux the compositor is a stub whose socket name is empty: there is
+    // no display, so nothing may steer a toolkit toward one.
+    if let Some(wd) = wayland_display.filter(|wd| !wd.is_empty()) {
         let wd_path = std::path::Path::new(wd);
         if let Some(dir) = wd_path.parent() {
             let inherited = std::env::var_os("XDG_RUNTIME_DIR");
@@ -130,7 +132,7 @@ pub fn toolkit_env(x_display: Option<&str>) -> Vec<(&'static str, String)> {
 
 #[cfg(test)]
 mod tests {
-    use super::toolkit_env;
+    use super::{session_env, toolkit_env};
 
     fn lookup(x_display: Option<&str>, key: &str) -> Option<String> {
         toolkit_env(x_display)
@@ -172,5 +174,28 @@ mod tests {
             lookup(Some(":20"), "_JAVA_AWT_WM_NONREPARENTING").as_deref(),
             Some("1")
         );
+    }
+
+    /// The non-Linux compositor stub hands out an empty socket name. A Qt app
+    /// pinned to Wayland on macOS aborts instead of falling back to cocoa.
+    #[test]
+    fn an_empty_socket_name_sets_no_display_variables() {
+        let env = session_env(Some(""), None, None, None, None);
+        for key in [
+            "WAYLAND_DISPLAY",
+            "XDG_RUNTIME_DIR",
+            "XDG_SESSION_TYPE",
+            "NIXOS_OZONE_WL",
+            "ELECTRON_OZONE_PLATFORM_HINT",
+            "MOZ_ENABLE_WAYLAND",
+            "GDK_BACKEND",
+            "QT_QPA_PLATFORM",
+            "SDL_VIDEODRIVER",
+        ] {
+            assert!(
+                env.set.iter().all(|(name, _)| name != key),
+                "{key} set without a compositor"
+            );
+        }
     }
 }
